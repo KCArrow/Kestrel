@@ -3,7 +3,7 @@
 ## Setup
 
 ```bash
-git clone https://github.com/<you>/kestrel.git && cd kestrel
+git clone https://github.com/KCArrow/kestrel.git && cd kestrel
 sudo dnf install python3-gobject gtk3 python3-numpy      # or the apt/pacman equivalents in README
 ./build.sh && python3 kestrel.py
 ```

@@ -15,6 +15,19 @@ kestrel ~/Pictures
 
 Or unzip the portable build and run `./kestrel` — nothing is installed (see [Portable build](#portable-build)).
 
+## Screenshots
+
+<!-- Taken in demo mode (docs/DEMO.md) — nothing here is a real machine. -->
+![Kestrel main window](docs/screenshots/hero.png)
+
+| This PC | 3D preview | Video preview |
+|---|---|---|
+| ![](docs/screenshots/this-pc.png) | ![](docs/screenshots/preview-3d.png) | ![](docs/screenshots/preview-video.png) |
+
+| EXR / PSD preview | Split view | Preferences → Optional |
+|---|---|---|
+| ![](docs/screenshots/preview-exr.png) | ![](docs/screenshots/split-view.png) | ![](docs/screenshots/preferences-optional.png) |
+
 ---
 
 ## Contents
@@ -107,7 +120,7 @@ sudo pacman -S python-gobject gtk3 python-numpy
 ## Install
 
 ```bash
-git clone https://github.com/<you>/kestrel.git
+git clone https://github.com/KCArrow/kestrel.git
 cd kestrel
 ./install.sh
 ```
@@ -200,6 +213,7 @@ Press **F1** in the app for the full list.
 
 ```
 kestrel [folder …]                 open one tab per folder (default: home)
+kestrel --demo [KestrelDemo]       fictional machine for screenshots/demos — see docs/DEMO.md
 kestrel --selftest [--bench]       unit/benchmark tests of the non-GUI machinery
 kestrel --preview-bench [--quick] [--keep]
                                    synthesize large files of every preview type, time each decoder
@@ -273,6 +287,7 @@ and how to report a freeze.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — source layout, threading model, preview pipeline, index design
 - [docs/TESTING.md](docs/TESTING.md) — every test/bench flag, what it measures, how to read the output
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+- [docs/DEMO.md](docs/DEMO.md) — `--demo` mode and the KestrelDemo folder for screenshots
 - [CHANGELOG.md](CHANGELOG.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 

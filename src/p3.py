@@ -668,7 +668,7 @@ class FolderView(Gtk.Box):
         if p.startswith(HOME + "/"):
             rel = "~/" + p[len(HOME) + 1:]
         else:
-            rel = p
+            rel = pretty_path(p)
         parts = [x for x in rel.split("/") if x]
         if rel.startswith("/"):
             parts.insert(0, "")

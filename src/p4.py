@@ -213,7 +213,11 @@ class MainWindow(Gtk.ApplicationWindow):
         if path in VIRTUAL:
             return [(self.display_path(path), path)]
         out = [("This PC", THISPC)]
-        if path == HOME or path.startswith(HOME + "/"):
+        dr = demo_drive_root(path)
+        if dr is not None:
+            out.append(dr)
+            rest, acc = path[len(dr[1]):].strip("/"), dr[1]
+        elif path == HOME or path.startswith(HOME + "/"):
             out.append((os.path.basename(HOME), HOME))
             rest, acc = path[len(HOME):].strip("/"), HOME
         else:
@@ -227,7 +231,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def edit_address(self):
         t = self.tab
-        self.addr.set_text("" if t.path in VIRTUAL else t.path)
+        self.addr.set_text("" if t.path in VIRTUAL else pretty_path(t.path))
         self.path_stack.set_visible_child_name("entry")
         self.addr.grab_focus()
         self.addr.select_region(0, -1)
@@ -675,7 +679,7 @@ class MainWindow(Gtk.ApplicationWindow):
         def work():
             for e in drive_entries:
                 try:
-                    u = shutil.disk_usage(e.path)
+                    u = disk_usage(e.path)
                     e.usage = (u.total - u.free, u.total)
                     e.type = f"{fmt_size(u.free)} free of {fmt_size(u.total)}"
                 except OSError:
@@ -773,7 +777,7 @@ class MainWindow(Gtk.ApplicationWindow):
             message(self, "Format", "Couldn't find the block device for this drive.", Gtk.MessageType.ERROR)
             return
         try:
-            total = shutil.disk_usage(path).total
+            total = disk_usage(path).total
         except OSError:
             total = 0
         d = Gtk.Dialog(title=f"Format {label}", transient_for=self, modal=True)
@@ -1909,14 +1913,14 @@ class MainWindow(Gtk.ApplicationWindow):
             self.details_title.set_markup(f"<b>{GLib.markup_escape_text(self.display_path(t.path))}</b>")
             nd = sum(1 for e in t.entries if e.is_dir)
             self.qv_subtitle.set_text(f"{len(t.entries) - nd} files, {nd} folders")
-            rows = [("Location", t.path if t.path not in VIRTUAL else self.display_path(t.path))]
+            rows = [("Location", pretty_path(t.path) if t.path not in VIRTUAL else self.display_path(t.path))]
             if t.path not in VIRTUAL:
                 rows.append(("Disk", "…"))
                 tp = t.path
 
                 def dwork():
                     try:
-                        u = shutil.disk_usage(tp)
+                        u = disk_usage(tp)
                         txt = f"{fmt_size(u.free)} free of {fmt_size(u.total)}"
                     except OSError:
                         txt = "unavailable"
@@ -1929,7 +1933,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self.qv_subtitle.set_text(f"{len(sel) - nd} files, {nd} folders")
             total = sum(e.size or 0 for e in sel if not e.is_dir)
             rows = [("Size", fmt_size(total) + ("  (files only)" if nd else "")),
-                    ("Location", os.path.dirname(sel[0].path))]
+                    ("Location", pretty_path(os.path.dirname(sel[0].path)))]
             exts = sorted({e.ext for e in sel if e.ext})
             if exts:
                 rows.append(("Types", ", ".join(exts[:8]) + ("…" if len(exts) > 8 else "")))
@@ -1944,7 +1948,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 rows.append(("Size", "calculating…"))
             else:
                 rows.append(("Size", f"{fmt_size(e.size)}  ({(e.size or 0):,} bytes)"))
-            rows.append(("Location", e.location or os.path.dirname(e.path)))
+            rows.append(("Location", e.location or pretty_path(os.path.dirname(e.path))))
             rows.append(("Modified", fmt_date(e.mtime, f_long)))
             if e.ctime:
                 rows.append(("Created", fmt_date(e.ctime, f_long)))
@@ -2164,7 +2168,7 @@ class MainWindow(Gtk.ApplicationWindow):
         t = self.tab
         if t is None:
             return
-        self.set_title((t.path if (self.cfg["full_path_title"] and t.path not in VIRTUAL) else t.title()) + " — " + APP_NAME)
+        self.set_title((pretty_path(t.path) if (self.cfg["full_path_title"] and t.path not in VIRTUAL) else t.title()) + " — " + APP_NAME)
 
     def _update_history_buttons(self):
         t = self.tab
@@ -2530,7 +2534,7 @@ class MainWindow(Gtk.ApplicationWindow):
         def work():
             for e in drive_entries:
                 try:
-                    u = shutil.disk_usage(e.path)
+                    u = disk_usage(e.path)
                     e.usage = (u.total - u.free, u.total)
                     e.type = f"{fmt_size(u.free)} free of {fmt_size(u.total)}"
                 except OSError:

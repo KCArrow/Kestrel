@@ -17,6 +17,7 @@ First public release.
 - CPU parking, stall watchdog with freeze dumps, `--selftest`, `--preview-bench`, `--stress`,
   `--nav-bench`, `--profile`, `--probe-gl`, `--probe-model`
 - OpenRV integration (Ctrl+Shift+R)
+- `--demo` mode: fictional drives, disks, user folders and config for screenshots (docs/DEMO.md)
 - Preferences dialog with General / View / Search / Optional tabs and dependency diagnostics
 
 Known issues

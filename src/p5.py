@@ -1382,6 +1382,22 @@ def main():
             return 0
         print("FAILED:", (m or {}).get("error", "no result"))
         return 1
+    if "--demo" in sys.argv[1:]:
+        # kestrel --demo /path/to/KestrelDemo : a fictional machine for screenshots (see docs/DEMO.md)
+        i = sys.argv.index("--demo")
+        if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
+            root = sys.argv[i + 1]
+            del sys.argv[i:i + 2]
+        else:
+            root = os.path.join(HOME, "KestrelDemo")
+            del sys.argv[i]
+        if not os.path.isdir(root):
+            print(f"kestrel: demo folder not found: {root}", file=sys.stderr)
+            return 2
+        globals()["DEMO"] = demo_setup(root)
+        globals()["HOME"] = DEMO["home"]
+        if len(sys.argv) == 1:
+            sys.argv.append(os.path.join(DEMO["root"], "Projects", "Hollowmere"))
     cfg0 = load_config()
     globals()["UI_CORES"] = int(cfg0.get("ui_cores", 2))
     pin_ui_thread()

@@ -7,6 +7,8 @@ and gtk3, which Rocky Linux 9 Workstation already has
 (otherwise: sudo dnf install python3-gobject gtk3).
 
 Usage:  kestrel [folder ...]
+        kestrel --demo [KestrelDemo folder]     fictional machine for screenshots (docs/DEMO.md)
+        kestrel --selftest | --preview-bench | --stress | --nav-bench | --profile | --probe-gl | --probe-model
 """
 from __future__ import annotations
 
@@ -67,6 +69,104 @@ APP_NAME = "Kestrel"
 APP_FULL_NAME = "Kestrel File Browser"
 VERSION = "1.0"
 HOME = os.path.expanduser("~")
+
+# --------------------------------------------------------------------------- demo mode (kestrel --demo folder)
+# A fictional machine for screenshots and demos: drives, disks, free space, user folders, user name, Quick access
+# and Recent all come from the demo folder; the real config is neither read nor written.
+DEMO: Optional[dict] = None
+
+
+def demo_setup(root: str) -> dict:
+    """Build the fake machine around `root` (the unzipped KestrelDemo folder). Returns the demo descriptor."""
+    root = os.path.abspath(root)
+    sub_ = lambda *a: os.path.join(root, *a)
+    drives = [  # label, path, kind, device, fstype, total, used, source
+        ("Local Disk (/)", sub_("System"), "local", "nvme0n1p2", "xfs", 1_000_204_886_016, 312_000_000_000, ""),
+        ("Projects (/mnt/projects)", sub_("Projects"), "local", "nvme1n1p1", "xfs", 4_000_787_030_016, 2_610_000_000_000, ""),
+        ("Archive (/mnt/archive)", sub_("Archive"), "local", "sda1", "ext4", 8_001_563_222_016, 6_950_000_000_000, ""),
+        ("KINGSTON (/run/media/artist/KINGSTON)", sub_("KINGSTON"), "removable", "sdb1", "exfat", 61_847_142_400, 8_200_000_000, ""),
+        ("studio (nas01:/export/studio)", sub_("studio_nas"), "network", "", "nfs4", 43_980_465_111_040, 31_200_000_000_000, "nas01:/export/studio"),
+    ]
+    disks = [
+        {"name": "nvme0n1", "model": "Samsung SSD 980 PRO 1TB", "size": 1_000_204_886_016, "tran": "NVME", "removable": False,
+         "parts": [{"name": "nvme0n1p1", "size": 629_145_600, "fstype": "vfat", "label": "EFI", "mountpoints": []},
+                   {"name": "nvme0n1p2", "size": 999_575_740_416, "fstype": "xfs", "label": "rocky", "mountpoints": [sub_("System")]}]},
+        {"name": "nvme1n1", "model": "WD_BLACK SN850X 4TB", "size": 4_000_787_030_016, "tran": "NVME", "removable": False,
+         "parts": [{"name": "nvme1n1p1", "size": 4_000_787_030_016, "fstype": "xfs", "label": "projects", "mountpoints": [sub_("Projects")]}]},
+        {"name": "sda", "model": "Seagate IronWolf 8TB", "size": 8_001_563_222_016, "tran": "SATA", "removable": False,
+         "parts": [{"name": "sda1", "size": 7_501_563_222_016, "fstype": "ext4", "label": "archive", "mountpoints": [sub_("Archive")]},
+                   {"name": "sda2", "size": 500_000_000_000, "fstype": "ntfs", "label": "Windows", "mountpoints": []}]},
+        {"name": "sdb", "model": "Kingston DataTraveler 3.0", "size": 61_847_142_400, "tran": "USB", "removable": True,
+         "parts": [{"name": "sdb1", "size": 61_847_142_400, "fstype": "exfat", "label": "KINGSTON", "mountpoints": [sub_("KINGSTON")]}]},
+    ]
+    for d in drives:
+        os.makedirs(d[1], exist_ok=True)
+    home = sub_("Home")
+    os.makedirs(home, exist_ok=True)
+    return {"root": root, "home": home, "drives": drives, "disks": disks, "user": "artist",
+            "usage": {d[1]: (d[6], d[5]) for d in drives}}
+
+
+def demo_config() -> dict:
+    """A fresh config with Quick access / Recent pointing into the demo folder."""
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    r = DEMO["root"]
+    j = lambda *a: os.path.join(r, *a)
+    cfg["pinned"] = [p for p in (j("Projects", "Hollowmere"), j("Projects", "Hollowmere", "renders"), j("Projects", "Hollowmere", "reference", "concept"),
+                                 j("studio_nas", "library", "hdri"), j("Home", "Downloads")) if os.path.isdir(p)]
+    cfg["recent"] = [p for p in (j("Projects", "Hollowmere", "docs", "dailies_notes_2026-10-24.txt"),
+                                 j("Projects", "Hollowmere", "assets", "creatures", "bogwraith", "model", "bogwraith_sculpt_v007.obj"),
+                                 j("Projects", "Hollowmere", "renders", "sh010", "beauty", "sh010_beauty_v004.1001.exr"),
+                                 j("Projects", "Hollowmere", "reference", "concept", "hollowmere_keyart_v03.png"),
+                                 j("Projects", "Hollowmere", "shots", "sh010", "playblast", "sh010_anim_latest.mp4"),
+                                 j("Home", "Documents", "timesheet_oct.csv")) if os.path.isfile(p)]
+    cfg["frequent"] = {j("Projects", "Hollowmere", "shots"): 41, j("Projects", "Hollowmere", "assets"): 37, j("Home", "Pictures"): 12, j("Archive"): 9}
+    cfg["preview_pane"] = cfg["details_pane"] = True
+    return cfg
+
+
+_DEMO_MOUNTS = {"System": "", "Projects": "/mnt/projects", "Archive": "/mnt/archive", "KINGSTON": "/run/media/artist/KINGSTON",
+                "studio_nas": "/mnt/studio", "Home": "/home/artist"}
+
+
+def pretty_path(path: str) -> str:
+    """The path as shown to the user. Identity normally; in demo mode the demo folder is presented as the
+    fictional machine's mount points so no real path (or user name) appears anywhere in the window."""
+    if DEMO is None or not path:
+        return path
+    root = DEMO["root"]
+    if path == root:
+        return "/"
+    if path.startswith(root + os.sep):
+        rest = path[len(root) + 1:].split(os.sep, 1)
+        top = _DEMO_MOUNTS.get(rest[0])
+        if top is not None:
+            return (top + ("/" + rest[1] if len(rest) > 1 else "")) or "/"
+    return path
+
+
+def demo_drive_root(path: str) -> Optional[Tuple[str, str]]:
+    """(short label, drive path) of the demo drive containing `path`."""
+    if DEMO is None:
+        return None
+    for label, dp, _k, *_ in DEMO["drives"]:
+        if path == dp or path.startswith(dp + os.sep):
+            return label.split(" (")[0], dp
+    if path == DEMO["home"] or path.startswith(DEMO["home"] + os.sep):
+        return "artist", DEMO["home"]
+    return None
+
+
+_Usage = __import__("collections").namedtuple("_Usage", "total used free")
+
+
+def disk_usage(path: str):
+    """shutil.disk_usage, or the fictional numbers in demo mode."""
+    if DEMO is not None:
+        for mp, (used, total) in DEMO["usage"].items():
+            if path == mp or path.startswith(mp + os.sep):
+                return _Usage(total, used, total - used)
+    return shutil.disk_usage(path)
 CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "kestrel")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -95,6 +195,8 @@ ATTRS = ("standard::name,standard::type,standard::size,standard::icon,standard::
 
 # --------------------------------------------------------------------------- config
 def load_config() -> dict:
+    if DEMO is not None:
+        return demo_config()
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     old = os.path.join(GLib.get_user_config_dir(), "explorer-gtk", "config.json")
     if not os.path.exists(CONFIG_FILE) and os.path.exists(old):
@@ -114,6 +216,8 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
+    if DEMO is not None:
+        return
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         tmp = CONFIG_FILE + ".tmp"
@@ -326,6 +430,8 @@ _OWNERS: Dict[int, str] = {}
 
 
 def _owner_name(uid: int) -> str:
+    if DEMO is not None:
+        return DEMO["user"] if uid == os.getuid() else ("root" if uid == 0 else "pipeline")
     n = _OWNERS.get(uid)
     if n is None:
         try:
@@ -486,6 +592,13 @@ def group_label(e: Entry, group_by: str) -> str:
 def xdg_user_dirs() -> List[Tuple[str, str, str]]:
     """[(label, path, icon-name)]"""
     out = []
+    if DEMO is not None:
+        for label, icon in (("Desktop", "user-desktop"), ("Documents", "folder-documents"), ("Downloads", "folder-download"),
+                            ("Music", "folder-music"), ("Pictures", "folder-pictures"), ("Videos", "folder-videos")):
+            p = os.path.join(DEMO["home"], label)
+            if os.path.isdir(p):
+                out.append((label, p, icon))
+        return out
     for key, label, icon in ((GLib.UserDirectory.DIRECTORY_DESKTOP, "Desktop", "user-desktop"),
                              (GLib.UserDirectory.DIRECTORY_DOCUMENTS, "Documents", "folder-documents"),
                              (GLib.UserDirectory.DIRECTORY_DOWNLOAD, "Downloads", "folder-download"),
@@ -531,6 +644,12 @@ def drives(kind: Optional[str] = None) -> List[Tuple[str, str, Gio.Icon, str]]:
     """[(label, mountpoint, icon, kind)] with kind in local | removable | network.
     Pass kind to filter. Network = NFS, SMB/CIFS, sshfs, davfs, rclone, gvfs mounts…"""
     out: List[Tuple[str, str, Gio.Icon, str]] = []
+    if DEMO is not None:
+        for label, path, k, _dev, _fs, _tot, _used, _src in DEMO["drives"]:
+            icon = Gio.ThemedIcon.new_with_default_fallbacks("drive-removable-media-usb") if k == "removable" else \
+                Gio.ThemedIcon.new("network-server" if k == "network" else "drive-harddisk")
+            out.append((label, path, icon, k))
+        return [d for d in out if kind is None or d[3] == kind]
     seen = set()
     fs_of = {mp: fs for mp, fs in _mounts()}
 
@@ -649,6 +768,8 @@ _LSBLK_CACHE: Dict[str, Tuple[float, list]] = {}
 def physical_disks() -> List[dict]:
     """Physical disks and their partitions, from lsblk (util-linux): [{name, model, size, tran, removable,
     parts: [{name, size, fstype, label, mountpoints}]}]. Cached 10 s; empty if lsblk is unavailable."""
+    if DEMO is not None:
+        return DEMO["disks"]
     now = time.time()
     hit = _LSBLK_CACHE.get("d")
     if hit and now - hit[0] < 10:
@@ -700,6 +821,8 @@ def volumes_unmounted() -> List[Tuple[str, "Gio.Volume", Gio.Icon]]:
     listed: they only appear once the user mounts them explicitly (then they show as local disks).
     [(label, GVolume, icon)]."""
     out = []
+    if DEMO is not None:
+        return out
     for v in Gio.VolumeMonitor.get().get_volumes():
         if v.get_mount() is not None or not v.can_mount():
             continue
@@ -806,6 +929,8 @@ def udisks_format(device: str, fstype: str, label: str, erase: bool, on_done: Ca
 
 
 def _mount_source(mp: str) -> str:
+    if DEMO is not None:
+        return next((d[7] for d in DEMO["drives"] if d[1] == mp), "")
     try:
         with open("/proc/mounts") as f:
             for line in f:
@@ -3949,7 +4074,7 @@ class PropertiesDialog(Gtk.Dialog):
         if not e.is_dir:
             app = Gio.AppInfo.get_default_for_type(e.content_type, False) if e.content_type else None
             self._row(g, r, "Opens with:", app.get_display_name() if app else "Unknown application"); r += 1
-        self._row(g, r, "Location:", os.path.dirname(e.path)); r += 1
+        self._row(g, r, "Location:", pretty_path(os.path.dirname(e.path))); r += 1
         self.size_lab = self._row(g, r, "Size:", fmt_size(e.size or 0) + f" ({(e.size or 0):,} bytes)"); r += 1
         blocks = (st.st_blocks * 512) if st else 0
         self._row(g, r, "Size on disk:", f"{fmt_size(blocks)} ({blocks:,} bytes)"); r += 1
@@ -4095,7 +4220,7 @@ class MultiPropertiesDialog(Gtk.Dialog):
         g.attach(Gtk.Label(label="Type:", xalign=1), 0, 0, 1, 1)
         g.attach(Gtk.Label(label=f"Multiple Types ({nf} Files, {len(sel) - nf} Folders)", xalign=0), 1, 0, 1, 1)
         g.attach(Gtk.Label(label="Location:", xalign=1), 0, 1, 1, 1)
-        g.attach(Gtk.Label(label=f"All in {os.path.dirname(sel[0].path)}", xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE), 1, 1, 1, 1)
+        g.attach(Gtk.Label(label=f"All in {pretty_path(os.path.dirname(sel[0].path))}", xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE), 1, 1, 1, 1)
         g.attach(Gtk.Label(label="Size:", xalign=1), 0, 2, 1, 1)
         self.size_lab = Gtk.Label(label="calculating…", xalign=0)
         g.attach(self.size_lab, 1, 2, 1, 1)
@@ -8387,7 +8512,7 @@ class FolderView(Gtk.Box):
         if p.startswith(HOME + "/"):
             rel = "~/" + p[len(HOME) + 1:]
         else:
-            rel = p
+            rel = pretty_path(p)
         parts = [x for x in rel.split("/") if x]
         if rel.startswith("/"):
             parts.insert(0, "")
@@ -8990,7 +9115,11 @@ class MainWindow(Gtk.ApplicationWindow):
         if path in VIRTUAL:
             return [(self.display_path(path), path)]
         out = [("This PC", THISPC)]
-        if path == HOME or path.startswith(HOME + "/"):
+        dr = demo_drive_root(path)
+        if dr is not None:
+            out.append(dr)
+            rest, acc = path[len(dr[1]):].strip("/"), dr[1]
+        elif path == HOME or path.startswith(HOME + "/"):
             out.append((os.path.basename(HOME), HOME))
             rest, acc = path[len(HOME):].strip("/"), HOME
         else:
@@ -9004,7 +9133,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def edit_address(self):
         t = self.tab
-        self.addr.set_text("" if t.path in VIRTUAL else t.path)
+        self.addr.set_text("" if t.path in VIRTUAL else pretty_path(t.path))
         self.path_stack.set_visible_child_name("entry")
         self.addr.grab_focus()
         self.addr.select_region(0, -1)
@@ -9452,7 +9581,7 @@ class MainWindow(Gtk.ApplicationWindow):
         def work():
             for e in drive_entries:
                 try:
-                    u = shutil.disk_usage(e.path)
+                    u = disk_usage(e.path)
                     e.usage = (u.total - u.free, u.total)
                     e.type = f"{fmt_size(u.free)} free of {fmt_size(u.total)}"
                 except OSError:
@@ -9550,7 +9679,7 @@ class MainWindow(Gtk.ApplicationWindow):
             message(self, "Format", "Couldn't find the block device for this drive.", Gtk.MessageType.ERROR)
             return
         try:
-            total = shutil.disk_usage(path).total
+            total = disk_usage(path).total
         except OSError:
             total = 0
         d = Gtk.Dialog(title=f"Format {label}", transient_for=self, modal=True)
@@ -10686,14 +10815,14 @@ class MainWindow(Gtk.ApplicationWindow):
             self.details_title.set_markup(f"<b>{GLib.markup_escape_text(self.display_path(t.path))}</b>")
             nd = sum(1 for e in t.entries if e.is_dir)
             self.qv_subtitle.set_text(f"{len(t.entries) - nd} files, {nd} folders")
-            rows = [("Location", t.path if t.path not in VIRTUAL else self.display_path(t.path))]
+            rows = [("Location", pretty_path(t.path) if t.path not in VIRTUAL else self.display_path(t.path))]
             if t.path not in VIRTUAL:
                 rows.append(("Disk", "…"))
                 tp = t.path
 
                 def dwork():
                     try:
-                        u = shutil.disk_usage(tp)
+                        u = disk_usage(tp)
                         txt = f"{fmt_size(u.free)} free of {fmt_size(u.total)}"
                     except OSError:
                         txt = "unavailable"
@@ -10706,7 +10835,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self.qv_subtitle.set_text(f"{len(sel) - nd} files, {nd} folders")
             total = sum(e.size or 0 for e in sel if not e.is_dir)
             rows = [("Size", fmt_size(total) + ("  (files only)" if nd else "")),
-                    ("Location", os.path.dirname(sel[0].path))]
+                    ("Location", pretty_path(os.path.dirname(sel[0].path)))]
             exts = sorted({e.ext for e in sel if e.ext})
             if exts:
                 rows.append(("Types", ", ".join(exts[:8]) + ("…" if len(exts) > 8 else "")))
@@ -10721,7 +10850,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 rows.append(("Size", "calculating…"))
             else:
                 rows.append(("Size", f"{fmt_size(e.size)}  ({(e.size or 0):,} bytes)"))
-            rows.append(("Location", e.location or os.path.dirname(e.path)))
+            rows.append(("Location", e.location or pretty_path(os.path.dirname(e.path))))
             rows.append(("Modified", fmt_date(e.mtime, f_long)))
             if e.ctime:
                 rows.append(("Created", fmt_date(e.ctime, f_long)))
@@ -10941,7 +11070,7 @@ class MainWindow(Gtk.ApplicationWindow):
         t = self.tab
         if t is None:
             return
-        self.set_title((t.path if (self.cfg["full_path_title"] and t.path not in VIRTUAL) else t.title()) + " — " + APP_NAME)
+        self.set_title((pretty_path(t.path) if (self.cfg["full_path_title"] and t.path not in VIRTUAL) else t.title()) + " — " + APP_NAME)
 
     def _update_history_buttons(self):
         t = self.tab
@@ -11307,7 +11436,7 @@ class MainWindow(Gtk.ApplicationWindow):
         def work():
             for e in drive_entries:
                 try:
-                    u = shutil.disk_usage(e.path)
+                    u = disk_usage(e.path)
                     e.usage = (u.total - u.free, u.total)
                     e.type = f"{fmt_size(u.free)} free of {fmt_size(u.total)}"
                 except OSError:
@@ -12879,6 +13008,22 @@ def main():
             return 0
         print("FAILED:", (m or {}).get("error", "no result"))
         return 1
+    if "--demo" in sys.argv[1:]:
+        # kestrel --demo /path/to/KestrelDemo : a fictional machine for screenshots (see docs/DEMO.md)
+        i = sys.argv.index("--demo")
+        if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
+            root = sys.argv[i + 1]
+            del sys.argv[i:i + 2]
+        else:
+            root = os.path.join(HOME, "KestrelDemo")
+            del sys.argv[i]
+        if not os.path.isdir(root):
+            print(f"kestrel: demo folder not found: {root}", file=sys.stderr)
+            return 2
+        globals()["DEMO"] = demo_setup(root)
+        globals()["HOME"] = DEMO["home"]
+        if len(sys.argv) == 1:
+            sys.argv.append(os.path.join(DEMO["root"], "Projects", "Hollowmere"))
     cfg0 = load_config()
     globals()["UI_CORES"] = int(cfg0.get("ui_cores", 2))
     pin_ui_thread()

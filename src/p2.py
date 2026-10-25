@@ -272,7 +272,7 @@ class PropertiesDialog(Gtk.Dialog):
         if not e.is_dir:
             app = Gio.AppInfo.get_default_for_type(e.content_type, False) if e.content_type else None
             self._row(g, r, "Opens with:", app.get_display_name() if app else "Unknown application"); r += 1
-        self._row(g, r, "Location:", os.path.dirname(e.path)); r += 1
+        self._row(g, r, "Location:", pretty_path(os.path.dirname(e.path))); r += 1
         self.size_lab = self._row(g, r, "Size:", fmt_size(e.size or 0) + f" ({(e.size or 0):,} bytes)"); r += 1
         blocks = (st.st_blocks * 512) if st else 0
         self._row(g, r, "Size on disk:", f"{fmt_size(blocks)} ({blocks:,} bytes)"); r += 1
@@ -418,7 +418,7 @@ class MultiPropertiesDialog(Gtk.Dialog):
         g.attach(Gtk.Label(label="Type:", xalign=1), 0, 0, 1, 1)
         g.attach(Gtk.Label(label=f"Multiple Types ({nf} Files, {len(sel) - nf} Folders)", xalign=0), 1, 0, 1, 1)
         g.attach(Gtk.Label(label="Location:", xalign=1), 0, 1, 1, 1)
-        g.attach(Gtk.Label(label=f"All in {os.path.dirname(sel[0].path)}", xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE), 1, 1, 1, 1)
+        g.attach(Gtk.Label(label=f"All in {pretty_path(os.path.dirname(sel[0].path))}", xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE), 1, 1, 1, 1)
         g.attach(Gtk.Label(label="Size:", xalign=1), 0, 2, 1, 1)
         self.size_lab = Gtk.Label(label="calculating…", xalign=0)
         g.attach(self.size_lab, 1, 2, 1, 1)
