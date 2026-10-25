@@ -1,0 +1,22 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System packages
+        run: sudo apt-get update && sudo apt-get install -y python3-gi gir1.2-glib-2.0 python3-numpy p7zip-full zip
+      - name: Build matches committed kestrel.py
+        run: |
+          cp kestrel.py /tmp/committed.py
+          ./build.sh
+          cmp kestrel.py /tmp/committed.py || { echo "kestrel.py is out of date: run ./build.sh and commit"; exit 1; }
+      - name: Python 3.9 syntax check (Rocky 9 baseline)
+        uses: actions/setup-python@v5
+        with: { python-version: '3.9' }
+      - run: python3.9 -m py_compile kestrel.py
+      - name: Headless self-test
+        run: /usr/bin/python3 tests/headless.py --selftest
+      - name: Portable zip builds
+        run: ./make-portable.sh

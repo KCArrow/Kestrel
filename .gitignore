@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+/dist/
+/build/
+*.tar.gz
+*.zip
+/tests/sandbox/
+/tests/screen.txt
+.venv/

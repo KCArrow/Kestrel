@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Kestrel File Browser
+GenericName=File Manager
+Comment=Fast, Windows-Explorer-style file browser
+Exec=kestrel %U
+Icon=system-file-manager
+Terminal=false
+Categories=System;FileTools;FileManager;Utility;
+MimeType=inode/directory;
+Keywords=files;folders;explorer;browser;kestrel;
+StartupNotify=true
