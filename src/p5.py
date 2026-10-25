@@ -142,7 +142,9 @@
                     {"label": "_Update file index now", "cb": self.index_now, "sensitive": bool(cfg.get("index_enabled"))},
                     ("_Optional tools and integrations…", lambda: self.folder_options(3)), "-",
                     ("_Preferences…", lambda: self.folder_options(0))]
-        return [("_View help (keyboard shortcuts)", lambda: show_shortcuts(self), "F1"), ("_About Kestrel", lambda: show_about(self))]
+        return [("_View help (keyboard shortcuts)", lambda: show_shortcuts(self), "F1"), "-",
+                ("_Report a problem…", lambda: open_report(self)), "-",
+                ("_About Kestrel", lambda: show_about(self))]
 
     def _new_item_spec(self):
         return [("_Folder", lambda: self.new_item("folder")), ("_Shortcut", lambda: self.new_item("shortcut")),
@@ -1169,8 +1171,21 @@ class ExplorerApp(Gtk.Application):
         prov.load_from_data(CSS)
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
+    def _on_report(self, path: str):
+        """CrashReporter hook (GTK thread): an error happened at run time — show the bar in the active window."""
+        w = self.get_active_window() or (self.get_windows() or [None])[0]
+        if w is not None and hasattr(w, "show_report_notice"):
+            w.show_report_notice(path)
+
     def do_activate(self):
         w = self.new_window(None)
+        CRASH.on_report = self._on_report
+        pend = CRASH.pending()
+        if pend:
+            first = CRASH.previous[0] if CRASH.previous else pend[0]
+            msg = (CRASH.summary_of(first) if CRASH.previous else
+                   f"{len(pend)} unsent error report{'s' if len(pend) > 1 else ''} — " + CRASH.summary_of(first))
+            GLib.timeout_add(900, lambda: (w.show_report_notice(first, msg), False)[1])
         if STRESS is not None:
             drv = StressDriver(w, STRESS[0], STRESS[1], STRESS[2])
             GLib.timeout_add(1500, lambda: (drv.start(), False)[1])
@@ -1405,10 +1420,15 @@ def main():
     sys.setswitchinterval(0.002)      # let the GTK thread grab the GIL back from Python workers within ~2 ms
     if cfg0.get("gdk_backend") and not os.environ.get("GDK_BACKEND"):
         os.environ["GDK_BACKEND"] = cfg0["gdk_backend"]       # chosen by --probe-gl; must be set before the display opens
+    CRASH.install()
     app = ExplorerApp()
+    # logout / kill / Ctrl+C in the terminal: quit cleanly so the run isn't mistaken for a crash next time
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, lambda *a: (app.quit(), False)[1])
     try:
         return app.run(sys.argv)
     finally:
+        CRASH.shutdown()
         save_config(app.cfg)
         if PROFILE is not None:
             out = os.path.join(GLib.get_user_cache_dir(), "kestrel", "profile.prof")

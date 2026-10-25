@@ -101,7 +101,14 @@ diagnostics report you can copy. **Tools → Performance report…** shows stall
 
 ## Reporting a problem
 
-Include: Kestrel version (Help → About), distro and desktop (Wayland or X11), the diagnostics
+The quickest way: **Help → Report a problem…**, or *Review & report…* on the error bar after a crash.
+The report already contains the version, distro, desktop, the stack trace and recent activity;
+describe what you were doing at the top and press *Report on GitHub…*.
+Reports live in `~/.cache/kestrel/reports/` if you'd rather attach the file yourself.
+
+If you report by hand, include:
+
+Kestrel version (Help → About), distro and desktop (Wayland or X11), the diagnostics
 report from Preferences → Optional, and for freezes the newest `~/.cache/kestrel/freeze-*.txt`
 or the Performance report. For a preview problem with a specific file type, the output of
 `kestrel --probe-model <file>` (3D) or the file's `file --mime-type` result.

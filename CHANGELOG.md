@@ -18,6 +18,8 @@ nonprofits; commercial licences available — see COMMERCIAL-LICENSE.md).
 - CPU parking, stall watchdog with freeze dumps, `--selftest`, `--preview-bench`, `--stress`,
   `--nav-bench`, `--profile`, `--probe-gl`, `--probe-model`
 - OpenRV integration (Ctrl+Shift+R)
+- Crash and error reporting: exceptions, hard crashes and freezes become reports you can review,
+  edit and file as a GitHub issue (Help → Report a problem…)
 - `--demo` mode: fictional drives, disks, user folders and config for screenshots (docs/DEMO.md)
 - Preferences dialog with General / View / Search / Optional tabs and dependency diagnostics
 

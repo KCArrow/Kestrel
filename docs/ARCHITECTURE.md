@@ -11,8 +11,10 @@ namespace, so a part may use anything defined in an earlier part, and a class de
 | `p1b.py` | ~900  | image decoders written in pure Python/numpy (EXR, Radiance HDR, Maya IFF, PSD/PSB), tone-mapping, external converter fallbacks, information previews (archive listing, media info), `PathCache` (non-blocking exists/isdir), CPU parking, the `run_heavy` process pool, `generate_preview` |
 | `p1c.py` | ~950  | diagnostics: `StallWatchdog` (main-loop stall detection, freeze dumps), navigation log, `run_selftest`, synthetic file generators and `run_preview_bench`, `StressDriver` (GUI stress and nav benchmarks) |
 | `p1d.py` | ~350  | encrypted file index: `IndexKey` (keyring or key file), `FileIndex` (crawl, lookup, search, encrypt-then-MAC storage) |
+| `p1e.py` | ~400  | crash detection and error reports: `CrashReporter` (exception hooks, faulthandler + per-process session markers for hard crashes, report files, sanitising, pre-filled GitHub issues), `CRASH` |
 | `p2.py`  | ~850  | dialogs: message/ask helpers, `ProgressDialog`, Properties, `OptionsDialog` (Preferences: General / View / Search / Optional), shortcuts, about |
 | `p2b.py` | ~250  | Batch rename dialog and `apply_renames` |
+| `p2c.py` | ~90   | `ReportDialog` (review / edit / send a report), `open_report` |
 | `p3b.py` | ~850  | custom widgets: `FitImage`, row hover, soft grid lines, virtualised `IconGrid`, This PC tile view (`PCView`, `DriveBar`) |
 | `p3c.py` | ~1400 | 3D preview: `load_model` + `_finish_model_numpy` (triangulation, decimation, normals), software rasteriser (`_rasterize`, `software_render`) and its `RenderWorker` process, `ModelView` (cairo) and `GLModelView` (Gtk.GLArea), GStreamer `VideoPreview` |
 | `p3d.py` | ~700  | 3D importers for FBX / USD / Alembic (HDF5 via h5py), Blender and assimp bridges, `optional_deps`, `install_script`, `preview_tool_report`, GL status |
@@ -89,6 +91,26 @@ thread's Python stack, > 4 s dumps every thread (`faulthandler`) to `~/.cache/ke
 `NAV_LOG` records each navigation (listing time, paint time, source: index/disk). `--profile` wraps
 the main loop in cProfile. `StressDriver` drives the real window (navigate, select, preview,
 rename, zip, undo) and reports stalls per step; `--nav-bench` visits every subfolder of a path.
+
+## Crash and error reports (`p1e.py`, `p2c.py`)
+
+| Trouble | How it is caught | What the user sees |
+|---|---|---|
+| unhandled Python exception (GTK callback, worker thread) | `sys.excepthook`, `threading.excepthook` | error bar in the active window, once per distinct failure site |
+| hard crash (segfault, abort, fatal signal) | `faulthandler` writes every thread's stack to `reports/fault-<pid>.txt`; `reports/session-<pid>.json` exists while the process runs and is removed on a clean quit | at the next start, a bar: "Kestrel crashed…" |
+| freeze > 4 s | `StallWatchdog.dump_freeze` (p1c) | bar when the interface recovers; if the user killed it, at the next start |
+| process killed (OOM, SIGKILL, power loss) | stale session marker without a fault trace | recorded as `ended`, not prompted (nothing to diagnose) |
+
+SIGTERM, SIGHUP and SIGINT quit the application cleanly (`GLib.unix_signal_add`) so a logout isn't
+mistaken for a crash. Several Kestrel processes can run at once; markers are per pid and a marker
+whose pid is still alive is left alone.
+
+Reports are plain text: summary, environment (versions, distro, desktop, RAM, a few settings),
+traceback / stacks, watchdog stalls this session and the last 40 `bench()` events (`RECENT_LOG`).
+`CrashReporter.sanitize` replaces `$HOME` with `~` and the user name with `<user>`. Reporting is
+always user-initiated: *Report on GitHub…* opens a new issue in the browser with title and body
+pre-filled (truncated at 6000 characters to fit the URL; *Copy* has the full text). The issue URL
+is `REPORT_ISSUES_URL` at the top of `p1e.py`.
 
 ## Configuration
 

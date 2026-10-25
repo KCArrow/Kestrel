@@ -63,7 +63,11 @@ _T0 = float(os.environ.get("EXPLORER_BENCH_T0") or time.time())
 BENCH = bool(os.environ.get("EXPLORER_BENCH"))
 
 
+RECENT_LOG = __import__("collections").deque(maxlen=200)   # last events, included in error reports
+
+
 def bench(label: str):
+    RECENT_LOG.append(f"{time.strftime('%H:%M:%S')}  {label}")
     if BENCH:
         sys.stderr.write(f"bench: {label} {int((time.time() - _T0) * 1000)} ms\n")
         sys.stderr.flush()

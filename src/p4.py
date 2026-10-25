@@ -74,6 +74,16 @@ class MainWindow(Gtk.ApplicationWindow):
         self._build_menubar()
         vbox.pack_start(self._build_toolbar(), False, False, 0)
         vbox.pack_start(self._build_commandbar(), False, False, 0)
+        # error bar: slides in when something failed (see CrashReporter); collapsed otherwise. GTK 3's InfoBar
+        # comes up blank if it is hidden and re-shown, so it stays "shown" and only its revealed state changes.
+        self.report_bar = Gtk.InfoBar(message_type=Gtk.MessageType.WARNING, show_close_button=True)
+        self.report_bar.set_revealed(False)
+        self.report_label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.report_bar.get_content_area().pack_start(self.report_label, True, True, 0)
+        self.report_bar.add_button("Review & report…", 1)
+        self.report_bar.connect("response", self._on_report_bar)
+        self._report_path: Optional[str] = None
+        vbox.pack_start(self.report_bar, False, False, 0)
         self.notebook = Gtk.Notebook(scrollable=True)
         self.notebook.set_show_border(False)
         self.notebook.set_group_name("kestrel-tabs")
@@ -2710,6 +2720,27 @@ class MainWindow(Gtk.ApplicationWindow):
             self.go_forward()
             return True
         return False
+
+    # ------------------------------------------------------------------ error reports
+    def show_report_notice(self, path: str, text: Optional[str] = None):
+        """Slide in the error bar for the report at `path`."""
+        if STRESS is not None:
+            return
+        self._report_path = path
+        self.report_label.set_text(text or ("Something went wrong: " + CRASH.summary_of(path)))
+        self.report_label.set_tooltip_text(CRASH.summary_of(path))
+        self.report_bar.set_revealed(True)
+
+    def _on_report_bar(self, bar, response):
+        bar.set_revealed(False)
+        if response == 1 and self._report_path:
+            path, self._report_path = self._report_path, None
+            if os.path.exists(path):
+                open_report(self, path)
+            nxt = CRASH.pending()            # more than one waiting (several errors, or crash + error): next one
+            if nxt:
+                self.show_report_notice(nxt[0], f"{len(nxt)} more error report{'s' if len(nxt) > 1 else ''} waiting — "
+                                                + CRASH.summary_of(nxt[0]))
 
     def _on_close(self, *a):
         if not self.prompt_save():

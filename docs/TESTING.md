@@ -14,7 +14,8 @@ Covers: listing/sorting/grouping, formatting, `unique_name`, `Entry` from dirent
 IFF / PSD decoders (synthetic files, bit-exact numpy vs. pure-Python), tone-mapping, OBJ/STL
 loading, `_finish_model_numpy` (triangulation, decimation, normals), the rasteriser, zip/7z
 round-trips through `ArchiveOp`, archive descriptions, batch-rename planning, RV sequence
-detection, drive classification helpers, index encrypt/decrypt/HMAC round-trip and search.
+detection, drive classification helpers, the crash reporter (stale-session detection, de-duplication,
+home-folder scrubbing), index encrypt/decrypt/HMAC round-trip and search.
 Each line prints its wall time; a non-zero exit means a failure.
 
 `tests/headless.py` stubs `Gtk`, `Gdk`, `GdkPixbuf`, `Pango`, `GtkSource` and `Gst` but uses the

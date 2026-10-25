@@ -91,6 +91,10 @@ class StallWatchdog:
                 f.flush()
                 faulthandler.dump_traceback(file=f, all_threads=True)
             sys.stderr.write(f"\nkestrel: INTERFACE FROZEN for {age:.0f}s — stacks written to {path}\n")
+            try:
+                CRASH.freeze_report(path)
+            except NameError:
+                pass
             sys.stderr.flush()
             faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
         except Exception:
@@ -249,6 +253,43 @@ def run_selftest(bench: bool = False) -> int:
                 open(os.path.join(d, f"shot.{i}.exr"), "w").close()
             self.assertEqual(rv_sequence_for(os.path.join(d, "shot.1002.exr")), os.path.join(d, "shot.#.exr"))
             self.assertIsNone(rv_sequence_for(os.path.join(d, "nope.exr")))
+
+        @timed("crash reporter")
+        def test_crash_reporter(self):
+            d = os.path.join(self.tmp, "reports")
+            cr = CrashReporter(d)
+            os.makedirs(d, exist_ok=True)
+            # a previous run that died with a fault trace, and one that just vanished
+            dead = 2 ** 22 + 12345
+            for pid, fault in ((dead, "Fatal Python error: Segmentation fault\n  File x"), (dead + 1, "")):
+                with open(os.path.join(d, f"session-{pid}.json"), "w") as f:
+                    json.dump({"pid": pid, "started": time.time() - 60, "version": VERSION}, f)
+                with open(os.path.join(d, f"fault-{pid}.txt"), "w") as f:
+                    f.write(fault)
+            prev = cr._check_previous()
+            self.assertEqual(len(prev), 1)
+            self.assertIn("crashed", cr.summary_of(prev[0]))
+            self.assertFalse(any(n.startswith(("session-", "fault-")) for n in os.listdir(d)))
+            self.assertEqual(len(cr.pending()), 1)          # the traceless 'ended' one isn't pending
+            # runtime exception: reported once per failure site, home folder scrubbed
+            def boom():
+                raise ValueError(os.path.join(os.path.expanduser("~"), "secret", "file.exr"))
+            paths = []
+            for _ in range(2):
+                try:
+                    boom()
+                except ValueError:
+                    paths.append(cr.record(*sys.exc_info()))
+            self.assertIsNotNone(paths[0])
+            self.assertIsNone(paths[1])
+            with open(paths[0]) as f:
+                txt = f.read()
+            self.assertIn("ValueError", txt)
+            self.assertIn("~/secret/file.exr", txt)
+            if os.path.expanduser("~") not in ("/", "/root"):
+                self.assertNotIn(os.path.expanduser("~"), txt)
+            cr.archive(paths[0], "sent")
+            self.assertEqual(len(cr.pending()), 1)
 
         @timed("zip round trip (ArchiveOp)")
         def test_zip_roundtrip(self):

@@ -94,6 +94,12 @@ thumbnails, previews, searches and sizes run in threads or worker processes. Opt
 pins the interface to its own cores so a heavy preview can't make the window stutter. A stall
 watchdog and freeze dumps are built in (see [Tests and diagnostics](#tests-and-diagnostics)).
 
+**Crash and error reports.** Unhandled errors, hard crashes (segfaults in a C library) and
+interface freezes are caught and written to a report. Kestrel shows a bar with *Review & report…*;
+you see the full report, can edit it, and open it as a pre-filled GitHub issue with one click —
+nothing is ever sent automatically, and your home folder and user name are scrubbed first.
+**Help → Report a problem…** builds a report on demand.
+
 **OpenRV integration (optional).** Right-click → *Open in RV* or **Ctrl+Shift+R** sends images,
 sequences and movies to RV when it's detected.
 
@@ -238,6 +244,7 @@ kestrel --probe-model file         run the 3D import chain on one file and repor
 | `~/.config/kestrel/index.key` | file-index key (only when no keyring is available; mode 0600) |
 | `~/.cache/kestrel/index.enc` | encrypted file index |
 | `~/.cache/kestrel/freeze-*.txt` | thread dumps written automatically if the UI freezes > 4 s |
+| `~/.cache/kestrel/reports/` | error / crash reports (unsent ones are offered at the next start; `archive/` keeps the last 40) |
 | `~/.cache/kestrel/gl-probe.txt` | last `--probe-gl` result |
 
 A legacy `~/.config/explorer-gtk/config.json` is migrated automatically on first start.
