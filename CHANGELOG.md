@@ -2,7 +2,8 @@
 
 ## 1.0 — 2026-10-25
 
-First public release.
+First public release. Licensed under PolyForm Noncommercial 1.0.0 (free for individuals and
+nonprofits; commercial licences available — see COMMERCIAL-LICENSE.md).
 
 - Windows-Explorer layout: menus, command bar, tabs, split view, navigation / preview / details panes,
   all icon and list views, grouping, column chooser

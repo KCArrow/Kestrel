@@ -3,7 +3,7 @@
 ## Setup
 
 ```bash
-git clone https://github.com/KCArrow/kestrel.git && cd kestrel
+git clone https://github.com/<you>/kestrel.git && cd kestrel
 sudo dnf install python3-gobject gtk3 python3-numpy      # or the apt/pacman equivalents in README
 ./build.sh && python3 kestrel.py
 ```
@@ -29,6 +29,15 @@ sudo dnf install python3-gobject gtk3 python3-numpy      # or the apt/pacman equ
   `run_preview_bench` and a unit test in `run_selftest`.
 - UI strings are terse: labels, not explanations. Rocky 9 is the baseline: Python 3.9 syntax, GTK 3.24.
 - Keep `--selftest` fast (< 10 s without `--bench`).
+
+## Licensing of contributions
+
+Kestrel is licensed under the PolyForm Noncommercial License with commercial licences sold
+separately (see COMMERCIAL-LICENSE.md). So that this remains possible, by submitting a pull
+request you agree that your contribution is provided under the same terms **and** that you grant
+the project author a perpetual, irrevocable, royalty-free licence to use, modify and relicense it,
+including under commercial terms. You keep the copyright to your work. If you can't agree to that,
+please open an issue describing the change instead of a PR.
 
 ## Releasing
 

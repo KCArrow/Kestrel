@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Kestrel File Browser — Copyright (c) 2026 Kalib Arrowsmith. https://github.com/KCArrow/kestrel
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Required Notice: Copyright Kalib Arrowsmith (https://github.com/KCArrow/kestrel)
+# Free for individuals and noncommercial organizations; companies and studios need a commercial
+# licence — see COMMERCIAL-LICENSE.md in the repository.
 """
 Kestrel File Browser — a fast, Windows-Explorer-style file manager for Linux desktops.
 

@@ -834,6 +834,10 @@ def show_shortcuts(parent):
 def show_about(parent):
     d = Gtk.AboutDialog(transient_for=parent, modal=True, program_name=APP_FULL_NAME, version=VERSION,
                         comments="A fast, Windows-Explorer-style file manager for Linux.\nGTK 3 · PyGObject · GIO",
-                        logo_icon_name="system-file-manager", website="https://github.com/")
+                        logo_icon_name="system-file-manager", website="https://github.com/KCArrow/kestrel",
+                        copyright="© 2026 Kalib Arrowsmith", license_type=Gtk.License.CUSTOM,
+                        license="PolyForm Noncommercial License 1.0.0\n\nFree for individuals and noncommercial organizations. "
+                                "Use by companies and studios requires a commercial licence — see COMMERCIAL-LICENSE.md "
+                                "at https://github.com/KCArrow/kestrel", wrap_license=True)
     d.run()
     d.destroy()

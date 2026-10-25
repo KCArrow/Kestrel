@@ -1,5 +1,7 @@
 # Kestrel File Browser
 
+[![Support on Ko-fi](https://img.shields.io/badge/Ko--fi-support%20Kestrel-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/kalibarrowsmith)
+
 A fast, Windows-Explorer-style file manager for the Linux desktop, built for Rocky Linux 9
 and VFX/animation workstations.
 
@@ -120,7 +122,7 @@ sudo pacman -S python-gobject gtk3 python-numpy
 ## Install
 
 ```bash
-git clone https://github.com/KCArrow/kestrel.git
+git clone https://github.com/<you>/kestrel.git
 cd kestrel
 ./install.sh
 ```
@@ -290,7 +292,20 @@ and how to report a freeze.
 - [docs/DEMO.md](docs/DEMO.md) — `--demo` mode and the KestrelDemo folder for screenshots
 - [CHANGELOG.md](CHANGELOG.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md)
+- [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) — studio / company licensing
+
+## Support
+
+Kestrel is free for personal use and built in my spare time. If it saves you time, you can
+support development on **[Ko-fi](https://ko-fi.com/kalibarrowsmith)**. Studios: see
+[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) instead.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+**Free for individuals and noncommercial organizations; studios and companies need a commercial licence.**
+
+Kestrel is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE). Personal,
+hobby, student, research and non-profit use is free, including modifying and sharing it, as long
+as the copyright notice stays with it. Using it at or for a company, studio or other commercial
+organization requires a commercial licence — see [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md)
+for studio pricing and contact. Copyright © 2026 Kalib Arrowsmith.
