@@ -304,8 +304,8 @@ and how to report a freeze.
 ## Support
 
 Kestrel is free for personal use and built in my spare time. If it saves you time, you can
-support development on **[Ko-fi](https://ko-fi.com/kalibarrowsmith)**. Studios: see
-[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) instead.
+support development on **[Ko-fi](https://ko-fi.com/kalibarrowsmith)**. Studios:
+**[buy a studio licence](https://ko-fi.com/s/6ee3ebf331)** (details in [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md)).
 
 ## License
 
