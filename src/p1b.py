@@ -885,6 +885,33 @@ def run_heavy(fn, *args):
         return fn(*args)
 
 
+def shutdown_workers():
+    """Quit: kill the decoder pool and the render process instead of letting multiprocessing's exit handler
+    join them — a worker busy with a big model or EXR made closing the window hang for seconds."""
+    global _POOL
+    pool, _POOL = _POOL, None
+    if pool is not None:
+        try:
+            for p in list(getattr(pool, "_processes", {}).values()):
+                p.kill()
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+    rw = globals().get("_RENDER_WORKER")
+    if rw is not None:
+        try:
+            rw.proc.kill()
+            rw.proc.join(timeout=0.5)
+        except Exception:
+            pass
+    try:
+        import multiprocessing
+        for ch in multiprocessing.active_children():
+            ch.kill()
+    except Exception:
+        pass
+
+
 PREVIEW_DECODERS = {".iff": decode_maya_iff, ".tdi": decode_maya_iff, ".exr": decode_exr, ".hdr": decode_hdr, ".pic": decode_hdr, ".rgbe": decode_hdr,
                     ".psd": decode_psd, ".psb": decode_psd}
 

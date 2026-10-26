@@ -43,11 +43,15 @@ class StallWatchdog:
             frame = frame.f_back
         return out
 
+    def stop(self):
+        """Quitting: tear-down is allowed to take a moment and must not be reported as a freeze."""
+        self._running = False
+
     def _watch(self):
         stall_start = None
         samples: dict = {}
         dumped = False
-        while True:
+        while self._running:
             time.sleep(0.02)
             age = time.monotonic() - self._beat
             if age > self.THRESHOLD:
@@ -290,6 +294,31 @@ def run_selftest(bench: bool = False) -> int:
                 self.assertNotIn(os.path.expanduser("~"), txt)
             cr.archive(paths[0], "sent")
             self.assertEqual(len(cr.pending()), 1)
+
+        @timed("file clipboard formats")
+        def test_file_clipboard(self):
+            fc = FileClipboard()
+            img = os.path.join(self.tmp, "clip pic.jpg")
+            txt = os.path.join(self.tmp, "notes.txt")
+            for p in (img, txt):
+                with open(p, "wb") as f:
+                    f.write(b"\xff\xd8\xff" + b"0" * 64)
+            t1 = fc.targets_for([img])
+            self.assertEqual(t1[:2], ["image/png", "image/jpeg"])
+            self.assertIn("text/uri-list", t1)
+            t2 = fc.targets_for([img, txt])
+            self.assertNotIn("image/png", t2)
+            self.assertEqual(t2[0], "x-special/gnome-copied-files")
+            fc.mode, fc.paths = "cut", [img, txt]
+            fc.uris = [Gio.File.new_for_path(p).get_uri() for p in fc.paths]
+            fc.image_path = img
+            ul = fc.payload("text/uri-list").decode()
+            self.assertTrue(ul.endswith("\r\n") and ul.count("\r\n") == 2)
+            self.assertIn("clip%20pic.jpg", ul)
+            g = fc.payload("x-special/gnome-copied-files").decode().split("\n")
+            self.assertEqual(g[0], "cut")
+            self.assertEqual(len(g), 3)
+            self.assertEqual(fc.payload("image/jpeg")[:3], b"\xff\xd8\xff")
 
         @timed("zip round trip (ArchiveOp)")
         def test_zip_roundtrip(self):

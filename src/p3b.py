@@ -854,3 +854,111 @@ class PCView(Gtk.ScrolledWindow):
         if event.button == 1 and fb.get_child_at_pos(int(event.x), int(event.y)) is None:
             self.select_none()
         return False
+
+
+# --------------------------------------------------------------------------- system clipboard: files
+class FileClipboard:
+    """Puts copied/cut files on the system clipboard in every form other applications look for.
+
+    Gtk.Clipboard.set_with_data() - the usual way to offer custom formats - is not callable from PyGObject
+    (it is marked non-introspectable), so Kestrel owns the CLIPBOARD selection through a hidden widget and
+    answers format requests itself. Offered, in order of preference:
+      image/png (+ the file's own image type)  a single picture: pastes as an image in any chat / web app
+      x-special/gnome-copied-files             Nautilus and other GTK file managers (copy vs cut)
+      text/uri-list                            Chromium, Firefox, Electron apps (Teams, Discord, Slack), KDE:
+                                               web pages receive these as real files on paste
+      UTF8_STRING / text/plain                 the paths, for terminals and text fields
+    The files stay on the clipboard while Kestrel runs (as with every X11/Wayland app)."""
+    IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+                   ".webp": "image/webp", ".bmp": "image/bmp"}
+    MAX_IMAGE = 40 << 20             # bigger pictures are offered as files only
+
+    def __init__(self):
+        self.w = Gtk.Invisible()
+        self.w.connect("selection-get", self._get)
+        self.w.connect("selection-clear-event", self._lost)
+        self.sel = Gdk.SELECTION_CLIPBOARD
+        self.mode, self.paths, self.uris = "copy", [], []
+        self.image_path: Optional[str] = None
+        self._png: Optional[bytes] = None
+
+    def targets_for(self, paths: List[str]) -> List[str]:
+        targets = []
+        self.image_path = None
+        if len(paths) == 1:
+            ext = os.path.splitext(paths[0])[1].lower()
+            try:
+                small = os.path.getsize(paths[0]) <= self.MAX_IMAGE
+            except OSError:
+                small = False
+            if ext in self.IMAGE_TYPES and small:
+                self.image_path = paths[0]
+                targets.append("image/png")
+                if self.IMAGE_TYPES[ext] != "image/png":
+                    targets.append(self.IMAGE_TYPES[ext])
+        return targets + ["x-special/gnome-copied-files", "text/uri-list", "UTF8_STRING", "text/plain;charset=utf-8",
+                          "text/plain", "STRING", "TEXT"]
+
+    def set_files(self, mode: str, paths: List[str]) -> bool:
+        self.mode, self.paths = mode, list(paths)
+        self.uris = [Gio.File.new_for_path(p).get_uri() for p in paths]
+        self._png = None
+        targets = self.targets_for(paths)
+        try:
+            Gtk.selection_clear_targets(self.w, self.sel)
+            for i, t in enumerate(targets):
+                Gtk.selection_add_target(self.w, self.sel, Gdk.Atom.intern(t, False), i)
+            t0 = Gtk.get_current_event_time() or Gdk.CURRENT_TIME
+            return bool(Gtk.selection_owner_set(self.w, self.sel, t0))
+        except Exception as ex:
+            bench(f"clipboard: owning the selection failed: {ex}")
+            return False
+
+    def _lost(self, *a):
+        self.paths, self.uris, self.image_path, self._png = [], [], None, None
+        return False
+
+    def payload(self, name: str) -> Optional[bytes]:
+        """The bytes for one clipboard format (None: nothing to offer)."""
+        if name.startswith("image/"):
+            p = self.image_path
+            if not p:
+                return None
+            ext = os.path.splitext(p)[1].lower()
+            try:
+                if name == self.IMAGE_TYPES.get(ext):
+                    with open(p, "rb") as f:
+                        return f.read()
+                if name == "image/png":
+                    if self._png is None:
+                        pb = GdkPixbuf.Pixbuf.new_from_file(p)
+                        ok, buf = pb.save_to_bufferv("png", [], [])
+                        self._png = bytes(buf) if ok else b""
+                    return self._png or None
+            except Exception as ex:
+                bench(f"clipboard: image conversion failed: {ex}")
+            return None
+        if name == "x-special/gnome-copied-files":
+            return (self.mode + "\n" + "\n".join(self.uris)).encode()
+        if name == "text/uri-list":
+            return ("\r\n".join(self.uris) + "\r\n").encode()          # RFC 2483: CRLF-separated
+        return "\n".join(self.paths).encode()
+
+    def _get(self, widget, sd, info, time_):
+        name = sd.get_target().name()
+        if name in ("UTF8_STRING", "STRING", "TEXT", "text/plain", "text/plain;charset=utf-8"):
+            sd.set_text("\n".join(self.paths), -1)
+            return
+        data = self.payload(name)
+        if data:
+            sd.set(sd.get_target(), 8, data)
+
+
+_FILE_CLIPBOARD: Optional[FileClipboard] = None
+
+
+def file_clipboard() -> FileClipboard:
+    global _FILE_CLIPBOARD
+    if _FILE_CLIPBOARD is None:
+        _FILE_CLIPBOARD = FileClipboard()
+    return _FILE_CLIPBOARD

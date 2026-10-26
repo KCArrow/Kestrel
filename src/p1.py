@@ -1580,6 +1580,17 @@ def script_runner(path: str) -> Optional[List[str]]:
     return None
 
 
+def looks_runnable(e) -> bool:
+    """script_runner() without opening the file — for menus, which are built while they pop up and must not
+    wait on a network share. Uses the name, the mode bits and the content type the listing already has."""
+    if e is None or e.is_dir or not e.path:
+        return False
+    if e.ext in (".py", ".sh", ".bash") or (e.mode & 0o111):
+        return True
+    return (e.content_type or "") in ("application/x-shellscript", "text/x-python", "text/x-python3",
+                                      "application/x-executable", "application/x-sharedlib")
+
+
 def run_detached(cmd: List[str], cwd: str) -> bool:
     try:
         subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)

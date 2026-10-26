@@ -383,6 +383,8 @@ class FolderView(Gtk.Box):
     # ---- per-row icon-view data (computed once at fill time, see _rows_for)
     def _iv_tile(self, e: Entry):
         """Called by the grid the first time a tile scrolls into view (and cached there)."""
+        if not isinstance(e, Entry):             # a group header row (never expected here, but never fatal)
+            return (None, f"<b>{GLib.markup_escape_text(str(e))}</b>")
         size = LAYOUT_ICON_SIZE.get(self.layout, 48)
         pb = None
         if size >= 48 and len(self.entries) <= 2500:
@@ -461,6 +463,11 @@ class FolderView(Gtk.Box):
                 self.icons.configure(size, False, size + 44, self.cfg["single_click"])
             self.icons.invalidate()
         self.tree.queue_draw()      # visible rows re-run their data funcs; no need to signal every row
+        # details rows carry section / group header rows, icon rows don't: switching between the two families
+        # must rebuild the rows (from the listing already in memory — no disk access)
+        want = self.path == THISPC or lay in ("details", "content")
+        if self.entries and getattr(self, "_rows_details", want) != want and not self.loading:
+            self._fill(self.gen, self.entries, self.error or "", [e.name for e in self.selected_entries()])
 
     @property
     def view(self):
@@ -767,7 +774,10 @@ class FolderView(Gtk.Box):
 
     def _rows_for(self, ents: List[Entry]) -> List[list]:
         group = self.cfg["group_by"]
-        details = self.stack.get_visible_child_name() == "details" or self.path == THISPC
+        # decided by the layout, not by whichever child the stack shows right now: a listing that lands
+        # before apply_layout() runs (startup, a new tab) would otherwise get header rows in an icon view
+        details = self.path == THISPC or self.layout in ("details", "content")
+        self._rows_details = details
         rows = []
         self._index = None
         if details:

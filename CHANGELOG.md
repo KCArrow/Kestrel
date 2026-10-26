@@ -8,6 +8,8 @@ nonprofits; commercial licences available — see COMMERCIAL-LICENSE.md).
 - Windows-Explorer layout: menus, command bar, tabs, split view, navigation / preview / details panes,
   all icon and list views, grouping, column chooser
 - Background file operations with progress, conflicts, pause, undo; freedesktop trash; batch rename
+- System clipboard: copied files paste into other apps — browsers (Teams, Gmail, web chat), Discord,
+  Slack, Nautilus; a single copied picture also pastes as an image
 - Archives: zip/tar natively, 7z/rar/cab/iso via 7-Zip; extract on double-click
 - Preview: images incl. EXR/HDR/IFF/PSD decoders, text with quick editor, PDF, folder contents,
   video/audio (GStreamer), 3D models (OBJ/STL/PLY/FBX/glTF/Alembic incl. HDF5/USD/.blend) with a

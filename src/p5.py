@@ -32,6 +32,7 @@
         for i in range(1, 10):
             key, mods = Gtk.accelerator_parse(f"<Control>{i}")
             self.accel.connect(key, mods, Gtk.AccelFlags.VISIBLE, lambda g, o, k, m, n=i: (self.notebook.set_current_page(n - 1), True)[1])
+        self._watch_clipboard()
 
     def _toggle_fullscreen(self):
         st = self.get_window().get_state() if self.get_window() else 0
@@ -92,7 +93,7 @@
                     {"label": "_Open", "cb": lambda: self.activate_entry(e), "accel": "Return", "sensitive": e is not None},
                     {"label": "Open _with…", "cb": self.open_with, "accel": "<Control>o", "sensitive": bool(e and not e.is_dir)},
                     {"label": "_Edit", "cb": self.edit_file, "sensitive": bool(e and not e.is_dir)},
-                    {"label": "_Run in terminal", "cb": lambda: self.run_script(e, True), "sensitive": bool(e and not e.is_dir and script_runner(e.path))}, "-",
+                    {"label": "_Run in terminal", "cb": lambda: self.run_script(e, True), "sensitive": looks_runnable(e)}, "-",
                     ("Select _all", lambda: t.select_all(), "<Control>a"), ("Select _none", lambda: t.select_none()),
                     ("_Invert selection", lambda: t.invert_selection())]
         if key == "share":
@@ -136,7 +137,7 @@
             multi = len(sel) >= 1 and real
             return [{"label": "_Batch rename…", "cb": self.batch_rename, "accel": "<Control>F2", "sensitive": multi},
                     {"label": "Copy SHA-256 c_hecksum", "cb": self.copy_checksum, "sensitive": bool(e and not e.is_dir)},
-                    {"label": "_Run in terminal", "cb": lambda: self.run_script(e, True), "sensitive": bool(e and not e.is_dir and script_runner(e.path))}, "-",
+                    {"label": "_Run in terminal", "cb": lambda: self.run_script(e, True), "sensitive": looks_runnable(e)}, "-",
                     ("Empty Recycle _Bin", self.empty_trash), "-",
                     ("_Performance report…", self.performance_report),
                     {"label": "_Update file index now", "cb": self.index_now, "sensitive": bool(cfg.get("index_enabled"))},
@@ -181,7 +182,7 @@
                     spec += [("Open in _RV", self.open_in_rv, "<Control><Shift>r")]
                     if len(sel) == 1 and rv_sequence_for(e.path or ""):
                         spec += [("Open image se_quence in RV", lambda: self.open_in_rv(sequence=True))]
-                if script_runner(e.path):
+                if looks_runnable(e):
                     spec += ["-", ("_Run in terminal", lambda: self.run_script(e, True)),
                              ("Run (_no window)", lambda: self.run_script(e, False)), "-"]
                 if self.is_archive(e):
@@ -232,46 +233,70 @@
         self._update_status()
 
     def _export_clipboard(self, mode: str, paths: List[str]):
-        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-        uris = [Gio.File.new_for_path(p).get_uri() for p in paths]
-        targets = [Gtk.TargetEntry.new("x-special/gnome-copied-files", 0, 0), Gtk.TargetEntry.new("text/uri-list", 0, 1),
-                   Gtk.TargetEntry.new("UTF8_STRING", 0, 2), Gtk.TargetEntry.new("text/plain", 0, 3)]
-
-        def get(cb_, sd, info, data):
-            if info == 0:
-                sd.set(Gdk.Atom.intern("x-special/gnome-copied-files", False), 8, (mode + "\n" + "\n".join(uris)).encode())
-            elif info == 1:
-                sd.set_uris(uris)
-            else:
-                sd.set_text("\n".join(paths), -1)
-        try:
-            cb.set_with_data(targets, get, lambda c, d: None, None)
-        except Exception:
-            cb.set_text("\n".join(paths), -1)
+        """Offer the files to every other application (see FileClipboard); plain paths as a last resort."""
+        if not file_clipboard().set_files(mode, paths):
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text("\n".join(paths), -1)
 
     def _external_clipboard_has_files(self) -> bool:
-        try:
-            cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-            return cb.wait_is_target_available(Gdk.Atom.intern("x-special/gnome-copied-files", False)) or \
-                cb.wait_is_target_available(Gdk.Atom.intern("text/uri-list", False))
-        except Exception:
-            return False
+        """Whether another app put files on the clipboard. Answered from a cache that is refreshed
+        asynchronously whenever the clipboard changes (_watch_clipboard): the menus ask this while they are
+        being shown, and a synchronous wait_is_target_available() there runs a nested main loop that breaks
+        the menu popup (and blocks for seconds if the clipboard owner is slow to answer)."""
+        return bool(getattr(self, "_clip_files", False))
 
-    def _read_external_clipboard(self) -> Tuple[str, List[str]]:
+    def _watch_clipboard(self):
         cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        self._clip_files = False
+        wanted = {"x-special/gnome-copied-files", "text/uri-list"}
+
+        def got(clip, *args):
+            atoms = next((a for a in args if isinstance(a, (list, tuple))), None) or []
+            try:
+                names = {a.name() for a in atoms if a is not None}
+            except Exception:
+                names = set()
+            self._clip_files = bool(names & wanted)
+
+        def check(*a):
+            try:
+                cb.request_targets(got)
+            except Exception:
+                self._clip_files = False
+        cb.connect("owner-change", check)
+        check()
+
+    def _read_external_clipboard(self, done: Callable[[str, List[str]], None]):
+        """Ask the clipboard owner for files, asynchronously, then call done(mode, paths) on the GTK thread.
+        The wait_for_* variants run a nested main loop; a click or menu during that loop re-entered the same
+        code until GTK crashed (seen in a crash report), so nothing here ever waits."""
+        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+
+        def from_uris(uris):
+            return [p for p in (Gio.File.new_for_uri(u).get_path() for u in (uris or []) if u.strip()) if p]
+
+        def got_uris(clip, uris, *a):
+            done("copy", from_uris(uris))
+
+        def got_gnome(clip, sd, *a):
+            try:
+                raw = sd.get_data() if sd is not None else None
+                if raw:
+                    lines = bytes(raw).decode("utf-8", "replace").split("\n")
+                    mode = "cut" if lines and lines[0].strip() == "cut" else "copy"
+                    paths = from_uris(lines[1:])
+                    if paths:
+                        done(mode, paths)
+                        return
+            except Exception:
+                pass
+            try:
+                cb.request_uris(got_uris)
+            except Exception:
+                done("", [])
         try:
-            sd = cb.wait_for_contents(Gdk.Atom.intern("x-special/gnome-copied-files", False))
-            if sd:
-                lines = bytes(sd.get_data()).decode("utf-8", "replace").split("\n")
-                mode = "cut" if lines and lines[0].strip() == "cut" else "copy"
-                paths = [Gio.File.new_for_uri(u).get_path() for u in lines[1:] if u.strip()]
-                return mode, [p for p in paths if p]
-            uris = cb.wait_for_uris()
-            if uris:
-                return "copy", [p for p in (Gio.File.new_for_uri(u).get_path() for u in uris) if p]
+            cb.request_contents(Gdk.Atom.intern("x-special/gnome-copied-files", False), got_gnome)
         except Exception:
-            pass
-        return "", []
+            done("", [])
 
     def copy_path(self):
         sel = self.tab.selected_entries()
@@ -285,9 +310,15 @@
         if dest in VIRTUAL:
             self.flash("Can't paste here.")
             return
+        # Kestrel's own copy is used only while Kestrel still owns the clipboard: once another app copies
+        # something, paste must take that instead of the stale list
         mode, paths = self.clipboard["mode"], list(self.clipboard["paths"])
-        if not paths:
-            mode, paths = self._read_external_clipboard()
+        if paths and file_clipboard().paths:
+            self._paste_paths(mode, paths, dest, shortcut)
+        else:
+            self._read_external_clipboard(lambda m, p: self._paste_paths(m, p, dest, shortcut))
+
+    def _paste_paths(self, mode: str, paths: List[str], dest: str, shortcut: bool):
         paths = [p for p in paths if os.path.lexists(p)]
         if not paths:
             self.flash("Nothing to paste.")
@@ -1428,8 +1459,10 @@ def main():
     try:
         return app.run(sys.argv)
     finally:
-        CRASH.shutdown()
+        WATCHDOG.stop()
         save_config(app.cfg)
+        shutdown_workers()
+        CRASH.shutdown()
         if PROFILE is not None:
             out = os.path.join(GLib.get_user_cache_dir(), "kestrel", "profile.prof")
             PROFILE.disable()

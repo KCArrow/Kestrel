@@ -1580,6 +1580,17 @@ def script_runner(path: str) -> Optional[List[str]]:
     return None
 
 
+def looks_runnable(e) -> bool:
+    """script_runner() without opening the file — for menus, which are built while they pop up and must not
+    wait on a network share. Uses the name, the mode bits and the content type the listing already has."""
+    if e is None or e.is_dir or not e.path:
+        return False
+    if e.ext in (".py", ".sh", ".bash") or (e.mode & 0o111):
+        return True
+    return (e.content_type or "") in ("application/x-shellscript", "text/x-python", "text/x-python3",
+                                      "application/x-executable", "application/x-sharedlib")
+
+
 def run_detached(cmd: List[str], cwd: str) -> bool:
     try:
         subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
@@ -2487,6 +2498,33 @@ def run_heavy(fn, *args):
         return fn(*args)
 
 
+def shutdown_workers():
+    """Quit: kill the decoder pool and the render process instead of letting multiprocessing's exit handler
+    join them — a worker busy with a big model or EXR made closing the window hang for seconds."""
+    global _POOL
+    pool, _POOL = _POOL, None
+    if pool is not None:
+        try:
+            for p in list(getattr(pool, "_processes", {}).values()):
+                p.kill()
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+    rw = globals().get("_RENDER_WORKER")
+    if rw is not None:
+        try:
+            rw.proc.kill()
+            rw.proc.join(timeout=0.5)
+        except Exception:
+            pass
+    try:
+        import multiprocessing
+        for ch in multiprocessing.active_children():
+            ch.kill()
+    except Exception:
+        pass
+
+
 PREVIEW_DECODERS = {".iff": decode_maya_iff, ".tdi": decode_maya_iff, ".exr": decode_exr, ".hdr": decode_hdr, ".pic": decode_hdr, ".rgbe": decode_hdr,
                     ".psd": decode_psd, ".psb": decode_psd}
 
@@ -2564,11 +2602,15 @@ class StallWatchdog:
             frame = frame.f_back
         return out
 
+    def stop(self):
+        """Quitting: tear-down is allowed to take a moment and must not be reported as a freeze."""
+        self._running = False
+
     def _watch(self):
         stall_start = None
         samples: dict = {}
         dumped = False
-        while True:
+        while self._running:
             time.sleep(0.02)
             age = time.monotonic() - self._beat
             if age > self.THRESHOLD:
@@ -2811,6 +2853,31 @@ def run_selftest(bench: bool = False) -> int:
                 self.assertNotIn(os.path.expanduser("~"), txt)
             cr.archive(paths[0], "sent")
             self.assertEqual(len(cr.pending()), 1)
+
+        @timed("file clipboard formats")
+        def test_file_clipboard(self):
+            fc = FileClipboard()
+            img = os.path.join(self.tmp, "clip pic.jpg")
+            txt = os.path.join(self.tmp, "notes.txt")
+            for p in (img, txt):
+                with open(p, "wb") as f:
+                    f.write(b"\xff\xd8\xff" + b"0" * 64)
+            t1 = fc.targets_for([img])
+            self.assertEqual(t1[:2], ["image/png", "image/jpeg"])
+            self.assertIn("text/uri-list", t1)
+            t2 = fc.targets_for([img, txt])
+            self.assertNotIn("image/png", t2)
+            self.assertEqual(t2[0], "x-special/gnome-copied-files")
+            fc.mode, fc.paths = "cut", [img, txt]
+            fc.uris = [Gio.File.new_for_path(p).get_uri() for p in fc.paths]
+            fc.image_path = img
+            ul = fc.payload("text/uri-list").decode()
+            self.assertTrue(ul.endswith("\r\n") and ul.count("\r\n") == 2)
+            self.assertIn("clip%20pic.jpg", ul)
+            g = fc.payload("x-special/gnome-copied-files").decode().split("\n")
+            self.assertEqual(g[0], "cut")
+            self.assertEqual(len(g), 3)
+            self.assertEqual(fc.payload("image/jpeg")[:3], b"\xff\xd8\xff")
 
         @timed("zip round trip (ArchiveOp)")
         def test_zip_roundtrip(self):
@@ -6205,6 +6272,114 @@ class PCView(Gtk.ScrolledWindow):
         return False
 
 
+# --------------------------------------------------------------------------- system clipboard: files
+class FileClipboard:
+    """Puts copied/cut files on the system clipboard in every form other applications look for.
+
+    Gtk.Clipboard.set_with_data() - the usual way to offer custom formats - is not callable from PyGObject
+    (it is marked non-introspectable), so Kestrel owns the CLIPBOARD selection through a hidden widget and
+    answers format requests itself. Offered, in order of preference:
+      image/png (+ the file's own image type)  a single picture: pastes as an image in any chat / web app
+      x-special/gnome-copied-files             Nautilus and other GTK file managers (copy vs cut)
+      text/uri-list                            Chromium, Firefox, Electron apps (Teams, Discord, Slack), KDE:
+                                               web pages receive these as real files on paste
+      UTF8_STRING / text/plain                 the paths, for terminals and text fields
+    The files stay on the clipboard while Kestrel runs (as with every X11/Wayland app)."""
+    IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+                   ".webp": "image/webp", ".bmp": "image/bmp"}
+    MAX_IMAGE = 40 << 20             # bigger pictures are offered as files only
+
+    def __init__(self):
+        self.w = Gtk.Invisible()
+        self.w.connect("selection-get", self._get)
+        self.w.connect("selection-clear-event", self._lost)
+        self.sel = Gdk.SELECTION_CLIPBOARD
+        self.mode, self.paths, self.uris = "copy", [], []
+        self.image_path: Optional[str] = None
+        self._png: Optional[bytes] = None
+
+    def targets_for(self, paths: List[str]) -> List[str]:
+        targets = []
+        self.image_path = None
+        if len(paths) == 1:
+            ext = os.path.splitext(paths[0])[1].lower()
+            try:
+                small = os.path.getsize(paths[0]) <= self.MAX_IMAGE
+            except OSError:
+                small = False
+            if ext in self.IMAGE_TYPES and small:
+                self.image_path = paths[0]
+                targets.append("image/png")
+                if self.IMAGE_TYPES[ext] != "image/png":
+                    targets.append(self.IMAGE_TYPES[ext])
+        return targets + ["x-special/gnome-copied-files", "text/uri-list", "UTF8_STRING", "text/plain;charset=utf-8",
+                          "text/plain", "STRING", "TEXT"]
+
+    def set_files(self, mode: str, paths: List[str]) -> bool:
+        self.mode, self.paths = mode, list(paths)
+        self.uris = [Gio.File.new_for_path(p).get_uri() for p in paths]
+        self._png = None
+        targets = self.targets_for(paths)
+        try:
+            Gtk.selection_clear_targets(self.w, self.sel)
+            for i, t in enumerate(targets):
+                Gtk.selection_add_target(self.w, self.sel, Gdk.Atom.intern(t, False), i)
+            t0 = Gtk.get_current_event_time() or Gdk.CURRENT_TIME
+            return bool(Gtk.selection_owner_set(self.w, self.sel, t0))
+        except Exception as ex:
+            bench(f"clipboard: owning the selection failed: {ex}")
+            return False
+
+    def _lost(self, *a):
+        self.paths, self.uris, self.image_path, self._png = [], [], None, None
+        return False
+
+    def payload(self, name: str) -> Optional[bytes]:
+        """The bytes for one clipboard format (None: nothing to offer)."""
+        if name.startswith("image/"):
+            p = self.image_path
+            if not p:
+                return None
+            ext = os.path.splitext(p)[1].lower()
+            try:
+                if name == self.IMAGE_TYPES.get(ext):
+                    with open(p, "rb") as f:
+                        return f.read()
+                if name == "image/png":
+                    if self._png is None:
+                        pb = GdkPixbuf.Pixbuf.new_from_file(p)
+                        ok, buf = pb.save_to_bufferv("png", [], [])
+                        self._png = bytes(buf) if ok else b""
+                    return self._png or None
+            except Exception as ex:
+                bench(f"clipboard: image conversion failed: {ex}")
+            return None
+        if name == "x-special/gnome-copied-files":
+            return (self.mode + "\n" + "\n".join(self.uris)).encode()
+        if name == "text/uri-list":
+            return ("\r\n".join(self.uris) + "\r\n").encode()          # RFC 2483: CRLF-separated
+        return "\n".join(self.paths).encode()
+
+    def _get(self, widget, sd, info, time_):
+        name = sd.get_target().name()
+        if name in ("UTF8_STRING", "STRING", "TEXT", "text/plain", "text/plain;charset=utf-8"):
+            sd.set_text("\n".join(self.paths), -1)
+            return
+        data = self.payload(name)
+        if data:
+            sd.set(sd.get_target(), 8, data)
+
+
+_FILE_CLIPBOARD: Optional[FileClipboard] = None
+
+
+def file_clipboard() -> FileClipboard:
+    global _FILE_CLIPBOARD
+    if _FILE_CLIPBOARD is None:
+        _FILE_CLIPBOARD = FileClipboard()
+    return _FILE_CLIPBOARD
+
+
 # --------------------------------------------------------------------------- lightweight 3D model preview
 def load_model(path: str, max_faces: int = 500000) -> Optional[dict]:
     """Parse OBJ / STL (ascii+binary) / PLY (ascii) into {verts: [(x,y,z)], faces: [(i,j,k)], info: [...]}.
@@ -8701,6 +8876,8 @@ class FolderView(Gtk.Box):
     # ---- per-row icon-view data (computed once at fill time, see _rows_for)
     def _iv_tile(self, e: Entry):
         """Called by the grid the first time a tile scrolls into view (and cached there)."""
+        if not isinstance(e, Entry):             # a group header row (never expected here, but never fatal)
+            return (None, f"<b>{GLib.markup_escape_text(str(e))}</b>")
         size = LAYOUT_ICON_SIZE.get(self.layout, 48)
         pb = None
         if size >= 48 and len(self.entries) <= 2500:
@@ -8779,6 +8956,11 @@ class FolderView(Gtk.Box):
                 self.icons.configure(size, False, size + 44, self.cfg["single_click"])
             self.icons.invalidate()
         self.tree.queue_draw()      # visible rows re-run their data funcs; no need to signal every row
+        # details rows carry section / group header rows, icon rows don't: switching between the two families
+        # must rebuild the rows (from the listing already in memory — no disk access)
+        want = self.path == THISPC or lay in ("details", "content")
+        if self.entries and getattr(self, "_rows_details", want) != want and not self.loading:
+            self._fill(self.gen, self.entries, self.error or "", [e.name for e in self.selected_entries()])
 
     @property
     def view(self):
@@ -9085,7 +9267,10 @@ class FolderView(Gtk.Box):
 
     def _rows_for(self, ents: List[Entry]) -> List[list]:
         group = self.cfg["group_by"]
-        details = self.stack.get_visible_child_name() == "details" or self.path == THISPC
+        # decided by the layout, not by whichever child the stack shows right now: a listing that lands
+        # before apply_layout() runs (startup, a new tab) would otherwise get header rows in an icon view
+        details = self.path == THISPC or self.layout in ("details", "content")
+        self._rows_details = details
         rows = []
         self._index = None
         if details:
@@ -10635,8 +10820,20 @@ class MainWindow(Gtk.ApplicationWindow):
         ct = e.content_type or ""
         if self.video is not None and e.path and (ct.startswith(("video/", "audio/")) or e.ext in (".mov", ".mp4", ".mkv", ".avi", ".webm", ".mxf", ".m4v", ".ogv", ".flac", ".ogg", ".mp3", ".wav")):
             self.video.load(e.path)
-            self.video.on_ready = lambda: gen == self._side_gen and self._show_preview("video")
-            self._placeholder("Loading video…", gen)
+            # No "Loading…" card for video: the previous preview stays on screen (held by the snapshot) while
+            # GStreamer prerolls, and fades straight into the first frame once it is ready. The status-bar
+            # spinner shows that something is happening; the card only appears if preroll takes over 5 s.
+            self._preview_loading = gen
+            self._set_spinner(True)
+
+            def ready():
+                if gen != self._side_gen:
+                    return
+                self._preview_loading = None
+                self._update_status()                   # spinner off unless the folder itself is still busy
+                self._show_preview("video")
+            self.video.on_ready = ready
+            self._placeholder("Loading video…", gen, 5000)
             path = e.path
 
             def minfo():
@@ -11357,8 +11554,15 @@ class MainWindow(Gtk.ApplicationWindow):
                     pass
             if e.deleted:
                 rows.append(("Deleted", fmt_date(e.deleted, f_long)))
-            if script_runner(e.path or ""):
-                rows.append(("Runnable", "yes"))
+            if e.path and not e.is_dir:
+                # script_runner reads the file's first bytes: on a network share that's a round trip of up to
+                # a few hundred ms, so it runs off the GTK thread and the row is added when the answer arrives
+                spath = e.path
+
+                def runnable():
+                    if script_runner(spath):
+                        GLib.idle_add(lambda: (gen == self._side_gen and self._qv_add("Runnable", "yes"), False)[1])
+                threading.Thread(target=runnable, daemon=True).start()
             # background facts: folder size / contents, text line count
             path = e.path
             if e.is_dir and path:
@@ -11572,6 +11776,10 @@ class MainWindow(Gtk.ApplicationWindow):
 
     SPINNER_DELAY_MS = 250        # only waits longer than this earn a wheel; quick folders never flash it
 
+    def _preview_busy(self) -> bool:
+        """A video preview for the current selection is still loading."""
+        return getattr(self, "_preview_loading", None) == getattr(self, "_side_gen", -1)
+
     def _set_spinner(self, on: bool):
         pending = getattr(self, "_spin_timer", None)
         if on:
@@ -11589,7 +11797,7 @@ class MainWindow(Gtk.ApplicationWindow):
     def _spinner_due(self):
         self._spin_timer = None
         t = self.tab
-        if t is not None and (t.busy or t.loading or getattr(t, "partial", False) or (t.search and t.search.is_alive())):
+        if self._preview_busy() or (t is not None and (t.busy or t.loading or getattr(t, "partial", False) or (t.search and t.search.is_alive()))):
             self.spinner.show()
             self.spinner.start()
         return False
@@ -11598,7 +11806,7 @@ class MainWindow(Gtk.ApplicationWindow):
         t = self.tab
         if t is None:
             return
-        self._set_spinner(bool(t.busy or t.loading or getattr(t, "partial", False) or (t.search and t.search.is_alive())))
+        self._set_spinner(self._preview_busy() or bool(t.busy or t.loading or getattr(t, "partial", False) or (t.search and t.search.is_alive())))
         n = len(t.entries)
         sel = t.selected_entries()
         s = f"{n} item{'s' if n != 1 else ''}"
@@ -12163,6 +12371,7 @@ class MainWindow(Gtk.ApplicationWindow):
         for i in range(1, 10):
             key, mods = Gtk.accelerator_parse(f"<Control>{i}")
             self.accel.connect(key, mods, Gtk.AccelFlags.VISIBLE, lambda g, o, k, m, n=i: (self.notebook.set_current_page(n - 1), True)[1])
+        self._watch_clipboard()
 
     def _toggle_fullscreen(self):
         st = self.get_window().get_state() if self.get_window() else 0
@@ -12223,7 +12432,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     {"label": "_Open", "cb": lambda: self.activate_entry(e), "accel": "Return", "sensitive": e is not None},
                     {"label": "Open _with…", "cb": self.open_with, "accel": "<Control>o", "sensitive": bool(e and not e.is_dir)},
                     {"label": "_Edit", "cb": self.edit_file, "sensitive": bool(e and not e.is_dir)},
-                    {"label": "_Run in terminal", "cb": lambda: self.run_script(e, True), "sensitive": bool(e and not e.is_dir and script_runner(e.path))}, "-",
+                    {"label": "_Run in terminal", "cb": lambda: self.run_script(e, True), "sensitive": looks_runnable(e)}, "-",
                     ("Select _all", lambda: t.select_all(), "<Control>a"), ("Select _none", lambda: t.select_none()),
                     ("_Invert selection", lambda: t.invert_selection())]
         if key == "share":
@@ -12267,7 +12476,7 @@ class MainWindow(Gtk.ApplicationWindow):
             multi = len(sel) >= 1 and real
             return [{"label": "_Batch rename…", "cb": self.batch_rename, "accel": "<Control>F2", "sensitive": multi},
                     {"label": "Copy SHA-256 c_hecksum", "cb": self.copy_checksum, "sensitive": bool(e and not e.is_dir)},
-                    {"label": "_Run in terminal", "cb": lambda: self.run_script(e, True), "sensitive": bool(e and not e.is_dir and script_runner(e.path))}, "-",
+                    {"label": "_Run in terminal", "cb": lambda: self.run_script(e, True), "sensitive": looks_runnable(e)}, "-",
                     ("Empty Recycle _Bin", self.empty_trash), "-",
                     ("_Performance report…", self.performance_report),
                     {"label": "_Update file index now", "cb": self.index_now, "sensitive": bool(cfg.get("index_enabled"))},
@@ -12312,7 +12521,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     spec += [("Open in _RV", self.open_in_rv, "<Control><Shift>r")]
                     if len(sel) == 1 and rv_sequence_for(e.path or ""):
                         spec += [("Open image se_quence in RV", lambda: self.open_in_rv(sequence=True))]
-                if script_runner(e.path):
+                if looks_runnable(e):
                     spec += ["-", ("_Run in terminal", lambda: self.run_script(e, True)),
                              ("Run (_no window)", lambda: self.run_script(e, False)), "-"]
                 if self.is_archive(e):
@@ -12363,46 +12572,70 @@ class MainWindow(Gtk.ApplicationWindow):
         self._update_status()
 
     def _export_clipboard(self, mode: str, paths: List[str]):
-        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-        uris = [Gio.File.new_for_path(p).get_uri() for p in paths]
-        targets = [Gtk.TargetEntry.new("x-special/gnome-copied-files", 0, 0), Gtk.TargetEntry.new("text/uri-list", 0, 1),
-                   Gtk.TargetEntry.new("UTF8_STRING", 0, 2), Gtk.TargetEntry.new("text/plain", 0, 3)]
-
-        def get(cb_, sd, info, data):
-            if info == 0:
-                sd.set(Gdk.Atom.intern("x-special/gnome-copied-files", False), 8, (mode + "\n" + "\n".join(uris)).encode())
-            elif info == 1:
-                sd.set_uris(uris)
-            else:
-                sd.set_text("\n".join(paths), -1)
-        try:
-            cb.set_with_data(targets, get, lambda c, d: None, None)
-        except Exception:
-            cb.set_text("\n".join(paths), -1)
+        """Offer the files to every other application (see FileClipboard); plain paths as a last resort."""
+        if not file_clipboard().set_files(mode, paths):
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text("\n".join(paths), -1)
 
     def _external_clipboard_has_files(self) -> bool:
-        try:
-            cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-            return cb.wait_is_target_available(Gdk.Atom.intern("x-special/gnome-copied-files", False)) or \
-                cb.wait_is_target_available(Gdk.Atom.intern("text/uri-list", False))
-        except Exception:
-            return False
+        """Whether another app put files on the clipboard. Answered from a cache that is refreshed
+        asynchronously whenever the clipboard changes (_watch_clipboard): the menus ask this while they are
+        being shown, and a synchronous wait_is_target_available() there runs a nested main loop that breaks
+        the menu popup (and blocks for seconds if the clipboard owner is slow to answer)."""
+        return bool(getattr(self, "_clip_files", False))
 
-    def _read_external_clipboard(self) -> Tuple[str, List[str]]:
+    def _watch_clipboard(self):
         cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        self._clip_files = False
+        wanted = {"x-special/gnome-copied-files", "text/uri-list"}
+
+        def got(clip, *args):
+            atoms = next((a for a in args if isinstance(a, (list, tuple))), None) or []
+            try:
+                names = {a.name() for a in atoms if a is not None}
+            except Exception:
+                names = set()
+            self._clip_files = bool(names & wanted)
+
+        def check(*a):
+            try:
+                cb.request_targets(got)
+            except Exception:
+                self._clip_files = False
+        cb.connect("owner-change", check)
+        check()
+
+    def _read_external_clipboard(self, done: Callable[[str, List[str]], None]):
+        """Ask the clipboard owner for files, asynchronously, then call done(mode, paths) on the GTK thread.
+        The wait_for_* variants run a nested main loop; a click or menu during that loop re-entered the same
+        code until GTK crashed (seen in a crash report), so nothing here ever waits."""
+        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+
+        def from_uris(uris):
+            return [p for p in (Gio.File.new_for_uri(u).get_path() for u in (uris or []) if u.strip()) if p]
+
+        def got_uris(clip, uris, *a):
+            done("copy", from_uris(uris))
+
+        def got_gnome(clip, sd, *a):
+            try:
+                raw = sd.get_data() if sd is not None else None
+                if raw:
+                    lines = bytes(raw).decode("utf-8", "replace").split("\n")
+                    mode = "cut" if lines and lines[0].strip() == "cut" else "copy"
+                    paths = from_uris(lines[1:])
+                    if paths:
+                        done(mode, paths)
+                        return
+            except Exception:
+                pass
+            try:
+                cb.request_uris(got_uris)
+            except Exception:
+                done("", [])
         try:
-            sd = cb.wait_for_contents(Gdk.Atom.intern("x-special/gnome-copied-files", False))
-            if sd:
-                lines = bytes(sd.get_data()).decode("utf-8", "replace").split("\n")
-                mode = "cut" if lines and lines[0].strip() == "cut" else "copy"
-                paths = [Gio.File.new_for_uri(u).get_path() for u in lines[1:] if u.strip()]
-                return mode, [p for p in paths if p]
-            uris = cb.wait_for_uris()
-            if uris:
-                return "copy", [p for p in (Gio.File.new_for_uri(u).get_path() for u in uris) if p]
+            cb.request_contents(Gdk.Atom.intern("x-special/gnome-copied-files", False), got_gnome)
         except Exception:
-            pass
-        return "", []
+            done("", [])
 
     def copy_path(self):
         sel = self.tab.selected_entries()
@@ -12416,9 +12649,15 @@ class MainWindow(Gtk.ApplicationWindow):
         if dest in VIRTUAL:
             self.flash("Can't paste here.")
             return
+        # Kestrel's own copy is used only while Kestrel still owns the clipboard: once another app copies
+        # something, paste must take that instead of the stale list
         mode, paths = self.clipboard["mode"], list(self.clipboard["paths"])
-        if not paths:
-            mode, paths = self._read_external_clipboard()
+        if paths and file_clipboard().paths:
+            self._paste_paths(mode, paths, dest, shortcut)
+        else:
+            self._read_external_clipboard(lambda m, p: self._paste_paths(m, p, dest, shortcut))
+
+    def _paste_paths(self, mode: str, paths: List[str], dest: str, shortcut: bool):
         paths = [p for p in paths if os.path.lexists(p)]
         if not paths:
             self.flash("Nothing to paste.")
@@ -13559,8 +13798,10 @@ def main():
     try:
         return app.run(sys.argv)
     finally:
-        CRASH.shutdown()
+        WATCHDOG.stop()
         save_config(app.cfg)
+        shutdown_workers()
+        CRASH.shutdown()
         if PROFILE is not None:
             out = os.path.join(GLib.get_user_cache_dir(), "kestrel", "profile.prof")
             PROFILE.disable()

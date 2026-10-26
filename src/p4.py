@@ -1259,8 +1259,20 @@ class MainWindow(Gtk.ApplicationWindow):
         ct = e.content_type or ""
         if self.video is not None and e.path and (ct.startswith(("video/", "audio/")) or e.ext in (".mov", ".mp4", ".mkv", ".avi", ".webm", ".mxf", ".m4v", ".ogv", ".flac", ".ogg", ".mp3", ".wav")):
             self.video.load(e.path)
-            self.video.on_ready = lambda: gen == self._side_gen and self._show_preview("video")
-            self._placeholder("Loading video…", gen)
+            # No "Loading…" card for video: the previous preview stays on screen (held by the snapshot) while
+            # GStreamer prerolls, and fades straight into the first frame once it is ready. The status-bar
+            # spinner shows that something is happening; the card only appears if preroll takes over 5 s.
+            self._preview_loading = gen
+            self._set_spinner(True)
+
+            def ready():
+                if gen != self._side_gen:
+                    return
+                self._preview_loading = None
+                self._update_status()                   # spinner off unless the folder itself is still busy
+                self._show_preview("video")
+            self.video.on_ready = ready
+            self._placeholder("Loading video…", gen, 5000)
             path = e.path
 
             def minfo():
@@ -1981,8 +1993,15 @@ class MainWindow(Gtk.ApplicationWindow):
                     pass
             if e.deleted:
                 rows.append(("Deleted", fmt_date(e.deleted, f_long)))
-            if script_runner(e.path or ""):
-                rows.append(("Runnable", "yes"))
+            if e.path and not e.is_dir:
+                # script_runner reads the file's first bytes: on a network share that's a round trip of up to
+                # a few hundred ms, so it runs off the GTK thread and the row is added when the answer arrives
+                spath = e.path
+
+                def runnable():
+                    if script_runner(spath):
+                        GLib.idle_add(lambda: (gen == self._side_gen and self._qv_add("Runnable", "yes"), False)[1])
+                threading.Thread(target=runnable, daemon=True).start()
             # background facts: folder size / contents, text line count
             path = e.path
             if e.is_dir and path:
@@ -2196,6 +2215,10 @@ class MainWindow(Gtk.ApplicationWindow):
 
     SPINNER_DELAY_MS = 250        # only waits longer than this earn a wheel; quick folders never flash it
 
+    def _preview_busy(self) -> bool:
+        """A video preview for the current selection is still loading."""
+        return getattr(self, "_preview_loading", None) == getattr(self, "_side_gen", -1)
+
     def _set_spinner(self, on: bool):
         pending = getattr(self, "_spin_timer", None)
         if on:
@@ -2213,7 +2236,7 @@ class MainWindow(Gtk.ApplicationWindow):
     def _spinner_due(self):
         self._spin_timer = None
         t = self.tab
-        if t is not None and (t.busy or t.loading or getattr(t, "partial", False) or (t.search and t.search.is_alive())):
+        if self._preview_busy() or (t is not None and (t.busy or t.loading or getattr(t, "partial", False) or (t.search and t.search.is_alive()))):
             self.spinner.show()
             self.spinner.start()
         return False
@@ -2222,7 +2245,7 @@ class MainWindow(Gtk.ApplicationWindow):
         t = self.tab
         if t is None:
             return
-        self._set_spinner(bool(t.busy or t.loading or getattr(t, "partial", False) or (t.search and t.search.is_alive())))
+        self._set_spinner(self._preview_busy() or bool(t.busy or t.loading or getattr(t, "partial", False) or (t.search and t.search.is_alive())))
         n = len(t.entries)
         sel = t.selected_entries()
         s = f"{n} item{'s' if n != 1 else ''}"
