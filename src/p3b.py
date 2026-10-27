@@ -1,5 +1,30 @@
 
 
+# --------------------------------------------------------------------------- input diagnostics
+DEBUG_INPUT = bool(os.environ.get("KESTREL_DEBUG_INPUT"))
+_INPUT_T0 = time.monotonic()
+
+
+def input_log(msg: str):
+    """KESTREL_DEBUG_INPUT=1: one line per click / selection event on stderr (and in error reports)."""
+    line = f"[input {time.monotonic() - _INPUT_T0:8.3f}] {msg}"
+    print(line, file=sys.stderr, flush=True)
+    RECENT_LOG.append(line)
+
+
+def is_double_click(last, item: int, event) -> bool:
+    """Our own double-click test: second press on the same item within the desktop's double-click time and
+    distance. `last` = (item, time, x_root, y_root) of the previous press, or None after a folder change."""
+    if last is None or item < 0 or last[0] != item:
+        return False
+    st = Gtk.Settings.get_default()
+    try:
+        dt, dist = st.props.gtk_double_click_time, st.props.gtk_double_click_distance
+    except Exception:
+        dt, dist = 400, 5
+    return (0 <= event.time - last[1] <= dt and abs(event.x_root - last[2]) <= dist and abs(event.y_root - last[3]) <= dist)
+
+
 # --------------------------------------------------------------------------- row hover for tree views
 def clip_width(widget: Gtk.Widget) -> Gtk.Widget:
     """Wrap a horizontal toolbar so it never dictates the pane's minimum width: a ScrolledWindow with an
@@ -221,6 +246,8 @@ class IconGrid(Gtk.Layout):
 
     def _reset_press(self):
         """A dialog or drag grab interrupted a click: forget the pending press/rubber band."""
+        if DEBUG_INPUT:
+            input_log("grid: press reset by a grab")
         self.press_index, self.press_pos = -1, None
         if self.rubber is not None:
             self.rubber = None
@@ -247,8 +274,11 @@ class IconGrid(Gtk.Layout):
             self._mh = [model.connect("row-changed", self._row_changed),
                         model.connect("row-inserted", lambda m, p, it: self._model_resized()),
                         model.connect("row-deleted", lambda m, p: self._model_resized())]
+        if DEBUG_INPUT:
+            input_log(f"grid: set_model({'None' if model is None else len(model)}) — selection, cursor and shift-anchor reset")
         self.selected.clear()
         self.cursor = self.anchor = -1
+        self._last_click = None          # a click in the previous folder never pairs with one in this folder
         self._model_resized()
 
     def get_model(self):
@@ -446,7 +476,10 @@ class IconGrid(Gtk.Layout):
         return path.get_indices()[0] in self.selected
 
     def select_path(self, path):
-        self.selected.add(path.get_indices()[0])
+        i = path.get_indices()[0]
+        self.selected.add(i)
+        if self.anchor < 0:                  # programmatic selection (after a reload / going up) anchors shift-click
+            self.anchor = self.cursor = i
         self._emit_sel()
 
     def unselect_path(self, path):
@@ -519,13 +552,22 @@ class IconGrid(Gtk.Layout):
         i = self._index_at(x, y)
         mods = event.state & Gtk.accelerator_get_default_mod_mask()
         ctrl, shift = bool(mods & Gdk.ModifierType.CONTROL_MASK), bool(mods & Gdk.ModifierType.SHIFT_MASK)
-        if event.button == 1 and event.type == Gdk.EventType._2BUTTON_PRESS:
-            if i >= 0 and not self.single_click:
-                self.emit("item-activated", Gtk.TreePath.new_from_indices([i]))
-            return True
+        if DEBUG_INPUT:
+            input_log(f"grid: {event.type.value_nick} button={event.button} item={i} shift={shift} ctrl={ctrl} "
+                      f"anchor={self.anchor} cursor={self.cursor} selected={len(self.selected)} t={event.time}")
         if event.type != Gdk.EventType.BUTTON_PRESS:
+            # GDK's own 2/3-click events are ignored: GDK keeps counting clicks across a folder change, so the
+            # first click of a quick double-click right after opening a folder became the THIRD click of the
+            # double-click that opened it, and the real double-click was lost. We pair clicks ourselves below.
             return True
         if event.button == 1:
+            if is_double_click(getattr(self, "_last_click", None), i, event):
+                self._last_click = None
+                if i >= 0 and not self.single_click:
+                    self.cursor = i
+                    self.emit("item-activated", Gtk.TreePath.new_from_indices([i]))
+                return True
+            self._last_click = (i, event.time, event.x_root, event.y_root)
             self.press_index, self.press_pos = i, (event.x, event.y)
             self.press_was_selected = i in self.selected
             if i < 0:
@@ -538,7 +580,9 @@ class IconGrid(Gtk.Layout):
                 (self.selected.discard if i in self.selected else self.selected.add)(i)
                 self.cursor = self.anchor = i
                 self._emit_sel()
-            elif shift and self.anchor >= 0:
+            elif shift and (self.anchor >= 0 or self.cursor >= 0 or self.selected):
+                if self.anchor < 0:
+                    self.anchor = self.cursor if self.cursor >= 0 else min(self.selected)
                 lo, hi = min(self.anchor, i), max(self.anchor, i)
                 self.selected = set(range(lo, hi + 1))
                 self.cursor = i

@@ -1107,7 +1107,7 @@ menu menuitem:hover { background: alpha(@theme_selected_bg_color, 0.85); border-
 .toolbar-row button:hover, .statusbar button:hover, notebook > header button:hover { background: alpha(@theme_fg_color, 0.08); }
 .sidepane button:hover { background: alpha(@theme_fg_color, 0.08); }
 .toolbar-row button { min-width: 28px; min-height: 28px; padding: 2px; border-radius: 6px; }
-.pathbar { background: alpha(@theme_fg_color, 0.05); border: 1px solid alpha(@theme_fg_color, 0.14);
+.pathbar { background: alpha(@theme_fg_color, 0.05); border: 1px solid transparent;   /* outline: drawn in code */
            border-radius: 6px; padding: 1px 4px; min-height: 30px; }
 .pathbar > border { border-style: none; }        /* GtkFrame draws its own frame - keep only ours */
 .pathbar entry { border: none; background: transparent; box-shadow: none; min-height: 26px; }
@@ -1151,6 +1151,7 @@ notebook > header tab button.tab-close { min-width: 18px; min-height: 18px; padd
 .sidepane { background: alpha(@theme_fg_color, 0.025); }
 .sidepane textview, .sidepane textview text { background: alpha(@theme_fg_color, 0.03); }
 .edit-toolbar button { padding: 2px 8px; min-height: 24px; }
+.bd-error { color: #e5534b; font-family: monospace; font-size: 0.9em; padding: 2px 4px; }
 .edit-badge { font-size: 0.75em; font-weight: bold; letter-spacing: 1px; padding: 1px 6px; border-radius: 3px;
               color: alpha(@theme_fg_color, 0.55); background: alpha(@theme_fg_color, 0.07); }
 .edit-badge.badge-editing { color: #ffffff; background: #2b8a3e; }
@@ -1403,6 +1404,9 @@ def main():
         sys.argv = [sys.argv[0]]
     if "--preview-bench" in sys.argv[1:]:
         return run_preview_bench(big="--quick" not in sys.argv[1:])
+    if "--dcc-test" in sys.argv[1:]:
+        i = sys.argv.index("--dcc-test")
+        return run_dcc_test([a for a in sys.argv[i + 1:] if not a.startswith("--")])
     if "--selftest" in sys.argv[1:]:
         return run_selftest("--bench" in sys.argv[1:])
     if "--profile" in sys.argv[1:]:

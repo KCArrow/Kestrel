@@ -28,6 +28,17 @@ diagnostics report you can copy. **Tools → Performance report…** shows stall
 
 ## 3D previews
 
+- `.vdb` volumes are read by Kestrel itself — no Houdini, licence or library needed — and shown as smoke
+  (fog volumes; the `density` grid when there are several) or as a surface (level sets). Houdini, EmberGen,
+  Blender and Maya VDBs are supported (float grids, zip/blosc compression, half-float). Blosc decoding is
+  faster with `python3-blosc` or Houdini installed but works without either. EmberGen and Blender volumes
+  are Z-up and are stood upright. Anything the built-in reader can't parse (vector-only files, frustum
+  transforms) falls back to Houdini, `python3-openvdb`, then Blender (surface only).
+- `.bgeo`, `.bgeo.sc`, `.geo` need Houdini: Kestrel runs `hython` from PATH, `$HFS/bin` or the newest
+  `/opt/hfs*`. The first preview takes a few seconds while Houdini starts and checks out a licence; if no
+  licence is free it tries `gconvert` (geometry only).
+- No Blender at your studio? FBX, Alembic and USD fall back to Maya's `mayapy` when it's installed
+  (slower to start: Maya boots for every preview).
 - "No importer could read this file" → see which route applies in **Preferences → Optional**:
   - `.obj .stl .ply`: built in (numpy makes them far faster).
   - `.fbx .gltf .glb .dae .3ds` and friends: Blender (any install, including Flatpak
@@ -59,6 +70,61 @@ diagnostics report you can copy. **Tools → Performance report…** shows stall
   `gdk_backend` in the config and Kestrel sets `GDK_BACKEND` on startup.
 - Models render white in GL mode by design (flat lighting only). Turn OpenGL off in Preferences →
   Optional to get the shaded software renderer back.
+- Volumes (smoke) in OpenGL need float render targets (any desktop GL 3; on GLES the
+  `EXT_color_buffer_float` extension). Without them Kestrel says so once and draws caches with the
+  software renderer; meshes stay on OpenGL.
+
+## Scene breakdowns
+
+- Selecting an Unreal, Unity, Maya or Blender scene shows a breakdown instead of the file's raw text: what's in
+  it, its settings, and a **References** section with every file it uses. Missing files are red; paths that
+  belong to another machine (`C:/…`, unexpanded variables) are shown as written and marked "not checked".
+  Double-click a reference to jump to it; right-click to copy its path. The copy button puts the whole
+  breakdown on the clipboard as text.
+- `.blend` files open in the breakdown; **3D view** switches to the geometry preview (which starts Blender), and
+  **Breakdown** above the 3D view switches back. The choice is remembered.
+- Unity: script, prefab, material and mesh GUIDs are resolved through the project's `.meta` files (Assets,
+  Packages and `Library/PackageCache`). Scripts from packages that aren't installed show as unresolved GUIDs.
+  Binary-serialised scenes can't be read: set Project Settings → Editor → Asset Serialization to Force Text.
+- Unreal: hard references come from the import table, soft references (streaming levels, soft pointers) from
+  the name table. Actor labels and outliner folders are read where the editor data is present; cooked packages
+  show object names instead. World Partition maps also count the actors under `__ExternalActors__`.
+- Maya references to files saved on another machine are looked up by name next to the scene and in the
+  project's `scenes`, `sourceimages`, `images` and `cache` folders.
+
+## Shaders, materials and IES files
+
+- The material ball is an approximation from the file's values and textures, not the renderer's own result:
+  layered or procedural networks show the surface they end in, with what the ball used listed under "Ball
+  preview uses". Textures are looked up next to the file; missing ones are red in **References**.
+- Unity material colours are stored in sRGB and the ball converts them; a material whose shader comes from a
+  package that isn't installed still shows its colours and textures.
+- A GLSL file runs live only when it is a whole fragment shader: Shadertoy (`mainImage`) or glslsandbox /
+  Book of Shaders (`main` writing `gl_FragColor` or an `out vec4`). Vertex, compute and include files show the
+  breakdown and code only. `iChannel0-3` get a noise texture. Compile errors appear above the breakdown with
+  line numbers matching the file. Click or drag for `iMouse`; double-click restarts the clock; it pauses
+  when the window loses focus.
+- If OpenGL isn't available (or *Hardware-accelerated 3D preview* is off in Preferences) the shader shows its code instead.
+- **Code** above the breakdown switches between the tree and the highlighted source; the choice is remembered.
+- IES: the wall picture is lit from just in front of it; the polar plot shows the C0–C180 (orange) and
+  C90–C270 (blue) planes, 0° pointing down. Beam angle is where intensity falls to 50 % of the peak, field
+  angle to 10 %, measured in the C0 plane and only for lights that point down.
+
+## Cache sequences
+
+- Select two or more `.vdb` (or `.bgeo`) files — Ctrl+A in the cache folder is fine, other files are
+  ignored — and press **Preview as sequence** above the 3D preview. The selected caches play in name
+  order with a time slider; until you press it, only the clicked file is previewed (so a pack of
+  separate assets is never mistaken for frames). Selecting something else ends the sequence.
+  Space plays/pauses, ← → step a frame, the spin box sets the frame rate (remembered). Playback
+  pauses when the window loses focus.
+- Frames decode in the background in up to four worker processes, starting at the frame you're on.
+  "buffering frame N…" means playback is waiting for that frame; the first loop runs at decoding speed,
+  later loops at full speed once the frames are held in memory.
+- Memory: decoded frames are kept up to a third of RAM (3 GB at most); longer sequences keep a window
+  ahead of the playhead and decode the rest again when it comes round. Each frame is capped at about
+  1M volume samples, and the whole sequence uses the first frame's box, brightness and detail level so
+  nothing jumps while it plays.
 
 ## Slow folders / freezes
 

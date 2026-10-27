@@ -76,7 +76,7 @@ def bench(label: str):
 APP_ID = "io.github.kestrel_files"
 APP_NAME = "Kestrel"
 APP_FULL_NAME = "Kestrel File Browser"
-VERSION = "1.0"
+VERSION = "1.1"
 HOME = os.path.expanduser("~")
 
 # --------------------------------------------------------------------------- demo mode (kestrel --demo folder)
@@ -186,7 +186,7 @@ DEFAULT_CONFIG = {
     "open_to": "quick", "browse_in_new_tab": False, "single_click": False,
     "show_recent": True, "show_frequent": True,
     "show_hidden": False, "hide_extensions": False, "full_path_title": False, "folders_first": True,
-    "confirm_delete": True, "checkboxes": False, "gl_preview": True, "gdk_backend": "", "rv_enabled": False, "rv_path": "", "ui_cores": 2, "archive_action": "extract", "index_enabled": False, "index_roots": [HOME], "index_network": False, "index_hidden": False, "index_interval_h": 6, "nav_pane": True, "preview_pane": False, "details_pane": False,
+    "confirm_delete": True, "checkboxes": False, "gl_preview": True, "seq_fps": 24, "blend_view": "breakdown", "gdk_backend": "", "rv_enabled": False, "rv_path": "", "ui_cores": 2, "archive_action": "extract", "index_enabled": False, "index_roots": [HOME], "index_network": False, "index_hidden": False, "index_interval_h": 6, "nav_pane": True, "preview_pane": False, "details_pane": False,
     "size_in_bytes": False, "date_format": "%Y-%m-%d %H:%M", "layout": "details",
     "sort_key": "name", "sort_desc": False, "group_by": "none",
     "columns": ["name", "modified", "type", "size"],

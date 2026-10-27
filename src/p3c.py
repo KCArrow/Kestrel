@@ -1,10 +1,45 @@
 
 
 # --------------------------------------------------------------------------- lightweight 3D model preview
-def load_model(path: str, max_faces: int = 500000) -> Optional[dict]:
+def _read_obj_numpy(data: bytes):
+    """OBJ text → (V float64 N×3, F int64 M×3) in bulk with numpy: pull the 'v' and 'f' lines out, drop the
+    /vt/vn parts, fan-triangulate n-gons vectorised. (V empty if the file has no usable vertices.)"""
+    vlines = [l for l in data.split(b"\n") if l[:2] == b"v "]
+    try:
+        V = np.array(b" ".join(l[2:].strip() for l in vlines).split(), dtype=np.float64)
+        V = V.reshape(len(vlines), -1)[:, :3] if len(vlines) else np.zeros((0, 3))
+    except ValueError:
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
+    if not len(V):
+        return V, np.zeros((0, 3), dtype=np.int64)
+    flines = [l[2:].strip() for l in data.split(b"\n") if l[:2] == b"f "]
+    nvert = len(V)
+    if not flines:
+        return V, np.zeros((0, 3), dtype=np.int64)
+    blob = re.sub(rb"[ \t]+", b" ", re.sub(rb"/\S*", b"", b"\n".join(flines))).strip()
+    rows = blob.split(b"\n")
+    counts = np.fromiter((r.count(b" ") + 1 for r in rows), dtype=np.int64, count=len(rows))
+    toks = blob.split()
+    idx = np.array(toks).astype(np.int64) if toks else np.zeros(0, dtype=np.int64)
+    idx = np.where(idx > 0, idx - 1, nvert + idx)
+    starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+    tris = []
+    for t in range(1, int(counts.max()) - 1 if len(counts) else 0):
+        sel = counts > t + 1
+        s0 = starts[sel]
+        tris.append(np.stack((idx[s0], idx[s0 + t], idx[s0 + t + 1]), axis=1))
+    F = np.concatenate(tris) if tris else np.zeros((0, 3), dtype=np.int64)
+    return V, F
+
+
+def load_model(path: str, max_faces: int = 500000, norm=None, max_voxels: Optional[int] = None) -> Optional[dict]:
     """Parse OBJ / STL (ascii+binary) / PLY (ascii) into {verts: [(x,y,z)], faces: [(i,j,k)], info: [...]}.
-    Big meshes are decimated by skipping faces so the preview stays interactive."""
+    Big meshes are decimated by skipping faces so the preview stays interactive. For Houdini caches, `norm`
+    (from a previous frame's result) keeps every frame of a sequence in the same box and brightness."""
     global LAST_VFX_ERROR
+    hk = houdini_kind(os.path.basename(path))
+    if hk:
+        return load_houdini_cache(path, hk, max_faces, norm, max_voxels)
     ext = os.path.splitext(path)[1].lower()
     verts: List[Tuple[float, float, float]] = []
     faces: List[Tuple[int, int, int]] = []
@@ -13,36 +48,11 @@ def load_model(path: str, max_faces: int = 500000) -> Optional[dict]:
     if ext == ".obj" and np is None:
         ext = ".obj-slow"
     if ext == ".obj":
-        # numpy fast path: pull the 'v' and 'f' lines out in bulk; the Python fallback below handles the rest
         with open(path, "rb") as f:
-            data = f.read()
-        vlines = [l for l in data.split(b"\n") if l[:2] == b"v "]
-        try:
-            V = np.array(b" ".join(l[2:].strip() for l in vlines).split(), dtype=np.float64)
-            V = V.reshape(len(vlines), -1)[:, :3] if len(vlines) else np.zeros((0, 3))
-        except ValueError:
-            V = None
-        if V is not None and len(V):
-            verts = V
-            flines = [l[2:].strip() for l in data.split(b"\n") if l[:2] == b"f "]
-            nvert = len(V)
-            # drop the /vt/vn parts, then every remaining token is a vertex index; polygons are fan-triangulated
-            # with the same vectorised scheme as the Alembic reader
-            blob = re.sub(rb"[ \t]+", b" ", re.sub(rb"/\S*", b"", b"\n".join(flines))).strip()
-            rows = blob.split(b"\n")
-            counts = np.fromiter((r.count(b" ") + 1 for r in rows), dtype=np.int64, count=len(rows))
-            toks = blob.split()
-            idx = np.array(toks).astype(np.int64) if toks else np.zeros(0, dtype=np.int64)
-            idx = np.where(idx > 0, idx - 1, nvert + idx)
-            starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
-            tris = []
-            for t in range(1, int(counts.max()) - 1 if len(counts) else 0):
-                sel = counts > t + 1
-                s0 = starts[sel]
-                tris.append(np.stack((idx[s0], idx[s0 + t], idx[s0 + t + 1]), axis=1))
-            faces = np.concatenate(tris) if tris else np.zeros((0, 3), dtype=np.int64)
+            V, F = _read_obj_numpy(f.read())
+        if len(V):
+            verts, faces = V, F
             nfaces_total = len(faces)
-            del data, vlines, flines, blob, rows, toks
         else:
             ext = ".obj-slow"
     if ext == ".obj-slow":
@@ -145,7 +155,7 @@ def load_model(path: str, max_faces: int = 500000) -> Optional[dict]:
             verts, faces, nm = [], [], 0
         extra = [("Meshes", str(nm)), ("Source", "FBX " + ("binary" if open(path, "rb").read(18) == b"Kaydara FBX Binary" else "ASCII"))]
         if not verts:
-            for loader in (load_via_assimp, load_via_blender):
+            for loader in (load_via_assimp, load_via_blender, load_via_maya):
                 got = loader(path)
                 if got:
                     verts, faces = got[0], got[1]
@@ -177,7 +187,13 @@ def load_model(path: str, max_faces: int = 500000) -> Optional[dict]:
             # open-source first: h5py reads the HDF5 container directly; vendor PyAlembic only as a last resort
             loaders = [load_abc_hdf5]          # (Maya's PyAlembic rejects HDF5 too: "Unsupported core type")
         else:
-            loaders = [load_via_blender, load_via_assimp, load_via_vfx_python]
+            # Blender first; Maya for studios that don't deploy Blender; Houdini reads Alembic too
+            loaders = [load_via_blender, load_via_assimp]
+            if ext in (".abc", ".usd", ".usda", ".usdc", ".usdz", ".obj", ".dae"):
+                loaders.append(load_via_maya)
+            if ext == ".abc":
+                loaders.append(load_via_houdini_mesh)
+            loaders.append(load_via_vfx_python)
         for loader in loaders:
             if len(verts):
                 break
@@ -225,7 +241,7 @@ def load_model(path: str, max_faces: int = 500000) -> Optional[dict]:
     return {"verts": verts, "faces": faces, "normals": normals, "info": info, "nfaces_total": nfaces_total}
 
 
-def _finish_model_numpy(verts, faces, max_faces: int, nfaces_total: int, extra: list) -> dict:
+def _finish_model_numpy(verts, faces, max_faces: int, nfaces_total: int, extra: list, bounds=None) -> dict:
     """Vectorised post-processing: decimate, drop unused vertices, normalise to a unit box, face + vertex
     normals. verts/faces may be Python lists or numpy arrays. Decimation is by VERTEX CLUSTERING (snap
     vertices to a grid, merge, drop collapsed faces) rather than by skipping faces: skipping leaves a
@@ -235,7 +251,7 @@ def _finish_model_numpy(verts, faces, max_faces: int, nfaces_total: int, extra: 
     V = np.asarray(verts, dtype=np.float32).reshape(-1, 3)
     F = np.asarray(faces, dtype=np.int32).reshape(-1, 3)
     nverts_total = len(V)
-    lo, hi = V.min(axis=0), V.max(axis=0)
+    lo, hi = bounds if bounds is not None else (V.min(axis=0), V.max(axis=0))
     size = (hi - lo).astype(np.float64)
     scale = max(float(size.max()), 1e-9)
     V = ((V - (lo + hi) / 2) / scale).astype(np.float32)   # unit box around the origin, longest side = 1
@@ -316,9 +332,222 @@ def _finish_model_numpy(verts, faces, max_faces: int, nfaces_total: int, extra: 
 
 
 
-def software_render(V, F, N, VN, params):
+def load_houdini_cache(path: str, kind: str, max_faces: int, norm=None, max_voxels: Optional[int] = None) -> Optional[dict]:
+    """.bgeo/.geo/.vdb → model dict with any of: mesh, particles (points + Cd), volume voxels.
+    Order: VDB: built-in reader (fast, no licence) → Houdini (hython) → gconvert (.geo/.bgeo) →
+    for VDB: OpenVDB Python module → Blender (volume → mesh)."""
+    global LAST_VFX_ERROR
+    LAST_VFX_ERROR = ""
+    if np is None:
+        return {"error": "Houdini caches need numpy (sudo dnf install python3-numpy)."}
+    mv = max_voxels or VDB_MAX_VOXELS
+    got = load_vdb_native(path, mv, norm[3] if norm is not None and len(norm) > 3 else None) if kind == "vdb" else None
+    if got is None:
+        got = load_via_houdini(path, max_voxels=mv)
+    if got is None and kind == "geo":
+        got = load_via_gconvert(path)
+    if got is None and kind == "vdb":
+        got = load_vdb_openvdb(path)
+        if got is None:
+            b = load_via_blender(path)
+            if b:
+                got = {"V": b[0], "F": b[1], "info": [("Volume", "shown as a surface (Blender volume → mesh)")], "source": "Blender"}
+    if got is None:
+        hint = "" if _find_houdini()["hython"] else " Install Houdini (hython) to preview Houdini caches."
+        return {"error": (LAST_VFX_ERROR or "No reader for this cache.") + hint}
+    return _finish_cache_numpy(got, max_faces, norm=norm)
+
+
+def _finish_cache_numpy(got: dict, max_faces: int, max_points: int = 2_000_000, norm=None) -> dict:
+    """Normalise mesh / points / volume voxels into ONE unit box (so they stay registered), then finish the mesh
+    part with the usual pipeline. Returns the model dict plus 'points', 'pcolor', 'vpts', 'vden', 'vsize', and
+    'norm' = (centre, scale, density max): pass it back for the next frame of a sequence so the box and the
+    smoke brightness stay put while it plays."""
+    parts = [np.asarray(got[k], dtype=np.float64).reshape(-1, 3) for k in ("V", "P", "vP") if k in got and len(got[k])]
+    if not parts:
+        return {"error": "The cache contains no points, polygons or volumes."}
+    allp = np.concatenate([p[:: max(1, len(p) // 200000)] for p in parts] + [p.min(0, keepdims=True) for p in parts] + [p.max(0, keepdims=True) for p in parts])
+    lo, hi = allp.min(axis=0), allp.max(axis=0)
+    size = hi - lo
+    if norm is not None:
+        centre, scale, dmax_ref = np.asarray(norm[0], dtype=np.float64), float(norm[1]), norm[2]
+    else:
+        centre, scale, dmax_ref = (lo + hi) / 2, max(float(size.max()), 1e-9), None
+    to_box = lambda A: ((np.asarray(A, dtype=np.float64).reshape(-1, 3) - centre) / scale).astype(np.float32)
+    extra = list(got.get("info", [])) + [("Source", got.get("source", ""))]
+    if "F" in got and len(got["F"]):
+        half = np.full(3, scale / 2)
+        m = _finish_model_numpy(got["V"], got["F"], max_faces, len(got["F"]), [],
+                                bounds=((centre - half).astype(np.float32), (centre + half).astype(np.float32)))
+        info = [r for r in m["info"] if r[0] in ("Vertices", "Faces")]
+    else:
+        m = {"verts": np.zeros((0, 3), np.float32), "faces": np.zeros((0, 3), np.int32), "normals": np.zeros((0, 3), np.float32),
+             "vnormals": np.zeros((0, 3), np.float32), "nfaces_total": 0}
+        info = []
+    if "P" in got and len(got["P"]):
+        P = to_box(got["P"])
+        step = max(1, len(P) // max_points)
+        m["points"] = np.ascontiguousarray(P[::step])
+        if "Cd" in got and len(got["Cd"]) == len(P):
+            m["pcolor"] = np.clip(np.asarray(got["Cd"], dtype=np.float32)[::step], 0, 1)
+        if "pS" in got:
+            m["psize"] = float(np.asarray(got["pS"]).ravel()[0]) * step / scale
+    if "vP" in got and len(got["vP"]):
+        m["vpts"] = to_box(got["vP"])
+        d = np.asarray(got["vD"], dtype=np.float32).ravel()
+        dmax = float(dmax_ref) if dmax_ref else max(float(d.max()), 1e-9)
+        m["vden"] = d / dmax
+        m["vsize"] = float(np.asarray(got.get("vS", [scale / 100])).ravel()[0]) / scale
+    m["info"] = info + [("Bounds", f"{size[0]:.3g} × {size[1]:.3g} × {size[2]:.3g}")] + [r for r in extra if r[1]]
+    vd = got.get("vD")
+    m["norm"] = (tuple(float(x) for x in centre), scale,
+                 dmax_ref or (max(float(np.max(vd)), 1e-9) if vd is not None and len(vd) else None),
+                 norm[3] if norm is not None and len(norm) > 3 else got.get("vStep"))
+    return m
+
+
+def _project(V, W, H, yaw, pitch, zoom, panx, pany):
+    """Camera used by every software path: per-point screen x/y, view depth (larger = nearer) and the
+    perspective factor (screen pixels per model unit at that point)."""
+    f32 = np.float32
+    cy_, sy_ = math.cos(yaw), math.sin(yaw)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    k16 = min(W, H) * 0.8 * zoom * 1.6
+    ox, oy = W / 2 + panx, H / 2 + pany
+    x, y, z = V[:, 0], V[:, 1], V[:, 2]
+    xr = x * f32(cy_) + z * f32(sy_)
+    zr = -x * f32(sy_) + z * f32(cy_)
+    yp = y * f32(cp) - zr * f32(sp)
+    depth = y * f32(sp) + zr * f32(cp)
+    wdiv = f32(k16) / (f32(2.6) - depth)
+    return f32(ox) + xr * wdiv, f32(oy) - yp * wdiv, depth, wdiv
+
+
+def render_cache(V, F, N, VN, EX, params):
+    """Frame for a model with particles and/or volume voxels (mesh optional). Opaque pass (mesh triangles and
+    point splats) into a shared z-buffer, then the volume as smoke: voxel densities in front of the opaque
+    surface are summed per pixel and composited with an auto-exposed absorption curve."""
+    W, H, yaw, pitch, zoom, panx, pany, smooth, wire, bg_rgb, fg_rgb = params
+    if W < 2 or H < 2:
+        return None
+    f32 = np.float32
+    n = W * H
+    zbuf = np.full(n, -np.inf, dtype=f32)
+    col = np.empty((n, 3), dtype=f32)
+    col[:] = np.array(bg_rgb, dtype=f32) / f32(255)
+    drew = False
+    if F is not None and len(F):
+        px, py, depth, _ = _project(V, W, H, yaw, pitch, zoom, panx, pany)
+        cy_, sy_, cp, sp = math.cos(yaw), math.sin(yaw), math.cos(pitch), math.sin(pitch)
+        NN = VN if (smooth and VN is not None and len(VN)) else N
+        nx1 = NN[:, 0] * f32(cy_) + NN[:, 2] * f32(sy_)
+        nz1 = -NN[:, 0] * f32(sy_) + NN[:, 2] * f32(cy_)
+        ny2 = NN[:, 1] * f32(cp) - nz1 * f32(sp)
+        nz2 = NN[:, 1] * f32(sp) + nz1 * f32(cp)
+        sh = f32(0.35) + f32(0.65) * np.minimum(np.abs(nx1 * f32(0.4) + ny2 * f32(0.7) + nz2 * f32(0.6)), f32(1.0))
+        vsh, fsh = (sh, None) if NN is VN else (None, sh)
+        bufs = _rasterize(W, H, px, py, depth, F[:, 0], F[:, 1], F[:, 2], vsh, fsh, bg_rgb, buffers=True)
+        if bufs is not None:
+            zb, sb, hit = bufs
+            zbuf = zb
+            s_ = sb[hit]
+            col[hit, 0] = np.clip(0.42 * s_ + 0.1, 0, 1)
+            col[hit, 1] = np.clip(0.55 * s_ + 0.1, 0, 1)
+            col[hit, 2] = np.clip(0.72 * s_ + 0.12, 0, 1)
+            drew = bool(hit.any())
+    P = EX.get("points")
+    if P is not None and len(P):
+        px, py, depth, wdiv_p = _project(P, W, H, yaw, pitch, zoom, panx, pany)
+        ok = (px >= 0) & (px < W) & (py >= 0) & (py < H)
+        idx = np.nonzero(ok)[0]
+        if len(idx):
+            cue = (f32(0.55) + f32(0.45) * np.clip((depth[idx] + f32(0.6)) / f32(1.2), 0, 1))[:, None]
+            pc = EX.get("pcolor")
+            c = (pc[idx] if pc is not None else np.array([0.62, 0.75, 0.92], dtype=f32)[None, :]) * cue
+            if EX.get("psize"):                                      # known spacing (level-set voxels): close the gaps
+                r = int(np.clip(round(float(EX["psize"]) * float(np.median(wdiv_p[idx])) * 1.15), 1, 12))
+            else:
+                r = 1 if len(idx) > 300_000 else 2                   # 2×2 splats when sparse, so points read
+            before = zbuf.copy()
+            for dx in range(r):
+                for dy in range(r):
+                    sx = np.clip(px[idx].astype(np.int32) + dx, 0, W - 1)
+                    sy = np.clip(py[idx].astype(np.int32) + dy, 0, H - 1)
+                    pix = sy * W + sx
+                    dz = depth[idx]
+                    np.maximum.at(zbuf, pix, dz)
+                    win = dz >= zbuf[pix]
+                    col[pix[win]] = c[win] if c.shape[0] == len(idx) else c[0]
+            # Shade the splats from the depth buffer they just wrote (normals from screen-space depth slopes):
+            # dense particle sheets and level-set surfaces read as 3D forms instead of flat cut-outs.
+            mine = (zbuf > before).reshape(H, W)
+            if mine.any():
+                z = np.where(mine, zbuf.reshape(H, W), np.nan)
+                gx = np.zeros_like(z)
+                gy = np.zeros_like(z)
+                gx[:, 1:-1] = (z[:, 2:] - z[:, :-2]) * 0.5
+                gy[1:-1, :] = (z[2:, :] - z[:-2, :]) * 0.5
+                gx = np.nan_to_num(gx, nan=0.0)
+                gy = np.nan_to_num(gy, nan=0.0)
+                k = float(np.median(wdiv_p[idx])) if len(idx) else 1.0
+                nx, ny = -gx * k, gy * k
+                ln = np.sqrt(nx * nx + ny * ny + 1.0)
+                lam = np.clip((nx * 0.4 + ny * 0.7 + 0.6) / ln, 0, 1)
+                shade = (0.45 + 0.55 * lam).astype(f32).reshape(-1)
+                m1 = mine.reshape(-1)
+                col[m1] *= shade[m1, None]
+            drew = True
+    VP = EX.get("vpts")
+    if VP is not None and len(VP):
+        px, py, depth, wdiv = _project(VP, W, H, yaw, pitch, zoom, panx, pany)
+        dens = EX["vden"]
+        rad = int(np.clip(round(float(EX.get("vsize", 0.01)) * float(np.median(wdiv))), 1, 4))
+        acc = np.zeros(n, dtype=np.float64)
+        ok = (px >= -rad - 1) & (px < W + rad) & (py >= -rad - 1) & (py < H + rad)
+        idx = np.nonzero(ok)[0]
+        if len(idx):
+            # Bilinear splats: each voxel spreads over the pixels it straddles by its sub-pixel position, so a
+            # regular voxel grid seen straight on doesn't alias into dark seams (moiré) between pixel columns.
+            fx = px[idx] - f32(0.5) - f32(rad // 2)
+            fy = py[idx] - f32(0.5) - f32(rad // 2)
+            x0 = np.floor(fx)
+            y0 = np.floor(fy)
+            tx, ty = fx - x0, fy - y0
+            x0 = x0.astype(np.int32)
+            y0 = y0.astype(np.int32)
+            dz = depth[idx]
+            w0 = (dens[idx] / (rad * rad)).astype(np.float64)
+            for cx, cy, wb in ((0, 0, (1 - tx) * (1 - ty)), (1, 0, tx * (1 - ty)), (0, 1, (1 - tx) * ty), (1, 1, tx * ty)):
+                wc = w0 * wb
+                for dx in range(rad):
+                    for dy in range(rad):
+                        sx = x0 + (cx + dx)
+                        sy = y0 + (cy + dy)
+                        inb = (sx >= 0) & (sx < W) & (sy >= 0) & (sy < H)
+                        pix = sy[inb] * W + sx[inb]
+                        front = dz[inb] > zbuf[pix]                      # occluded by the mesh / particles?
+                        acc += np.bincount(pix[front], weights=wc[inb][front], minlength=n)
+            nz = acc[acc > 0]
+            if len(nz):
+                ref = float(np.percentile(nz, 97)) or 1.0
+                a = (1.0 - np.exp(-2.5 * acc / ref)).astype(f32)[:, None]
+                smoke = (f32(0.94) - f32(0.30) * a) * np.array([0.97, 0.98, 1.0], dtype=f32)[None, :]
+                col = col * (f32(1) - a) + smoke * a
+                drew = True
+    if not drew:
+        return None
+    out = np.empty((n, 4), dtype=np.uint8)
+    rgb8 = np.clip(col * 255, 0, 255).astype(np.uint8)
+    out[:, 2], out[:, 1], out[:, 0], out[:, 3] = rgb8[:, 0], rgb8[:, 1], rgb8[:, 2], 255
+    return W, H, out.tobytes()
+
+
+def software_render(V, F, N, VN, params, EX=None):
     """Render one frame of a mesh with the numpy rasteriser. params = (W, H, yaw, pitch, zoom, panx, pany,
-    smooth, wire, bg_rgb, fg_rgb). Returns (W, H, BGRX bytes) or None. Runs in the render worker process."""
+    smooth, wire, bg_rgb, fg_rgb). Returns (W, H, BGRX bytes) or None. Runs in the render worker process.
+    EX (particles / volume voxels from Houdini caches) switches to render_cache."""
+    if EX and (not params[8] or F is None or not len(F)):
+        return render_cache(V, F, N, VN, EX, params)
     W, H, yaw, pitch, zoom, panx, pany, smooth, wire, bg_rgb, fg_rgb = params
     if W < 2 or H < 2 or F is None or not len(F):
         return None
@@ -385,7 +614,7 @@ def _wire_render(W, H, px, py, i, j, k, bg_rgb, fg_rgb):
     return W, H, out.reshape(H, W, 4).tobytes()
 
 
-def _rasterize(W, H, px, py, depth, i, j, k, vshade, fshade, bg_rgb):
+def _rasterize(W, H, px, py, depth, i, j, k, vshade, fshade, bg_rgb, buffers=False):
     """Vectorised triangle rasteriser with a z-buffer, in numpy.
 
     px/py/depth are per-VERTEX screen coordinates and view depth (larger = nearer); i/j/k index them per
@@ -476,6 +705,8 @@ def _rasterize(W, H, px, py, depth, i, j, k, vshade, fshade, bg_rgb):
                 sbuf[pix[win]] = w0s[win] * sa[tw] + w1s[win] * sb[tw] + w2s[win] * sc[tw]
 
     hit = zbuf > -np.inf
+    if buffers:
+        return zbuf, sbuf, hit
     if not hit.any():
         return None
     out = np.empty((H * W, 4), dtype=np.uint8)
@@ -493,6 +724,7 @@ def _render_worker_main(conn):
     """Render worker process: holds one model, answers ('frame', params) with the pixels."""
     pin_worker()
     V = F = N = VN = None
+    EX = None
     while True:
         try:
             msg = conn.recv()
@@ -502,11 +734,12 @@ def _render_worker_main(conn):
         if kind == "quit":
             return
         if kind == "model":
-            V, F, N, VN = msg[1]
+            V, F, N, VN = msg[1][:4]
+            EX = msg[1][4] if len(msg[1]) > 4 else None
             continue
         if kind == "frame":
             try:
-                res = software_render(V, F, N, VN, msg[1])
+                res = software_render(V, F, N, VN, msg[1], EX)
             except Exception as ex:          # never let a bad frame kill the worker
                 res = None
                 print("kestrel: render failed —", ex, file=sys.stderr)
@@ -554,8 +787,8 @@ class RenderWorker:
             except (OSError, ValueError):
                 return
 
-    def set_model(self, V, F, N, VN):
-        self._q.put(("model", (V, F, N, VN)))      # a 5M-face model takes ~0.3 s to pipe across, off-thread
+    def set_model(self, V, F, N, VN, EX=None):
+        self._q.put(("model", (V, F, N, VN, EX)))      # a 5M-face model takes ~0.3 s to pipe across, off-thread
 
     def render(self, params, cb):
         self._cb = cb
@@ -688,9 +921,10 @@ class ModelView(ModelNav, Gtk.DrawingArea):
         self.connect("draw", self._draw)
         # (the render process is shared and lives for the whole session; nothing to tear down per view)
 
-    def set_model(self, model: Optional[dict]):
+    def set_model(self, model: Optional[dict], keep_view: bool = False):
         self.model = model
-        self._reset_view()
+        if not keep_view:
+            self._reset_view()
         self._V = self._F = self._N = self._VN = None
         if model and np is not None:
             # numpy copies for the vectorised path: projection, culling, sorting and lighting become array
@@ -699,13 +933,14 @@ class ModelView(ModelNav, Gtk.DrawingArea):
             self._F = np.asarray(model["faces"], dtype=np.int32).reshape(-1, 3)
             self._N = np.asarray(model["normals"], dtype=np.float32).reshape(-1, 3) if model.get("normals") is not None and len(model["normals"]) else None
             self._VN = np.asarray(model["vnormals"], dtype=np.float32).reshape(-1, 3) if model.get("vnormals") is not None and len(model["vnormals"]) else None
+            EX = {k: model[k] for k in ("points", "pcolor", "psize", "vpts", "vden", "vsize") if k in model} or None
             self._worker = get_render_worker()
-            self._worker.set_model(self._V, self._F, self._N, self._VN)
+            self._worker.set_model(self._V, self._F, self._N, self._VN, EX)
         # Keep the previous frame on screen until the new model's first frame lands (model → model would
         # otherwise blank the viewport for the whole load, which reads as a flash before the crossfade).
         self._frame_params = None
         self._want = None
-        self._awaiting_first = True
+        self._awaiting_first = not keep_view
         if model is None:
             self._frame = None
         self.queue_draw()
@@ -916,13 +1151,404 @@ void main() {
     frag = vec4(vec3(0.08 + 0.90 * sh), 1.0);        // neutral white: tells the GL path from the blue software one
 }
 """
+# Particles: round sprites shaded as little spheres, sized like the software splats.
+_GL_PTS_VERT = """
+in vec3 pos;
+in vec3 col;
+uniform mat4 mvp;
+uniform float pxPerUnit;     // screen pixels per model unit at distance 1 (framebuffer pixels)
+uniform float psize;         // known point spacing in model units (level-set voxels), 0 = unknown
+uniform float defSize;       // sprite size when the spacing is unknown
+out vec3 vCol;
+out float vCue;
+void main() {
+    gl_Position = mvp * vec4(pos, 1.0);
+    float w = max(gl_Position.w, 1e-4);
+    gl_PointSize = psize > 0.0 ? clamp(psize * pxPerUnit / w * 1.15, 1.0, 64.0) : defSize;
+    vCue = 0.55 + 0.45 * clamp((2.6 - w + 0.6) / 1.2, 0.0, 1.0);    // nearer = brighter, as in software
+    vCol = col;
+}
+"""
+_GL_PTS_FRAG = """
+in vec3 vCol;
+in float vCue;
+uniform float round_;
+out vec4 frag;
+void main() {
+    float lam = 0.75;
+    if (round_ > 0.5) {
+        vec2 c = gl_PointCoord * 2.0 - 1.0;
+        float r2 = dot(c, c);
+        if (r2 > 1.0) discard;
+        vec3 n = vec3(c.x, -c.y, sqrt(1.0 - r2));
+        lam = clamp(dot(n, normalize(vec3(0.4, 0.7, 0.6))), 0.0, 1.0);
+    }
+    frag = vec4(vCol * vCue * (0.45 + 0.55 * lam), 1.0);
+}
+"""
+# Volume voxels: each is splatted as its exact screen footprint (box filtered against the pixel grid), adding
+# density x covered pixel area into a float target. A pixel's total is the density summed along its ray, the
+# same quantity the software renderer accumulates, so both paths share the exposure curve.
+_GL_VOX_VERT = """
+in vec3 pos;
+in float den;
+uniform mat4 mvp;
+uniform float pxPerUnit;
+uniform float vsize;
+out float vDen;
+out float vS;
+out float vSprite;
+void main() {
+    gl_Position = mvp * vec4(pos, 1.0);
+    float s = vsize * pxPerUnit / max(gl_Position.w, 1e-4);   // voxel edge in pixels
+    vS = s;
+    vSprite = ceil(s) + 2.0;
+    gl_PointSize = vSprite;
+    vDen = den;
+}
+"""
+_GL_VOX_FRAG = """
+in float vDen;
+in float vS;
+in float vSprite;
+out vec4 frag;
+float cover(float x, float h) { return clamp(min(x + 0.5, h) - max(x - 0.5, -h), 0.0, 1.0); }
+void main() {
+    vec2 p = (gl_PointCoord - 0.5) * vSprite;                  // this pixel's centre relative to the voxel's
+    float h = vS * 0.5;
+    frag = vec4(vDen * cover(p.x, h) * cover(p.y, h), 0.0, 0.0, 0.0);
+}
+"""
+# Final pass: opaque scene + smoke from the accumulated densities (1 - exp(-k·sum), auto-exposed).
+_GL_COMP_VERT = """
+out vec2 uv;
+void main() {
+    vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0, (gl_VertexID == 2) ? 3.0 : -1.0);
+    uv = p * 0.5 + 0.5;
+    gl_Position = vec4(p, 0.0, 1.0);
+}
+"""
+_GL_COMP_FRAG = """
+in vec2 uv;
+uniform sampler2D opaqueTex;
+uniform sampler2D accumTex;
+uniform float k;
+out vec4 frag;
+void main() {
+    vec3 c = texture(opaqueTex, uv).rgb;
+    float a = 1.0 - exp(-k * texture(accumTex, uv).r);
+    vec3 smoke = (0.94 - 0.30 * a) * vec3(0.97, 0.98, 1.0);
+    frag = vec4(mix(c, smoke, a), 1.0);
+}
+"""
+
+
+def gl_matrices(w: int, h: int, yaw: float, pitch: float, zoom: float, pan):
+    """Row-major numpy (upload with transpose=True): mvp, mv, normal matrix, and pixels per model unit at
+    distance 1 (the software path's k16). Same camera as _project: yaw → pitch → distance 2.6, pan in pixels."""
+    cy_, sy_ = math.cos(yaw), math.sin(yaw)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    Ry = np.array([[cy_, 0, sy_, 0], [0, 1, 0, 0], [-sy_, 0, cy_, 0], [0, 0, 0, 1]], dtype=np.float64)
+    Rx = np.array([[1, 0, 0, 0], [0, cp, -sp, 0], [0, sp, cp, 0], [0, 0, 0, 1]], dtype=np.float64)
+    T = np.eye(4)
+    T[2, 3] = -2.6
+    mv = T @ Rx @ Ry
+    s = min(w, h) * 0.8 * zoom * 1.6
+    fx, fy = s / (w / 2), s / (h / 2)
+    near, far = 0.05, 20.0
+    P = np.array([[fx, 0, 0, 0], [0, fy, 0, 0],
+                  [0, 0, (far + near) / (near - far), 2 * far * near / (near - far)],
+                  [0, 0, -1, 0]], dtype=np.float64)
+    Pan = np.eye(4)
+    Pan[0, 3] = pan[0] * 2.0 / w
+    Pan[1, 3] = -pan[1] * 2.0 / h
+    mvp = Pan @ P @ mv
+    return mvp.astype(np.float32), mv.astype(np.float32), (Rx @ Ry)[:3, :3].astype(np.float32), s
+
+
+class GLScene:
+    """Everything the OpenGL previewer draws, independent of GTK (so it can be tested on any GL context):
+    a mesh (one glDrawElements), particles (sphere-shaded sprites) and volumes. Volumes go through an
+    offscreen pass: opaque scene into an RGBA8 texture + depth, voxel densities added into a float texture
+    (depth-tested against the opaque scene), then one full-screen pass composites smoke over it.
+    Methods must be called with the context current."""
+
+    def __init__(self, header: str):
+        self.hdr = header
+        self.es = "300 es" in header
+        self.mesh_prog = self._program(_GL_VERT, _GL_FRAG)
+        self.pts_prog = self.vox_prog = self.comp_prog = None
+        self.vao = _GL.glGenVertexArrays(1)
+        self.vbo = _GL.glGenBuffers(1)
+        self.ebo = _GL.glGenBuffers(1)
+        self.pvao = self.pvbo = self.vvao = self.vvbo = self.evao = None
+        self.fbo_a = self.fbo_b = self.tex_a = self.tex_b = self.rb = None
+        self.fb_size = (0, 0)
+        self.nidx = self.npts = self.nvox = 0
+        self.psize = 0.0
+        self.vsize = 0.0
+        self.k = None                       # smoke exposure, measured on the first frame of each model
+        self.acc_fmt = ""
+
+    def _program(self, vs: str, fs: str):
+        return _GLshaders.compileProgram(_GLshaders.compileShader(self.hdr + vs, _GL.GL_VERTEX_SHADER),
+                                         _GLshaders.compileShader(self.hdr + fs, _GL.GL_FRAGMENT_SHADER))
+
+    def _attribs(self, prog, layout):
+        """layout: [(name, components)] interleaved float32."""
+        import ctypes
+        stride = 4 * sum(n for _, n in layout)
+        off = 0
+        for name, n in layout:
+            loc = _GL.glGetAttribLocation(prog, name)
+            if loc >= 0:
+                _GL.glEnableVertexAttribArray(loc)
+                _GL.glVertexAttribPointer(loc, n, _GL.GL_FLOAT, _GL.GL_FALSE, stride, ctypes.c_void_p(off))
+            off += 4 * n
+
+    # ---- upload
+    def upload(self, m: Optional[dict], keep_exposure: bool = False):
+        self.nidx = self.npts = self.nvox = 0
+        if not keep_exposure:
+            self.k = None
+        if not m:
+            return
+        if len(m.get("faces", ())):
+            V = np.asarray(m["verts"], dtype=np.float32).reshape(-1, 3)
+            F = np.asarray(m["faces"], dtype=np.uint32).reshape(-1, 3)
+            VN = m.get("vnormals")
+            if VN is None or not len(VN):
+                VN = np.zeros_like(V)
+                VN[:, 2] = 1.0
+            data = np.ascontiguousarray(np.hstack((V, np.asarray(VN, dtype=np.float32).reshape(-1, 3))))
+            _GL.glBindVertexArray(self.vao)
+            _GL.glBindBuffer(_GL.GL_ARRAY_BUFFER, self.vbo)
+            _GL.glBufferData(_GL.GL_ARRAY_BUFFER, data.nbytes, data, _GL.GL_STATIC_DRAW)
+            _GL.glBindBuffer(_GL.GL_ELEMENT_ARRAY_BUFFER, self.ebo)
+            idx = np.ascontiguousarray(F)
+            _GL.glBufferData(_GL.GL_ELEMENT_ARRAY_BUFFER, idx.nbytes, idx, _GL.GL_STATIC_DRAW)
+            self._attribs(self.mesh_prog, [("pos", 3), ("nrm", 3)])
+            _GL.glBindVertexArray(0)
+            self.nidx = int(idx.size)
+        P = m.get("points")
+        if P is not None and len(P):
+            if self.pts_prog is None:
+                self.pts_prog = self._program(_GL_PTS_VERT, _GL_PTS_FRAG)
+                self.pvao, self.pvbo = _GL.glGenVertexArrays(1), _GL.glGenBuffers(1)
+            P = np.asarray(P, dtype=np.float32).reshape(-1, 3)
+            C = m.get("pcolor")
+            C = (np.asarray(C, dtype=np.float32).reshape(-1, 3) if C is not None and len(C) == len(P)
+                 else np.broadcast_to(np.array([0.62, 0.75, 0.92], np.float32), P.shape))
+            data = np.ascontiguousarray(np.hstack((P, C)))
+            _GL.glBindVertexArray(self.pvao)
+            _GL.glBindBuffer(_GL.GL_ARRAY_BUFFER, self.pvbo)
+            _GL.glBufferData(_GL.GL_ARRAY_BUFFER, data.nbytes, data, _GL.GL_STATIC_DRAW)
+            self._attribs(self.pts_prog, [("pos", 3), ("col", 3)])
+            _GL.glBindVertexArray(0)
+            self.npts = len(P)
+            self.psize = float(m.get("psize") or 0.0)
+        VP = m.get("vpts")
+        if VP is not None and len(VP):
+            if self.vox_prog is None:
+                self.vox_prog = self._program(_GL_VOX_VERT, _GL_VOX_FRAG)
+                self.comp_prog = self._program(_GL_COMP_VERT, _GL_COMP_FRAG)
+                self.vvao, self.vvbo = _GL.glGenVertexArrays(1), _GL.glGenBuffers(1)
+                self.evao = _GL.glGenVertexArrays(1)        # empty VAO for the full-screen triangle
+            data = np.ascontiguousarray(np.hstack((np.asarray(VP, dtype=np.float32).reshape(-1, 3),
+                                                   np.asarray(m["vden"], dtype=np.float32).reshape(-1, 1))))
+            _GL.glBindVertexArray(self.vvao)
+            _GL.glBindBuffer(_GL.GL_ARRAY_BUFFER, self.vvbo)
+            _GL.glBufferData(_GL.GL_ARRAY_BUFFER, data.nbytes, data, _GL.GL_STATIC_DRAW)
+            self._attribs(self.vox_prog, [("pos", 3), ("den", 1)])
+            _GL.glBindVertexArray(0)
+            self.nvox = len(data)
+            self.vsize = float(m.get("vsize") or 0.01)
+
+    # ---- offscreen targets for volumes
+    def _targets(self, W: int, H: int):
+        if self.fb_size == (W, H) and self.fbo_a:
+            return
+        self._free_targets()
+        self.tex_a, self.tex_b = _GL.glGenTextures(1), _GL.glGenTextures(1)
+        for t in (self.tex_a, self.tex_b):
+            _GL.glBindTexture(_GL.GL_TEXTURE_2D, t)
+            _GL.glTexParameteri(_GL.GL_TEXTURE_2D, _GL.GL_TEXTURE_MIN_FILTER, _GL.GL_NEAREST)
+            _GL.glTexParameteri(_GL.GL_TEXTURE_2D, _GL.GL_TEXTURE_MAG_FILTER, _GL.GL_NEAREST)
+            _GL.glTexParameteri(_GL.GL_TEXTURE_2D, _GL.GL_TEXTURE_WRAP_S, _GL.GL_CLAMP_TO_EDGE)
+            _GL.glTexParameteri(_GL.GL_TEXTURE_2D, _GL.GL_TEXTURE_WRAP_T, _GL.GL_CLAMP_TO_EDGE)
+        _GL.glBindTexture(_GL.GL_TEXTURE_2D, self.tex_a)
+        _GL.glTexImage2D(_GL.GL_TEXTURE_2D, 0, _GL.GL_RGBA8, W, H, 0, _GL.GL_RGBA, _GL.GL_UNSIGNED_BYTE, None)
+        self.rb = _GL.glGenRenderbuffers(1)
+        _GL.glBindRenderbuffer(_GL.GL_RENDERBUFFER, self.rb)
+        _GL.glRenderbufferStorage(_GL.GL_RENDERBUFFER, _GL.GL_DEPTH_COMPONENT24, W, H)
+        self.fbo_a, self.fbo_b = _GL.glGenFramebuffers(1), _GL.glGenFramebuffers(1)
+        _GL.glBindFramebuffer(_GL.GL_FRAMEBUFFER, self.fbo_a)
+        _GL.glFramebufferTexture2D(_GL.GL_FRAMEBUFFER, _GL.GL_COLOR_ATTACHMENT0, _GL.GL_TEXTURE_2D, self.tex_a, 0)
+        _GL.glFramebufferRenderbuffer(_GL.GL_FRAMEBUFFER, _GL.GL_DEPTH_ATTACHMENT, _GL.GL_RENDERBUFFER, self.rb)
+        if _GL.glCheckFramebufferStatus(_GL.GL_FRAMEBUFFER) != _GL.GL_FRAMEBUFFER_COMPLETE:
+            raise RuntimeError("offscreen colour target not supported")
+        _GL.glBindFramebuffer(_GL.GL_FRAMEBUFFER, self.fbo_b)
+        _GL.glFramebufferRenderbuffer(_GL.GL_FRAMEBUFFER, _GL.GL_DEPTH_ATTACHMENT, _GL.GL_RENDERBUFFER, self.rb)
+        for ifmt, typ, label in ((_GL.GL_R32F, _GL.GL_FLOAT, "R32F"), (_GL.GL_R16F, _GL.GL_HALF_FLOAT, "R16F")):
+            _GL.glBindTexture(_GL.GL_TEXTURE_2D, self.tex_b)
+            _GL.glTexImage2D(_GL.GL_TEXTURE_2D, 0, ifmt, W, H, 0, _GL.GL_RED, typ, None)
+            _GL.glFramebufferTexture2D(_GL.GL_FRAMEBUFFER, _GL.GL_COLOR_ATTACHMENT0, _GL.GL_TEXTURE_2D, self.tex_b, 0)
+            if _GL.glCheckFramebufferStatus(_GL.GL_FRAMEBUFFER) == _GL.GL_FRAMEBUFFER_COMPLETE:
+                self.acc_fmt = label
+                break
+        else:
+            raise RuntimeError("float render targets not supported (volumes need them)")
+        _GL.glBindTexture(_GL.GL_TEXTURE_2D, 0)
+        self.fb_size = (W, H)
+
+    def _free_targets(self):
+        try:
+            if self.fbo_a:
+                _GL.glDeleteFramebuffers(2, [self.fbo_a, self.fbo_b])
+            if self.tex_a:
+                _GL.glDeleteTextures(2, [self.tex_a, self.tex_b])
+            if self.rb:
+                _GL.glDeleteRenderbuffers(1, [self.rb])
+        except Exception:
+            pass
+        self.fbo_a = self.fbo_b = self.tex_a = self.tex_b = self.rb = None
+        self.fb_size = (0, 0)
+
+    def free(self):
+        self._free_targets()
+        try:
+            _GL.glDeleteBuffers(1, [self.vbo])
+            _GL.glDeleteBuffers(1, [self.ebo])
+            for b in (self.pvbo, self.vvbo):
+                if b:
+                    _GL.glDeleteBuffers(1, [b])
+            for a in (self.vao, self.pvao, self.vvao, self.evao):
+                if a:
+                    _GL.glDeleteVertexArrays(1, [a])
+            for p in (self.mesh_prog, self.pts_prog, self.vox_prog, self.comp_prog):
+                if p:
+                    _GL.glDeleteProgram(p)
+        except Exception:
+            pass
+
+    # ---- draw
+    def _u(self, prog, name):
+        return _GL.glGetUniformLocation(prog, name)
+
+    def _draw_opaque(self, mvp, mv, nmat, ppu, smooth, wire, fg):
+        _GL.glEnable(_GL.GL_DEPTH_TEST)
+        _GL.glDepthMask(_GL.GL_TRUE)
+        _GL.glDisable(_GL.GL_CULL_FACE)
+        _GL.glDisable(_GL.GL_BLEND)
+        if self.nidx:
+            p = self.mesh_prog
+            _GL.glUseProgram(p)
+            _GL.glUniformMatrix4fv(self._u(p, "mvp"), 1, _GL.GL_TRUE, mvp)
+            _GL.glUniformMatrix4fv(self._u(p, "mv"), 1, _GL.GL_TRUE, mv)
+            _GL.glUniformMatrix3fv(self._u(p, "nmat"), 1, _GL.GL_TRUE, nmat)
+            _GL.glUniform1i(self._u(p, "smoothShade"), 1 if smooth else 0)
+            _GL.glUniform1i(self._u(p, "wire"), 1 if wire else 0)
+            _GL.glUniform3f(self._u(p, "wireColor"), *fg)
+            if not self.es:
+                _GL.glPolygonMode(_GL.GL_FRONT_AND_BACK, _GL.GL_LINE if wire else _GL.GL_FILL)
+            _GL.glBindVertexArray(self.vao)
+            _GL.glDrawElements(_GL.GL_TRIANGLES, self.nidx, _GL.GL_UNSIGNED_INT, None)
+            if not self.es:
+                _GL.glPolygonMode(_GL.GL_FRONT_AND_BACK, _GL.GL_FILL)
+        if self.npts:
+            if not self.es:
+                _GL.glEnable(_GL.GL_PROGRAM_POINT_SIZE)
+            p = self.pts_prog
+            _GL.glUseProgram(p)
+            _GL.glUniformMatrix4fv(self._u(p, "mvp"), 1, _GL.GL_TRUE, mvp)
+            _GL.glUniform1f(self._u(p, "pxPerUnit"), ppu)
+            _GL.glUniform1f(self._u(p, "psize"), self.psize)
+            _GL.glUniform1f(self._u(p, "defSize"), 1.5 if self.npts > 300_000 else 2.5)
+            _GL.glUniform1f(self._u(p, "round_"), 1.0 if self.psize or self.npts <= 300_000 else 0.0)
+            _GL.glBindVertexArray(self.pvao)
+            _GL.glDrawArrays(_GL.GL_POINTS, 0, self.npts)
+        _GL.glBindVertexArray(0)
+        _GL.glUseProgram(0)
+
+    def render(self, W: int, H: int, w: int, h: int, cam, bg, fg, smooth: bool, wire: bool, target_fb: int):
+        """W×H framebuffer pixels (w×h logical). cam = (yaw, pitch, zoom, pan). target_fb = the framebuffer
+        to finish in (GtkGLArea's own one is bound when the render signal fires, and is not 0)."""
+        mvp, mv, nmat, k16 = gl_matrices(w, h, *cam)
+        ppu = k16 * (W / float(w))                            # framebuffer pixels per unit at distance 1
+        if not self.nvox:
+            _GL.glBindFramebuffer(_GL.GL_FRAMEBUFFER, target_fb)
+            _GL.glViewport(0, 0, W, H)
+            _GL.glClearColor(bg[0], bg[1], bg[2], 1.0)
+            _GL.glClear(_GL.GL_COLOR_BUFFER_BIT | _GL.GL_DEPTH_BUFFER_BIT)
+            self._draw_opaque(mvp, mv, nmat, ppu, smooth, wire, fg)
+            return
+        self._targets(W, H)
+        _GL.glViewport(0, 0, W, H)
+        _GL.glBindFramebuffer(_GL.GL_FRAMEBUFFER, self.fbo_a)
+        _GL.glClearColor(bg[0], bg[1], bg[2], 1.0)
+        _GL.glClear(_GL.GL_COLOR_BUFFER_BIT | _GL.GL_DEPTH_BUFFER_BIT)
+        self._draw_opaque(mvp, mv, nmat, ppu, smooth, wire, fg)
+        # densities in front of the opaque scene, summed per pixel
+        _GL.glBindFramebuffer(_GL.GL_FRAMEBUFFER, self.fbo_b)
+        _GL.glClearColor(0.0, 0.0, 0.0, 0.0)
+        _GL.glClear(_GL.GL_COLOR_BUFFER_BIT)
+        _GL.glEnable(_GL.GL_DEPTH_TEST)
+        _GL.glDepthMask(_GL.GL_FALSE)
+        _GL.glEnable(_GL.GL_BLEND)
+        _GL.glBlendFunc(_GL.GL_ONE, _GL.GL_ONE)
+        if not self.es:
+            _GL.glEnable(_GL.GL_PROGRAM_POINT_SIZE)
+        p = self.vox_prog
+        _GL.glUseProgram(p)
+        _GL.glUniformMatrix4fv(self._u(p, "mvp"), 1, _GL.GL_TRUE, mvp)
+        _GL.glUniform1f(self._u(p, "pxPerUnit"), ppu)
+        _GL.glUniform1f(self._u(p, "vsize"), self.vsize)
+        _GL.glBindVertexArray(self.vvao)
+        _GL.glDrawArrays(_GL.GL_POINTS, 0, self.nvox)
+        _GL.glDisable(_GL.GL_BLEND)
+        _GL.glDepthMask(_GL.GL_TRUE)
+        if self.k is None:
+            self.k = self._exposure(W, H)
+        # composite into the widget's framebuffer
+        _GL.glBindFramebuffer(_GL.GL_FRAMEBUFFER, target_fb)
+        _GL.glViewport(0, 0, W, H)
+        _GL.glDisable(_GL.GL_DEPTH_TEST)
+        p = self.comp_prog
+        _GL.glUseProgram(p)
+        _GL.glActiveTexture(_GL.GL_TEXTURE0)
+        _GL.glBindTexture(_GL.GL_TEXTURE_2D, self.tex_a)
+        _GL.glActiveTexture(_GL.GL_TEXTURE1)
+        _GL.glBindTexture(_GL.GL_TEXTURE_2D, self.tex_b)
+        _GL.glUniform1i(self._u(p, "opaqueTex"), 0)
+        _GL.glUniform1i(self._u(p, "accumTex"), 1)
+        _GL.glUniform1f(self._u(p, "k"), self.k)
+        _GL.glBindVertexArray(self.evao)
+        _GL.glDrawArrays(_GL.GL_TRIANGLES, 0, 3)
+        _GL.glBindVertexArray(0)
+        _GL.glBindTexture(_GL.GL_TEXTURE_2D, 0)
+        _GL.glActiveTexture(_GL.GL_TEXTURE0)
+        _GL.glBindTexture(_GL.GL_TEXTURE_2D, 0)
+        _GL.glUseProgram(0)
+
+    def _exposure(self, W: int, H: int) -> float:
+        """Same auto-exposure as the software renderer (97th percentile of the summed densities), measured once
+        per model from the first frame so orbiting doesn't pump the brightness."""
+        try:
+            _GL.glReadBuffer(_GL.GL_COLOR_ATTACHMENT0)
+            raw = _GL.glReadPixels(0, 0, W, H, _GL.GL_RED, _GL.GL_FLOAT)
+            acc = np.asarray(raw, dtype=np.float32).reshape(-1)
+            nz = acc[acc > 0]
+            ref = float(np.percentile(nz, 97)) if len(nz) else 1.0
+        except Exception:
+            ref = 8.0                                         # GLES drivers may refuse float readback
+        return 2.5 / max(ref, 1e-6)
 
 
 class GLModelView(ModelNav, Gtk.GLArea):
-    """Hardware-accelerated previewer: the mesh is uploaded to the GPU once (interleaved position+normal VBO,
-    uint32 index buffer) and every frame is a single glDrawElements, so a 5M-triangle mesh orbits at the
-    display's refresh rate. Same camera maths as the software path (yaw → pitch → distance 2.6, pan in
-    pixels), same shading (two-sided, Gouraud or flat via screen-space derivatives), same keys."""
+    """Hardware-accelerated previewer: geometry is uploaded to the GPU once and every frame is a few draw
+    calls, so a 5M-triangle mesh or a million-voxel volume orbits at the display's refresh rate. Same camera
+    maths as the software path (yaw → pitch → distance 2.6, pan in pixels), same shading, same keys.
+    Drawing lives in GLScene."""
 
     def __init__(self):
         super().__init__()
@@ -931,13 +1557,12 @@ class GLModelView(ModelNav, Gtk.GLArea):
         self.set_auto_render(True)
         self.gl_flavour = ""
         self.connect("create-context", self._create_context)
-        self._prog = None
-        self._vao = self._vbo = self._ebo = None
-        self._count = 0
+        self.scene: Optional[GLScene] = None
         self._dirty = False
         self.gl_info = ""
         self.gl_error: Optional[str] = None
         self.on_error = None                  # callable(msg) set by the window: shown in the UI, triggers fallback
+        self.on_cache_failed = None           # callable(model, msg): particles/volumes failed, use software for them
         self.connect("realize", self._on_realize)
         self.connect("unrealize", self._on_unrealize)
         self.connect("render", self._on_render)
@@ -979,13 +1604,8 @@ class GLModelView(ModelNav, Gtk.GLArea):
                 self.gl_info += " — " + _GL.glGetString(_GL.GL_RENDERER).decode(errors="replace")
             except Exception:
                 pass
-            hdr = _gl_header(ctx)
             self.gl_info += f" [{self.gl_flavour}]"
-            self._prog = _GLshaders.compileProgram(_GLshaders.compileShader(hdr + _GL_VERT, _GL.GL_VERTEX_SHADER),
-                                                   _GLshaders.compileShader(hdr + _GL_FRAG, _GL.GL_FRAGMENT_SHADER))
-            self._vao = _GL.glGenVertexArrays(1)
-            self._vbo = _GL.glGenBuffers(1)
-            self._ebo = _GL.glGenBuffers(1)
+            self.scene = GLScene(_gl_header(ctx))
             self._dirty = self.model is not None
             GL_STATUS[:] = [f"OpenGL OK: {self.gl_info}"]
         except Exception as ex:
@@ -993,87 +1613,41 @@ class GLModelView(ModelNav, Gtk.GLArea):
 
     def _on_unrealize(self, w):
         self.make_current()
-        try:
-            if self._vao:
-                _GL.glDeleteVertexArrays(1, [self._vao])
-            if self._vbo:
-                _GL.glDeleteBuffers(1, [self._vbo])
-            if self._ebo:
-                _GL.glDeleteBuffers(1, [self._ebo])
-            if self._prog:
-                _GL.glDeleteProgram(self._prog)
-        except Exception:
-            pass
-        self._prog = self._vao = self._vbo = self._ebo = None
+        if self.scene:
+            self.scene.free()
+        self.scene = None
 
-    def set_model(self, model: Optional[dict]):
+    def set_model(self, model: Optional[dict], keep_view: bool = False):
+        """keep_view: next frame of a sequence — same camera, same smoke exposure (no brightness pumping)."""
         self.model = model
-        self._reset_view()
-        self._dirty = True
+        if not keep_view:
+            self._reset_view()
+        self._dirty = "keep" if keep_view else True
         self.queue_render()
 
     def queue_draw(self):             # ModelNav calls queue_draw(); GLArea wants queue_render()
         self.queue_render()
 
-    # ---- upload
-    def _upload(self):
+    def _cache_failed(self, ex):
+        """Particles / volumes need features this driver lacks: hand this model to the software renderer
+        (meshes keep using OpenGL)."""
         m = self.model
-        self._dirty = False
-        if not m or not len(m["faces"]):
-            self._count = 0
-            return
-        V = np.asarray(m["verts"], dtype=np.float32).reshape(-1, 3)
-        F = np.asarray(m["faces"], dtype=np.uint32).reshape(-1, 3)
-        VN = m.get("vnormals")
-        if VN is None or not len(VN):
-            VN = np.zeros_like(V)
-            VN[:, 2] = 1.0
-        data = np.ascontiguousarray(np.hstack((V, np.asarray(VN, dtype=np.float32).reshape(-1, 3))))
-        _GL.glBindVertexArray(self._vao)
-        _GL.glBindBuffer(_GL.GL_ARRAY_BUFFER, self._vbo)
-        _GL.glBufferData(_GL.GL_ARRAY_BUFFER, data.nbytes, data, _GL.GL_STATIC_DRAW)
-        _GL.glBindBuffer(_GL.GL_ELEMENT_ARRAY_BUFFER, self._ebo)
-        idx = np.ascontiguousarray(F)
-        _GL.glBufferData(_GL.GL_ELEMENT_ARRAY_BUFFER, idx.nbytes, idx, _GL.GL_STATIC_DRAW)
-        stride = 6 * 4
-        lp = _GL.glGetAttribLocation(self._prog, "pos")
-        ln = _GL.glGetAttribLocation(self._prog, "nrm")
-        _GL.glEnableVertexAttribArray(lp)
-        import ctypes
-        _GL.glVertexAttribPointer(lp, 3, _GL.GL_FLOAT, _GL.GL_FALSE, stride, ctypes.c_void_p(0))
-        _GL.glEnableVertexAttribArray(ln)
-        _GL.glVertexAttribPointer(ln, 3, _GL.GL_FLOAT, _GL.GL_FALSE, stride, ctypes.c_void_p(12))
-        _GL.glBindVertexArray(0)
-        self._count = int(idx.size)
-
-    # ---- matrices (row-major numpy, uploaded with transpose=True)
-    def _matrices(self, w: int, h: int):
-        cy_, sy_ = math.cos(self.yaw), math.sin(self.yaw)
-        cp, sp = math.cos(self.pitch), math.sin(self.pitch)
-        Ry = np.array([[cy_, 0, sy_, 0], [0, 1, 0, 0], [-sy_, 0, cy_, 0], [0, 0, 0, 1]], dtype=np.float64)
-        Rx = np.array([[1, 0, 0, 0], [0, cp, -sp, 0], [0, sp, cp, 0], [0, 0, 0, 1]], dtype=np.float64)
-        T = np.eye(4)
-        T[2, 3] = -2.6
-        mv = T @ Rx @ Ry
-        s = min(w, h) * 0.8 * self.zoom * 1.6
-        fx, fy = s / (w / 2), s / (h / 2)
-        near, far = 0.05, 20.0
-        P = np.array([[fx, 0, 0, 0], [0, fy, 0, 0],
-                      [0, 0, (far + near) / (near - far), 2 * far * near / (near - far)],
-                      [0, 0, -1, 0]], dtype=np.float64)
-        # pan in pixels → NDC offset after projection
-        Pan = np.eye(4)
-        Pan[0, 3] = self.pan[0] * 2.0 / w
-        Pan[1, 3] = -self.pan[1] * 2.0 / h
-        mvp = Pan @ P @ mv
-        return mvp.astype(np.float32), mv.astype(np.float32), (Rx @ Ry)[:3, :3].astype(np.float32)
+        msg = str(ex).replace("\n", " ")[:300]
+        print("kestrel: OpenGL can't draw this cache, using the software renderer —", msg, file=sys.stderr)
+        self.model = None
+        self._dirty = True
+        if self.on_cache_failed and m is not None:
+            GLib.idle_add(lambda: (self.on_cache_failed(m, msg), False)[1])
 
     # ---- render
     def _on_render(self, area, ctx):
         try:
             self._render()
         except Exception as ex:
-            self._fail("render", ex)
+            if self.model is not None and any(k in self.model for k in ("points", "vpts")):
+                self._cache_failed(ex)
+            else:
+                self._fail("render", ex)
         return True
 
     def _render(self):
@@ -1084,33 +1658,20 @@ class GLModelView(ModelNav, Gtk.GLArea):
             r, g, b = (bgc.red, bgc.green, bgc.blue) if ok else ((0.13,) * 3 if fg.red > 0.5 else (0.98,) * 3)
         except Exception:
             r, g, b = (0.13,) * 3
-        _GL.glClearColor(r * 0.96 + fg.red * 0.04, g * 0.96 + fg.green * 0.04, b * 0.96 + fg.blue * 0.04, 1.0)
-        _GL.glClear(_GL.GL_COLOR_BUFFER_BIT | _GL.GL_DEPTH_BUFFER_BIT)
-        if self.gl_error or not self._prog:
+        bg = (r * 0.96 + fg.red * 0.04, g * 0.96 + fg.green * 0.04, b * 0.96 + fg.blue * 0.04)
+        target = int(np.asarray(_GL.glGetIntegerv(_GL.GL_DRAW_FRAMEBUFFER_BINDING)).reshape(-1)[0])
+        if self.gl_error or not self.scene:
+            _GL.glClearColor(bg[0], bg[1], bg[2], 1.0)
+            _GL.glClear(_GL.GL_COLOR_BUFFER_BIT | _GL.GL_DEPTH_BUFFER_BIT)
             return
         if self._dirty:
-            self._upload()
-        if not self._count:
-            return
+            keep = self._dirty == "keep"
+            self._dirty = False
+            self.scene.upload(self.model, keep_exposure=keep)
         scale = self.get_scale_factor()
         w, h = max(1, self.get_allocated_width()), max(1, self.get_allocated_height())
-        _GL.glViewport(0, 0, w * scale, h * scale)
-        mvp, mv, nmat = self._matrices(w, h)
-        _GL.glEnable(_GL.GL_DEPTH_TEST)
-        _GL.glDisable(_GL.GL_CULL_FACE)
-        _GL.glUseProgram(self._prog)
-        _GL.glUniformMatrix4fv(_GL.glGetUniformLocation(self._prog, "mvp"), 1, _GL.GL_TRUE, mvp)
-        _GL.glUniformMatrix4fv(_GL.glGetUniformLocation(self._prog, "mv"), 1, _GL.GL_TRUE, mv)
-        _GL.glUniformMatrix3fv(_GL.glGetUniformLocation(self._prog, "nmat"), 1, _GL.GL_TRUE, nmat)
-        _GL.glUniform1i(_GL.glGetUniformLocation(self._prog, "smoothShade"), 1 if self.smooth else 0)
-        _GL.glUniform1i(_GL.glGetUniformLocation(self._prog, "wire"), 1 if self.wire else 0)
-        _GL.glUniform3f(_GL.glGetUniformLocation(self._prog, "wireColor"), fg.red, fg.green, fg.blue)
-        _GL.glPolygonMode(_GL.GL_FRONT_AND_BACK, _GL.GL_LINE if self.wire else _GL.GL_FILL)
-        _GL.glBindVertexArray(self._vao)
-        _GL.glDrawElements(_GL.GL_TRIANGLES, self._count, _GL.GL_UNSIGNED_INT, None)
-        _GL.glBindVertexArray(0)
-        _GL.glPolygonMode(_GL.GL_FRONT_AND_BACK, _GL.GL_FILL)
-        _GL.glUseProgram(0)
+        self.scene.render(w * scale, h * scale, w, h, (self.yaw, self.pitch, self.zoom, self.pan), bg,
+                          (fg.red, fg.green, fg.blue), self.smooth, self.wire, target)
 
 
 # --------------------------------------------------------------------------- video / audio playback (GStreamer)

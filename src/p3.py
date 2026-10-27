@@ -560,6 +560,25 @@ class FolderView(Gtk.Box):
 
     # ---- mouse
     def _on_button(self, view, event, kind):
+        if DEBUG_INPUT and kind == "tree":
+            hit = view.get_path_at_pos(int(event.x), int(event.y))
+            input_log(f"list: {event.type.value_nick} button={event.button} row={hit[0].get_indices()[0] if hit else None} "
+                      f"state={int(event.state & Gtk.accelerator_get_default_mod_mask())} t={event.time}")
+        if kind == "tree" and event.button == 1:
+            # Same fix as the icon grid: pair clicks ourselves instead of trusting GDK's 2-click events, which
+            # chain across a folder change (the TreeView would otherwise activate on GDK's count).
+            if event.type in (Gdk.EventType._2BUTTON_PRESS, Gdk.EventType._3BUTTON_PRESS):
+                return True
+            hit = view.get_path_at_pos(int(event.x), int(event.y))
+            row = hit[0].get_indices()[0] if hit else -1
+            mods = event.state & Gtk.accelerator_get_default_mod_mask()
+            if not mods and is_double_click(getattr(self, "_tree_last_click", None), row, event):
+                self._tree_last_click = None
+                if not self.cfg["single_click"]:
+                    view.row_activated(hit[0], hit[1])
+                    return True
+            else:
+                self._tree_last_click = (row, event.time, event.x_root, event.y_root)
         if event.button == 3:
             if kind == "tree":
                 hit = view.get_path_at_pos(int(event.x), int(event.y))
@@ -809,6 +828,9 @@ class FolderView(Gtk.Box):
         """Runs on the main loop. Small folders are filled at once; big ones in chunks so the UI never stalls."""
         if gen != self.gen:
             return False
+        self._tree_last_click = None
+        if DEBUG_INPUT:
+            input_log(f"view: refill {self.path} ({len(ents)} items)")
         self.busy = False
         self.indexed_paint = False
         for rec in reversed(NAV_LOG):

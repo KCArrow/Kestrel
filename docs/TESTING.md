@@ -69,6 +69,19 @@ thread. Works without `--profile` too, minus the cProfile section.
 If the window ever freezes for more than 4 s, a full thread dump is written automatically to
 `~/.cache/kestrel/freeze-*.txt` — attach it to a bug report.
 
+## Houdini / Maya integration test
+
+```bash
+python3 kestrel.py --dcc-test [extra files…]
+```
+
+Uses the installed Houdini (`hython`) and Maya (`mayapy`) to generate test files — a polygon
+mesh and a 200k-point particle cache as `.bgeo.sc`, a fog VDB, an SDF VDB, Alembic from both,
+FBX / USD / OBJ from Maya — then reads every file back through each route Kestrel has (hython,
+gconvert, mayapy, Houdini-for-Alembic, OpenVDB, Blender), renders a frame of each and writes
+`~/kestrel-dcc-test/report.txt` and `sheet.png`. Files given on the command line are tested too
+(through the normal automatic route). Takes a few minutes: each route starts the application.
+
 ## OpenGL and 3D import probes
 
 ```bash

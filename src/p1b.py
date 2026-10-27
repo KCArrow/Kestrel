@@ -885,12 +885,29 @@ def run_heavy(fn, *args):
         return fn(*args)
 
 
+_SEQ_POOL = None
+
+
+def seq_pool():
+    """Separate worker processes for loading the frames of a cache sequence in parallel, so prefetching a
+    128-frame VDB sequence never queues in front of the single preview decoder."""
+    global _SEQ_POOL
+    if _SEQ_POOL is None:
+        from concurrent.futures import ProcessPoolExecutor
+        import multiprocessing
+        n = max(1, min(4, (os.cpu_count() or 2) // 4))
+        _SEQ_POOL = ProcessPoolExecutor(max_workers=n, mp_context=multiprocessing.get_context("fork"), initializer=pin_worker)
+    return _SEQ_POOL
+
+
 def shutdown_workers():
     """Quit: kill the decoder pool and the render process instead of letting multiprocessing's exit handler
     join them — a worker busy with a big model or EXR made closing the window hang for seconds."""
-    global _POOL
-    pool, _POOL = _POOL, None
-    if pool is not None:
+    global _POOL, _SEQ_POOL
+    pools, _POOL, _SEQ_POOL = (_POOL, _SEQ_POOL), None, None
+    for pool in pools:
+        if pool is None:
+            continue
         try:
             for p in list(getattr(pool, "_processes", {}).values()):
                 p.kill()

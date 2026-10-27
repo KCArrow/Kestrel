@@ -191,6 +191,37 @@ def profiling_report(top: int = 40) -> str:
 
 
 # --------------------------------------------------------------------------- self-test / benchmark
+def write_test_vdb(path: str):
+    """A minimal valid .vdb (format 224, zip + active-mask compression): one fog grid named 'density' with five
+    active voxels in one leaf at index (8..12, 16, 24), voxel size 0.5, translated by (10, 20, 30)."""
+    S = lambda t: struct.pack("<I", len(t.encode())) + t.encode()
+    out = bytearray(struct.pack("<qIIIB", 0x56444220, 224, 8, 1, 1) + b"0" * 36 + struct.pack("<Ii", 0, 1))
+    out += S("density") + S("Tree_float_5_4_3") + S("")
+    gpos = len(out) + 24
+    grid = bytearray(struct.pack("<I", 3))                                     # COMPRESS_ZIP | COMPRESS_ACTIVE_MASK
+    grid += struct.pack("<I", 1) + S("class") + S("string") + S("fog volume")
+    grid += S("UniformScaleTranslateMap") + struct.pack("<18d", 10, 20, 30, *([0.5] * 15))
+    bit0 = lambda nbytes: b"\x01" + bytes(nbytes - 1)
+    no_vals = b"\x00" + struct.pack("<q", 0)                                 # metadata 0, zero active values
+    grid += struct.pack("<IfII", 1, 0.0, 0, 1) + struct.pack("<3i", 0, 0, 0)
+    grid += bit0(4096) + bytes(4096) + no_vals                                # upper: child 0
+    leaf_n = (1 << 8) | (2 << 4) | 3                                          # lower-node offset → leaf origin (8, 16, 24)
+    lm = bytearray(512)
+    lm[leaf_n >> 3] |= 1 << (leaf_n & 7)
+    grid += bytes(lm) + bytes(512) + no_vals                                  # lower at (0,0,0): one leaf
+    mask = bytearray(64)
+    for x in range(5):
+        n = x << 6                                                            # voxel (x, 0, 0) in the leaf
+        mask[n >> 3] |= 1 << (n & 7)
+    grid += mask                                                              # leaf topology
+    block = gpos + len(grid)
+    z = zlib.compress(struct.pack("<5f", 0.2, 0.4, 0.6, 0.8, 1.0))
+    grid += mask + b"\x00" + struct.pack("<q", len(z)) + z                    # leaf buffer
+    out += struct.pack("<qqq", gpos, block, gpos + len(grid)) + grid
+    with open(path, "wb") as f:
+        f.write(out)
+
+
 def run_selftest(bench: bool = False) -> int:
     """`kestrel.py --selftest [--bench]`: unit tests for the non-GUI machinery (listing, sorting, decoders,
     mesh pipeline, rasteriser, archives, rename, helpers) with timings, so a slowdown can be pinned to a
@@ -294,6 +325,208 @@ def run_selftest(bench: bool = False) -> int:
                 self.assertNotIn(os.path.expanduser("~"), txt)
             cr.archive(paths[0], "sent")
             self.assertEqual(len(cr.pending()), 1)
+
+        @timed("houdini cache render (points + volume)")
+        def test_cache_render(self):
+            self.assertEqual(houdini_kind("a.0001.bgeo.sc"), "geo")
+            self.assertEqual(houdini_kind("smoke.vdb"), "vdb")
+            self.assertEqual(houdini_kind("x.obj"), "")
+            if np is None:
+                self.skipTest("numpy not installed")
+            rng = np.random.default_rng(3)
+            P = rng.normal(size=(50000, 3)).astype(np.float32)
+            g = np.stack(np.meshgrid(*[np.linspace(-1, 1, 24)] * 3, indexing="ij"), -1).reshape(-1, 3)
+            d = np.clip(1 - np.linalg.norm(g, axis=1), 0, None)
+            m = _finish_cache_numpy({"P": P, "Cd": np.abs(P) % 1, "vP": g[d > 0] + 4, "vD": d[d > 0], "vS": [2 / 23],
+                                     "info": [("Points", "50,000")], "source": "test"}, 500000)
+            self.assertEqual(len(m["points"]), 50000)
+            self.assertTrue(len(m["vpts"]) > 1000)
+            self.assertLessEqual(float(np.abs(np.concatenate([m["points"], m["vpts"]])).max()), 0.5001)   # one shared unit box
+            EX = {k: m[k] for k in ("points", "pcolor", "psize", "vpts", "vden", "vsize") if k in m}
+            r = software_render(m["verts"], m["faces"], m["normals"], m["vnormals"], (200, 150, 0.5, 0.3, 1.0, 0, 0, True, False, (30, 30, 30), (1, 1, 1)), EX)
+            self.assertIsNotNone(r)
+            img = np.frombuffer(r[2], np.uint8).reshape(150, 200, 4)
+            self.assertGreater(int((img[:, :, :3].astype(int).sum(2) != 90).sum()), 2000)     # something was drawn
+
+        @timed("built-in VDB reader")
+        @timed("shader & IES previews")
+        def test_shader_previews(self):
+            j = lambda n: os.path.join(self.tmp, n)
+            # MaterialX: one standard_surface with a texture that exists
+            open(j("albedo.png"), "w").close()
+            with open(j("red.mtlx"), "w") as f:
+                f.write('<?xml version="1.0"?>\n<materialx version="1.38">\n'
+                        '  <image name="tex" type="color3"><input name="file" type="filename" value="albedo.png"/></image>\n'
+                        '  <standard_surface name="SR_red" type="surfaceshader">\n'
+                        '    <input name="base_color" type="color3" value="0.8, 0.1, 0.1"/>\n'
+                        '    <input name="specular_roughness" type="float" value="0.3"/>\n'
+                        '    <input name="metalness" type="float" value="1"/>\n'
+                        '  </standard_surface>\n'
+                        '  <surfacematerial name="M_red" type="material"><input name="surfaceshader" type="surfaceshader" nodename="SR_red"/></surfacematerial>\n'
+                        '</materialx>\n')
+            self.assertEqual(shader_preview_kind(j("red.mtlx")), "materialx")
+            r = shader_preview(j("red.mtlx"))
+            self.assertNotIn("error", r, r.get("error"))
+            m = r["materials"][0]
+            self.assertAlmostEqual(m["base_color"][0], 0.8, 3)
+            self.assertEqual(m.get("metallic"), 1.0)
+            self.assertEqual(r["code"][1], "xml")
+            mats = {n[0]: n for n in r["tree"]}["Materials"][2]
+            self.assertTrue(mats[0][3].startswith("material:"))
+            # Unity .mat (YAML) vs a MATLAB .mat that only shares the extension
+            with open(j("Brick.mat"), "w") as f:
+                f.write("%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!21 &2100000\nMaterial:\n  m_Name: Brick\n"
+                        "  m_Shader: {fileID: 46, guid: 0000000000000000f000000000000000, type: 0}\n"
+                        "  m_SavedProperties:\n    m_Floats:\n    - _Metallic: 0\n    - _Glossiness: 0.25\n"
+                        "    m_Colors:\n    - _Color: {r: 0.6, g: 0.3, b: 0.2, a: 1}\n")
+            with open(j("data.mat"), "wb") as f:
+                f.write(b"MATLAB 5.0 MAT-file" + b"\0" * 64)
+            self.assertEqual(shader_preview_kind(j("Brick.mat")), "unity-mat")
+            self.assertEqual(shader_preview_kind(j("data.mat")), "")
+            r = shader_preview(j("Brick.mat"))
+            self.assertNotIn("error", r, r.get("error"))
+            self.assertAlmostEqual(r["materials"][0]["base_color"][1], 0.0732, 3)        # Unity stores sRGB
+            # GLSL: Shadertoy and glslsandbox styles are runnable, a vertex shader isn't; F# .fs isn't a shader
+            toy = "void mainImage(out vec4 c, in vec2 p) { c = vec4(p / iResolution.xy, 0.5 + 0.5 * sin(iTime), 1.0); }\n"
+            box = "uniform float time;\nuniform vec2 resolution;\nvoid main() { gl_FragColor = vec4(gl_FragCoord.xy / resolution, 0.0, 1.0); }\n"
+            vert = "#version 330\nlayout(location = 0) in vec3 P;\nuniform mat4 mvp;\nvoid main() { gl_Position = mvp * vec4(P, 1.0); }\n"
+            self.assertEqual(glsl_style(toy), "shadertoy")
+            self.assertEqual(glsl_style(box), "sandbox")
+            self.assertEqual(glsl_style(vert), "")
+            with open(j("wave.frag"), "w") as f:
+                f.write(toy)
+            with open(j("Program.fs"), "w") as f:
+                f.write("module Program\nopen System\n[<EntryPoint>]\nlet main argv = printfn \"hi\"; 0\n")
+            self.assertEqual(shader_preview_kind(j("Program.fs")), "")
+            r = shader_preview(j("wave.frag"))
+            self.assertEqual(r["glsl"]["style"], "shadertoy")
+            frag, _ = glsl_build_fragment(toy, "shadertoy", "#version 150 core\n")
+            self.assertIn("mainImage(c, gl_FragCoord.xy)", frag)
+            self.assertIn("#line 0", frag)                                 # GLSL 1.50 numbers the next line N+1
+            self.assertIn("#line 1", glsl_build_fragment(box, "sandbox", "#version 300 es\nprecision highp float;\n")[0])
+            self.assertEqual(glsl_error_text(RuntimeError("Shader compile failure (0): b'0:3(2): error: syntax error\\n'", [], 0)),
+                             "0:3(2): error: syntax error")
+            # IES: a small symmetric downlight
+            with open(j("down.ies"), "w") as f:
+                f.write("IESNA:LM-63-2002\n[MANUFAC] Test\nTILT=NONE\n1 1000 1 5 1 1 2 0.1 0.1 0\n1 1 50\n"
+                        "0 22.5 45 67.5 90\n0\n800 700 400 100 0\n")
+            self.assertEqual(shader_preview_kind(j("down.ies")), "ies")
+            if np is not None:
+                ies = IESProfile(j("down.ies"))
+                self.assertEqual(len(ies.v), 5)
+                self.assertAlmostEqual(float(ies.cd.max()), 800.0)
+                r = shader_preview(j("down.ies"))
+                self.assertNotIn("error", r, r.get("error"))
+                img = r["images"][0][1]
+                self.assertEqual(len(img.rgb), img.w * img.h * 3)
+                ball = render_material_ball(dict(MATERIAL_DEFAULTS, base_color=(0.8, 0.1, 0.1)), size=64)
+                px = np.frombuffer(ball.rgb, np.uint8).reshape(ball.h, ball.w, 3)
+                c = px[ball.h // 2, ball.w // 2].astype(int)
+                self.assertGreater(c[0], c[1] + 20)                       # the ball is red where it faces us
+
+        def test_vdb_reader(self):
+            self.assertEqual(_lz4_block_decode(bytes([0x35]) + b"abc" + bytes([3, 0]), 12), b"abcabcabcabc")
+            if np is None:
+                self.skipTest("numpy not installed")
+            path = os.path.join(self.tmp, "fog.vdb")
+            write_test_vdb(path)
+            got = load_vdb_native(path)
+            self.assertIsNotNone(got, LAST_VFX_ERROR)
+            self.assertEqual(len(got["vD"]), 5)
+            # voxel (i, j, k) → translate + 0.5 · ijk; the leaf sits at index (8, 16, 24)
+            self.assertTrue(np.allclose(sorted(got["vP"][:, 0]), [10 + 0.5 * x for x in (8, 9, 10, 11, 12)]))
+            self.assertAlmostEqual(float(got["vD"].max()), 1.0, places=5)
+            # sequences: a later frame loaded with the first frame's norm lands in the same box
+            a = load_model(path)
+            b = load_model(path, 500000, a["norm"], 1000)
+            self.assertEqual(a["norm"], b["norm"])
+            self.assertTrue(np.allclose(a["vpts"], b["vpts"]))
+            import types
+            E = lambda n: types.SimpleNamespace(name=n, path="/s/" + n, is_dir=False)
+            seq = MainWindow._cache_selection([E("Tornado.ember"), E("smoke.10.vdb"), E("smoke.9.vdb"), E("smoke.100.vdb"), E("a.bgeo.sc")])
+            self.assertEqual([x.name for x in seq], ["smoke.9.vdb", "smoke.10.vdb", "smoke.100.vdb"])
+            self.assertIsNone(MainWindow._cache_selection([E("a.vdb"), E("b.txt")]))
+
+        @timed("scene breakdowns (Unity, Maya)")
+        def test_scene_breakdowns(self):
+            # a tiny Unity project: scene with a parent/child, a light, a script and a prefab instance
+            proj = os.path.join(self.tmp, "UnityProj")
+            for d in ("Assets/Scripts", "Assets/Prefabs", "ProjectSettings"):
+                os.makedirs(os.path.join(proj, d), exist_ok=True)
+            with open(os.path.join(proj, "ProjectSettings", "ProjectVersion.txt"), "w") as f:
+                f.write("m_EditorVersion: 2022.3.10f1\n")
+            for rel, g in (("Assets/Scripts/Spin.cs", "a" * 32), ("Assets/Prefabs/Tree.prefab", "b" * 32)):
+                open(os.path.join(proj, rel), "w").close()
+                with open(os.path.join(proj, rel + ".meta"), "w") as f:
+                    f.write(f"fileFormatVersion: 2\nguid: {g}\n")
+            scene = os.path.join(proj, "Assets", "Main.unity")
+            yaml_lines = [
+                "%YAML 1.1", "%TAG !u! tag:unity3d.com,2011:",
+                "--- !u!1 &100", "GameObject:", "  m_Name: World", "  m_IsActive: 1", "  m_Component:",
+                "  - component: {fileID: 101}",
+                "--- !u!4 &101", "Transform:", "  m_GameObject: {fileID: 100}", "  m_Children:", "  - {fileID: 201}",
+                "  m_Father: {fileID: 0}",
+                "--- !u!1 &200", "GameObject:", "  m_Name: Sun", "  m_Component:", "  - component: {fileID: 201}",
+                "  - component: {fileID: 202}", "  - component: {fileID: 203}",
+                "--- !u!4 &201", "Transform:", "  m_GameObject: {fileID: 200}", "  m_Children: []", "  m_Father: {fileID: 101}",
+                "--- !u!108 &202", "Light:", "  m_GameObject: {fileID: 200}", "  m_Type: 1",
+                "--- !u!114 &203", "MonoBehaviour:", "  m_GameObject: {fileID: 200}",
+                "  m_Script: {fileID: 11500000, guid: " + "a" * 32 + ", type: 3}",
+                "--- !u!1001 &300", "PrefabInstance:", "  m_Modification:", "    m_TransformParent: {fileID: 0}",
+                "    m_Modifications:", "    - target: {fileID: 5, guid: " + "b" * 32 + ",", "        type: 3}",
+                "      propertyPath: m_Name", "      value: Oak", "      objectReference: {fileID: 0}",
+                "  m_SourcePrefab: {fileID: 100100000, guid: " + "b" * 32 + ", type: 3}",
+                "--- !u!114 &400", "MonoBehaviour:", "  m_GameObject: {fileID: 100}",
+                "  m_Script: {fileID: 11500000, guid: " + "c" * 32 + ", type: 3}"]
+            with open(scene, "w") as f:
+                f.write("\n".join(yaml_lines) + "\n")
+            self.assertEqual(scene_breakdown_kind(scene), "unity")
+            r = scene_breakdown(scene)
+            self.assertNotIn("error", r, r.get("error"))
+            self.assertIn(("Unity", "2022.3.10f1"), r["info"])
+            tree = {n[0]: n for n in r["tree"]}
+            hier = tree["Hierarchy"][2]
+            self.assertEqual([n[0] for n in hier], ["World", "Oak"])
+            self.assertEqual(hier[0][2][0][0], "Sun")
+            self.assertIn("Light (Directional)", hier[0][2][0][1])
+            self.assertIn("Spin", hier[0][2][0][1])
+            refs = {g[0]: g for g in tree["References"][2]}
+            self.assertTrue(refs["Scripts"][2][0][3].endswith(os.path.join("Assets", "Scripts", "Spin.cs")))
+            self.assertIs(refs["Scripts"][2][0][4], True)
+            self.assertIn("Unresolved (missing or in an unindexed package)", refs)       # guid ccc... has no asset
+            # Maya ASCII: hierarchy, a reference, a found and a missing texture, a plug-in
+            tex = os.path.join(self.tmp, "wood.png")
+            open(tex, "w").close()
+            ma = os.path.join(self.tmp, "shot.ma")
+            ma_lines = [
+                "//Maya ASCII 2024 scene",
+                'file -rdi 1 -ns "chr" -rfn "chrRN" -typ "mayaAscii"', '\t\t"' + self.tmp + '/char.ma";',
+                'requires maya "2024";', 'requires "mtoa" "5.3.0";',
+                "currentUnit -l centimeter -a degree -t film;", 'fileInfo "product" "Maya 2024";',
+                'createNode transform -n "grp";', 'createNode transform -n "box" -p "grp";',
+                'createNode mesh -n "boxShape" -p "box";',
+                'createNode file -n "file1";', '\tsetAttr ".ftn" -type "string" "' + tex + '";',
+                'createNode file -n "file2";', '\tsetAttr ".ftn" -type "string" "/no/such/dir/rust.<UDIM>.exr";']
+            with open(ma, "w") as f:
+                f.write("\n".join(ma_lines) + "\n")
+            self.assertEqual(scene_breakdown_kind(ma), "maya")
+            r = scene_breakdown(ma)
+            self.assertNotIn("error", r, r.get("error"))
+            tree = {n[0]: n for n in r["tree"]}
+            self.assertEqual(tree["Outliner"][2][0][0], "grp")
+            self.assertEqual(tree["Outliner"][2][0][2][0][0], "box")
+            refs = {g[0]: g for g in tree["References"][2]}
+            self.assertEqual(refs["Scene references"][2][0][0], "chr")
+            self.assertIs(refs["Scene references"][2][0][4], False)                    # char.ma doesn't exist
+            texs = {n[0]: n[4] for n in refs["Textures"][2]}
+            self.assertEqual(texs, {"wood.png": True, "rust.<UDIM>.exr": False})
+            self.assertIn("mtoa", [n[0] for n in tree["Plug-ins required"][2]])
+            self.assertIn("rust.<UDIM>.exr", breakdown_text(r))
+            # files that only share an extension
+            matlab = os.path.join(self.tmp, "data.mat")
+            with open(matlab, "wb") as f:
+                f.write(b"MATLAB 5.0 MAT-file")
+            self.assertEqual(scene_breakdown_kind(matlab), "")
 
         @timed("file clipboard formats")
         def test_file_clipboard(self):
@@ -421,6 +654,26 @@ def run_selftest(bench: bool = False) -> int:
             self.assertFalse(errors)
             self.assertEqual(len(done), 2)
             self.assertTrue(os.path.exists(os.path.join(d, "a.txt")) and os.path.exists(os.path.join(d, "b.txt")))
+            # frame offset keeps padding; overlapping shift (1001..1003 → 1002..1004) goes through the two-phase rename
+            self.assertEqual(offset_number("shot.1001", 60), ("shot.1061", ""))
+            self.assertEqual(offset_number("f0009", 3), ("f0012", ""))
+            self.assertEqual(offset_number("sh010_v004.0999", 2), ("sh010_v004.1001", ""))
+            self.assertEqual(offset_number("sh010_v004.1001", 5, "first"), ("sh015_v004.1001", ""))
+            self.assertEqual(offset_number("a.0003", -5)[1], "frame would be negative")
+            self.assertEqual(offset_number("nonum", 5)[1], "no number to offset")
+            seq = [os.path.join(d, f"img.{f}.exr") for f in (1001, 1002, 1003)]
+            for p_ in seq:
+                open(p_, "w").close()
+            plan = [(p_, os.path.join(d, "img." + offset_number(os.path.basename(p_)[:-4], 1)[0].split(".")[1] + ".exr")) for p_ in seq]
+            done, errors = apply_renames(plan)
+            self.assertFalse(errors)
+            self.assertEqual(sorted(os.listdir(d))[-3:], ["img.1002.exr", "img.1003.exr", "img.1004.exr"])
+            # repath into a folder that doesn't exist yet
+            self.assertEqual(resolve_dest_dir(os.path.join(d, "x.exr"), "../{parent}_v2"), os.path.normpath(os.path.join(d, "..", "ren_v2")))
+            target = resolve_dest_dir(os.path.join(d, "a.txt"), "../moved/{ext}")
+            done, errors = apply_renames([(os.path.join(d, "a.txt"), os.path.join(target, "a_renamed.txt"))])
+            self.assertFalse(errors)
+            self.assertTrue(os.path.exists(os.path.join(self.tmp, "moved", "txt", "a_renamed.txt")))
 
         @timed("dir_stats (cached)")
         def test_dir_stats(self):
@@ -1011,3 +1264,231 @@ class StressDriver:
         w = self.win
         w.navigate(TRASH)
         GLib.timeout_add(500, lambda: (w.tab.select_names(["scratch-trash-me.txt"]), w.restore(), False)[2])
+
+
+# --------------------------------------------------------------------------- DCC integration test (Houdini / Maya)
+_DCC_HOU_GEN = r'''
+import sys, os, traceback
+out = sys.argv[1]
+import hou
+def step(name, fn):
+    try:
+        fn()
+        print("GEN-OK", name)
+    except Exception:
+        print("GEN-FAIL", name, traceback.format_exc().strip().splitlines()[-1])
+geo = hou.node("/obj").createNode("geo", "kestrel_gen")
+for c in geo.children():
+    c.destroy()
+sph = geo.createNode("sphere")
+for k, v in (("type", "polymesh"), ("rows", 48), ("cols", 64)):
+    try:
+        sph.parm(k).set(v)
+    except Exception:
+        pass
+def mesh():
+    sph.geometry().saveToFile(os.path.join(out, "hou_mesh.bgeo.sc"))
+def particles():
+    sc = geo.createNode("scatter")
+    sc.setFirstInput(sph)
+    for k in ("npts", "forcetotal"):
+        try:
+            sc.parm(k).set(200000 if k == "npts" else 1)
+        except Exception:
+            pass
+    w = geo.createNode("attribwrangle")
+    w.setFirstInput(sc)
+    w.parm("snippet").set("@Cd = relbbox(0, @P);")
+    g = w.geometry()
+    g.saveToFile(os.path.join(out, "hou_particles.bgeo.sc"))
+    print("GEN-INFO particles", len(g.points()))
+def vdb(fog):
+    v = geo.createNode("vdbfrompolygons")
+    v.setFirstInput(sph)
+    for k, val in (("voxelsize", 0.02), ("builddistance", 0 if fog else 1), ("buildfog", 1 if fog else 0)):
+        try:
+            v.parm(k).set(val)
+        except Exception:
+            pass
+    g = v.geometry()
+    if v.errors():
+        raise RuntimeError("; ".join(v.errors()))
+    g.saveToFile(os.path.join(out, "hou_fog.vdb" if fog else "hou_sdf.vdb"))
+def abc():
+    r = geo.createNode("rop_alembic")
+    r.setFirstInput(sph)
+    r.parm("filename").set(os.path.join(out, "hou_mesh.abc"))
+    r.parm("trange").set(0)
+    r.render()
+step("mesh .bgeo.sc", mesh)
+step("particles .bgeo.sc", particles)
+step("fog .vdb", lambda: vdb(True))
+step("sdf .vdb", lambda: vdb(False))
+step("alembic .abc", abc)
+'''
+
+_DCC_MAYA_GEN = r'''
+import sys, os, traceback
+out = sys.argv[1]
+import maya.standalone
+maya.standalone.initialize(name="python")
+import maya.cmds as cmds, maya.mel as mel
+for p in ("fbxmaya", "AbcExport", "mayaUsdPlugin", "objExport"):
+    try:
+        cmds.loadPlugin(p, quiet=True)
+    except Exception:
+        pass
+s = cmds.polySphere(sx=64, sy=48, r=1)[0]
+cmds.polyCube(w=1, h=0.4, d=1.4)
+cmds.move(0, -1.2, 0)
+def step(name, fn):
+    try:
+        fn()
+        print("GEN-OK", name)
+    except Exception:
+        print("GEN-FAIL", name, traceback.format_exc().strip().splitlines()[-1])
+step("fbx", lambda: (cmds.select(all=True), mel.eval('FBXExport -f "%s" -s' % os.path.join(out, "maya_mesh.fbx").replace("\\", "/"))))
+step("abc", lambda: cmds.AbcExport(j="-frameRange 1 1 -file %s" % os.path.join(out, "maya_mesh.abc")))
+def usd():
+    p = os.path.join(out, "maya_mesh.usd")
+    if hasattr(cmds, "mayaUSDExport"):
+        cmds.mayaUSDExport(file=p)
+    else:
+        try:
+            cmds.loadPlugin("mayaUsdPlugin")
+        except Exception as ex:
+            raise RuntimeError("Maya USD plugin (mayaUsdPlugin) is not available to mayapy: %s" % ex)
+        cmds.file(p, force=True, type="USD Export", exportAll=True)
+step("usd", usd)
+step("obj", lambda: cmds.file(os.path.join(out, "maya_mesh.obj"), force=True, options="groups=1;ptgroups=1;materials=0;smoothing=1;normals=1", type="OBJexport", exportAll=True))
+'''
+
+
+def _png_write(path: str, w: int, h: int, rgb: bytes):
+    import zlib
+    raw = b"".join(b"\0" + rgb[y * w * 3:(y + 1) * w * 3] for y in range(h))
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
+                chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def run_dcc_test(extra: List[str]) -> int:
+    """kestrel.py --dcc-test [files…]: generate test caches with the installed Houdini and Maya, read every one
+    back through each route Kestrel has (hython, gconvert, mayapy, Houdini-for-Alembic), render a frame of each
+    and write ~/kestrel-dcc-test/report.txt + sheet.png. Extra files given on the command line are tested too."""
+    global LAST_VFX_ERROR
+    out = os.path.join(HOME, "kestrel-dcc-test")
+    os.makedirs(out, exist_ok=True)
+    rep: List[str] = []
+
+    def log(s=""):
+        print(s, flush=True)
+        rep.append(s)
+    hou = _find_houdini()
+    mp = _find_mayapy()
+    log(f"Kestrel {VERSION} DCC test   {time.strftime('%Y-%m-%d %H:%M')}")
+    log(f"python {sys.version.split()[0]}  numpy {np.__version__ if np is not None else 'MISSING'}")
+    log(f"hython   {hou['hython'] or '—'}   (Houdini {hou['version'] or '?'})")
+    log(f"gconvert {hou['gconvert'] or '—'}")
+    log(f"mayapy   {mp or '—'}")
+    bl = _find_blender()
+    log(f"blender  {bl[0] if bl else '—'}")
+    if np is None:
+        log("numpy is required for Houdini caches — install python3-numpy and re-run.")
+    import tempfile
+    log("")
+    log("== generating test files")
+    for tool, script, label in ((hou["hython"], _DCC_HOU_GEN, "Houdini"), (mp, _DCC_MAYA_GEN, "Maya")):
+        if not tool:
+            log(f"  {label}: not found, skipped")
+            continue
+        sp = os.path.join(tempfile.gettempdir(), f"kestrel-gen-{label.lower()}.py")
+        with open(sp, "w") as f:
+            f.write(script)
+        t0 = time.time()
+        rc, so, se = _run_streaming([tool, sp, out], timeout=400)
+        gen = [l for l in so if l.startswith("GEN-")]
+        log(f"  {label} ({time.time() - t0:.0f}s, exit {rc}):")
+        for l in gen:
+            log("    " + l)
+        if not gen:
+            log("    no output; last lines: " + " | ".join(x[:160] for x in (so + se)[-6:]))
+    cases = []
+    for n, routes in (("hou_mesh.bgeo.sc", ("houdini", "gconvert")), ("hou_particles.bgeo.sc", ("houdini", "gconvert")),
+                      ("hou_fog.vdb", ("houdini", "openvdb", "blender")), ("hou_sdf.vdb", ("houdini", "openvdb", "blender")),
+                      ("hou_mesh.abc", ("houdini-abc", "maya", "blender")),
+                      ("maya_mesh.fbx", ("maya", "blender")), ("maya_mesh.abc", ("maya", "houdini-abc", "blender")),
+                      ("maya_mesh.usd", ("maya", "blender")), ("maya_mesh.obj", ("maya", "builtin"))):
+        p = os.path.join(out, n)
+        if os.path.exists(p):
+            cases += [(p, r) for r in routes]
+    for p in extra:
+        if os.path.exists(p):
+            cases.append((os.path.abspath(p), "auto"))
+    log("")
+    log("== reading back")
+    tiles = []
+    for p, route in cases:
+        LAST_VFX_ERROR = ""
+        t0 = time.time()
+        res, err = None, ""
+        try:
+            if route == "auto":
+                m = load_model(p, 500000)
+            elif route == "builtin":
+                m = load_model(p, 500000)
+            elif route in ("houdini", "gconvert", "openvdb"):
+                got = {"houdini": load_via_houdini, "gconvert": load_via_gconvert, "openvdb": load_vdb_openvdb}[route](p)
+                m = _finish_cache_numpy(got, 500000) if got else None
+            else:
+                fn = {"maya": load_via_maya, "blender": load_via_blender, "houdini-abc": load_via_houdini_mesh}[route]
+                got = fn(p)
+                m = _finish_model_numpy(got[0], got[1], 500000, len(got[1]), [("Source", got[2])]) if got and np is not None else None
+            if m and "error" in m:
+                err, m = m["error"], None
+            res = m
+        except Exception as ex:
+            err = f"{type(ex).__name__}: {ex}"
+        dt = time.time() - t0
+        name = f"{os.path.basename(p)} via {route}"
+        if res is None:
+            log(f"  FAIL  {name:<40} {dt:5.1f}s  {(err or LAST_VFX_ERROR or 'no result')[:300]}")
+            continue
+        parts = []
+        if len(res["faces"]):
+            parts.append(f"{len(res['faces']):,} tris")
+        if "points" in res:
+            parts.append(f"{len(res['points']):,} points" + (" +Cd" if "pcolor" in res else ""))
+        if "vpts" in res:
+            parts.append(f"{len(res['vpts']):,} voxels")
+        log(f"  OK    {name:<40} {dt:5.1f}s  {', '.join(parts) or 'EMPTY'}")
+        for k, v in res.get("info", []):
+            if k in ("Volumes", "Point attributes", "Source", "Houdini"):
+                log(f"          {k}: {v}")
+        if np is not None:
+            EX = {k: res[k] for k in ("points", "pcolor", "psize", "vpts", "vden", "vsize") if k in res} or None
+            V = np.asarray(res["verts"], np.float32).reshape(-1, 3)
+            F = np.asarray(res["faces"], np.int32).reshape(-1, 3)
+            N = np.asarray(res["normals"], np.float32).reshape(-1, 3) if len(res.get("normals", [])) else None
+            VN = np.asarray(res["vnormals"], np.float32).reshape(-1, 3) if len(res.get("vnormals", [])) else None
+            fr = software_render(V, F, N, VN, (320, 240, 0.6, 0.35, 1.0, 0, 0, True, False, (40, 40, 44), (1, 1, 1)), EX)
+            if fr:
+                rgb = np.frombuffer(fr[2], np.uint8).reshape(240, 320, 4)[:, :, [2, 1, 0]]
+                tiles.append((name, rgb))
+    if tiles and np is not None:
+        cols = 3
+        rows = (len(tiles) + cols - 1) // cols
+        sheet = np.full((rows * 244, cols * 324, 3), 20, np.uint8)
+        for i, (_, rgb) in enumerate(tiles):
+            r, c = divmod(i, cols)
+            sheet[r * 244 + 2:r * 244 + 242, c * 324 + 2:c * 324 + 322] = rgb
+        _png_write(os.path.join(out, "sheet.png"), sheet.shape[1], sheet.shape[0], sheet.tobytes())
+        log("")
+        log("contact sheet, left→right, top→bottom: " + "; ".join(n for n, _ in tiles))
+    with open(os.path.join(out, "report.txt"), "w") as f:
+        f.write(CrashReporter.sanitize("\n".join(rep) + "\n"))
+    print(f"\nWrote {out}/report.txt and sheet.png")
+    return 0

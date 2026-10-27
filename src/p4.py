@@ -51,6 +51,16 @@ def _short_drive_label(label: str) -> str:
 
 
 # --------------------------------------------------------------------------- main window
+def _tabular_digits():
+    """Pango attributes for fixed-width digits, so a ticking counter doesn't wobble."""
+    attrs = Pango.AttrList()
+    try:
+        attrs.insert(Pango.attr_font_features_new("tnum 1"))
+    except Exception:
+        pass
+    return attrs
+
+
 class MainWindow(Gtk.ApplicationWindow):
     MENU_KEYS = {"file": "File", "home": "Home", "share": "Share", "view": "View", "tools": "Tools", "help": "Help"}
 
@@ -173,8 +183,18 @@ class MainWindow(Gtk.ApplicationWindow):
         self.addr.connect("key-press-event", self._on_address_key)
         self.path_stack.add_named(self.addr, "entry")
         frame = Gtk.Frame()
+        frame.set_shadow_type(Gtk.ShadowType.NONE)
         frame.get_style_context().add_class("pathbar")
         frame.add(self.path_stack)
+        # The bar's outline is painted here rather than by CSS: themes differ in whether a GtkFrame draws a
+        # CSS border, and the outline must always be there (faint at rest, firmer under the pointer) so the
+        # clickable address area is obvious.
+        self._pathbar_hover = False
+        frame.connect("draw", self._draw_pathbar_outline)
+        self.path_stack.connect("notify::visible-child-name", lambda *a: frame.queue_draw())   # firmer while typing
+        crumb_frame.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        crumb_frame.connect("enter-notify-event", lambda w, e: self._pathbar_hovered(frame, True))
+        crumb_frame.connect("leave-notify-event", lambda w, e: e.detail == Gdk.NotifyType.INFERIOR or self._pathbar_hovered(frame, False))
         tb.pack_start(frame, True, True, 0)
         self.searchbox = Gtk.SearchEntry(width_chars=22)
         self.searchbox.set_placeholder_text("Search")
@@ -182,6 +202,37 @@ class MainWindow(Gtk.ApplicationWindow):
         self.searchbox.connect("stop-search", lambda e: self.clear_search())
         tb.pack_start(self.searchbox, False, False, 0)
         return tb
+
+    def _pathbar_hovered(self, frame, on: bool):
+        if self._pathbar_hover != on:
+            self._pathbar_hover = on
+            frame.queue_draw()
+        return False
+
+    def _draw_pathbar_outline(self, w, cr):
+        a = w.get_allocation()
+        fg = w.get_style_context().get_color(Gtk.StateFlags.NORMAL)
+        x, y, ww, hh, r = 0.5, 0.5, a.width - 1.0, a.height - 1.0, 6.0
+        cr.new_sub_path()
+        cr.arc(x + ww - r, y + r, r, -math.pi / 2, 0)
+        cr.arc(x + ww - r, y + hh - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + hh - r, r, math.pi / 2, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, 1.5 * math.pi)
+        cr.close_path()
+        # Matches the search box's outline as it renders (measured: the foreground colour at ~7.5 % over the
+        # window background; GTK's reported border colour for it is the full foreground, far too bright).
+        # While typing a path: the highlight colour the search box uses when it has focus.
+        if self.path_stack.get_visible_child_name() == "entry":
+            ok, sel = self.searchbox.get_style_context().lookup_color("theme_selected_bg_color")
+            if ok:
+                cr.set_source_rgba(sel.red, sel.green, sel.blue, 1.0)
+            else:
+                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.3)
+        else:
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.075)
+        cr.set_line_width(1.0)
+        cr.stroke()
+        return False                     # children (crumbs / entry) draw on top
 
     def _history_popup(self, btn, event):
         if event.button == 3:
@@ -397,6 +448,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self._fill_quick(self.nav_quick)
         self.nav_store.append(None, [NavNode("", None, None, False, "spacer")])
         pc = self.nav_store.append(None, [NavNode("This PC", THISPC, Gio.ThemedIcon.new("computer"), True, "root")])
+        it = self.nav_store.append(pc, [NavNode(os.path.basename(HOME.rstrip("/")) or "Home", HOME, Gio.ThemedIcon.new("user-home"))])
+        self.nav_store.append(it, [None])
         for label, p, icon in xdg_user_dirs():
             it = self.nav_store.append(pc, [NavNode(label, p, Gio.ThemedIcon.new(icon))])
             self.nav_store.append(it, [None])
@@ -1048,17 +1101,74 @@ class MainWindow(Gtk.ApplicationWindow):
         mbar.pack_start(self.model_count, True, True, 4)
         self.model_full_toggle = Gtk.ToggleButton(label="All triangles")
         self.model_full_toggle.set_tooltip_text("Override the 500,000-face preview cap and load every triangle.\n"
-                                                "Heavy meshes will orbit slowly — this is a software renderer.")
+                                                "Heavy meshes orbit slowly in the software renderer.")
         self.model_full_toggle.get_style_context().add_class("flat")
         self.model_full_toggle.connect("toggled", self._toggle_model_full)
         mbar.pack_end(self.model_full_toggle, False, False, 0)
+        self.model_bd_btn = Gtk.Button(label="Breakdown")
+        self.model_bd_btn.set_tooltip_text("Show what's in this scene: outliner, references, materials, settings")
+        self.model_bd_btn.get_style_context().add_class("flat")
+        self.model_bd_btn.connect("clicked", lambda b: self._switch_blend_view("breakdown"))
+        self.model_bd_btn.set_no_show_all(True)
+        mbar.pack_end(self.model_bd_btn, False, False, 0)
+        self.seq_button = Gtk.Button(label="Preview as sequence")
+        self.seq_button.set_tooltip_text("Play the selected caches as frames of one sequence, in name order")
+        self.seq_button.get_style_context().add_class("flat")
+        self.seq_button.connect("clicked", self._seq_button_clicked)
+        self.seq_button.set_no_show_all(True)
+        mbar.pack_end(self.seq_button, False, False, 0)
         mbox.pack_start(clip_width(mbar), False, False, 0)
         self.model_slot = Gtk.Box()
         mbox.pack_start(self.model_slot, True, True, 0)
+        # time slider for a selected sequence of caches (several .vdb / .bgeo frames selected together)
+        sbar = Gtk.Box(spacing=4)
+        self.seq_play = Gtk.Button.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.BUTTON)
+        self.seq_play.get_style_context().add_class("flat")
+        self.seq_play.set_tooltip_text("Play / pause (Space in the viewer; ← → step a frame)")
+        self.seq_play.connect("clicked", lambda b: self._seq_toggle_play())
+        sbar.pack_start(self.seq_play, False, False, 0)
+        self.seq_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 1)
+        self.seq_scale.set_draw_value(False)
+        self.seq_scale.set_digits(0)
+        self.seq_scale.set_round_digits(0)
+        self.seq_scale.set_hexpand(True)
+        self.seq_scale.set_size_request(120, -1)          # the slider gets the room; nothing beside it grows
+        self.seq_scale.set_show_fill_level(True)
+        self.seq_scale.set_restrict_to_fill_level(False)
+        self.seq_scale.connect("value-changed", self._seq_scrub)
+        sbar.pack_start(self.seq_scale, True, True, 0)
+        # Fixed width: the slider must not shift as frame numbers change length during playback (tabular
+        # digits). The file name lives in its own row above the viewer, so it never squeezes the slider.
+        self.seq_counter = Gtk.Label(xalign=1)
+        self.seq_counter.set_width_chars(9)
+        self.seq_counter.set_max_width_chars(9)
+        self.seq_counter.set_attributes(_tabular_digits())
+        sbar.pack_start(self.seq_counter, False, False, 0)
+        self.seq_label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE)
+        self.seq_label.get_style_context().add_class("dim-label")
+        self.seq_label.set_margin_start(4)
+        self.seq_label.set_no_show_all(True)
+        self.seq_fps = Gtk.SpinButton.new_with_range(1, 60, 1)
+        self.seq_fps.set_width_chars(2)
+        self.seq_fps.set_value(float(self.cfg.get("seq_fps", 24)))
+        self.seq_fps.set_tooltip_text("Playback speed (frames per second)")
+        self.seq_fps.connect("value-changed", self._seq_fps_changed)
+        sbar.pack_start(self.seq_fps, False, False, 0)
+        sbar.pack_start(Gtk.Label(label="fps"), False, False, 0)
+        sbar.show_all()
+        sbar.set_no_show_all(True)
+        sbar.hide()
+        self.seq_bar = sbar
+        self._seq = None
+        self.connect("notify::is-active", self._seq_focus_changed)
+        mbox.pack_start(sbar, False, False, 0)
+        mbox.pack_start(self.seq_label, False, False, 0)
+        mbox.reorder_child(self.seq_label, 1)            # current frame's file name: between the bar and the viewer
         mhint = Gtk.Label(label="LMB orbit · MMB pan · Alt+RMB or wheel zoom · double-click reset · W wireframe · S flat/smooth", ellipsize=Pango.EllipsizeMode.END)
         mhint.get_style_context().add_class("dim-label")
         mbox.pack_start(mhint, False, False, 0)
         self.preview_stack.add_named(mbox, "model")
+        self.preview_stack.add_named(self._build_breakdown_page(), "breakdown")
         self.preview_stack.add_named(self.preview_image, "image")
         self.video = VideoPreview() if gst_sink_available() else None
         if self.video is not None:
@@ -1166,14 +1276,40 @@ class MainWindow(Gtk.ApplicationWindow):
                 ev.set()
                 setattr(self, attr, None)
         if self.cfg["preview_pane"]:
-            self._update_preview(e)
+            # Several caches selected: preview the clicked one and offer "Preview as sequence". The sequence
+            # plays only after the button is pressed, and only while that same set stays selected.
+            cands = self._cache_selection(sel)
+            paths = tuple(x.path for x in cands) if cands else None
+            seq = cands if (paths and paths == getattr(self, "_seq_requested", None)) else None
+            if seq is None:
+                self._seq_requested = None
+            self._seq_candidates = cands
+            self.seq_button.set_visible(bool(cands) and seq is None)
+            if seq is None and cands and (e is None or not houdini_kind(e.name)):
+                e = cands[0]                          # Ctrl+A in a folder that starts with a .hip / .ember
+            self._update_preview(e, seq)
         if self.cfg["details_pane"]:
             if self.editing_pinned and self.edit_entry is not None and (e is None or e.path != self.edit_path):
                 sel = [self.edit_entry]        # keep the edited file's details on screen while editing
             self._update_details(sel)
 
     # ---- preview
-    def _update_preview(self, e: Optional[Entry]):
+    @staticmethod
+    def _cache_selection(sel) -> Optional[list]:
+        """Two or more selected Houdini caches of one kind (.vdb, or .bgeo/.geo), in natural name order — what
+        "Preview as sequence" would play. Other selected files (a .hip or .ember next to the caches) are
+        ignored. Nothing here decides that they ARE a sequence: the user does, with the button."""
+        caches = [x for x in sel if not x.is_dir and x.path and houdini_kind(x.name)]
+        if len(caches) < 2:
+            return None
+        k0 = houdini_kind(caches[0].name)
+        frames = [x for x in caches if houdini_kind(x.name) == k0]
+        if len(frames) < 2:
+            return None
+        nat = lambda x: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", x.name)]
+        return sorted(frames, key=nat)
+
+    def _update_preview(self, e: Optional[Entry], seq: Optional[list] = None):
         gen = self._side_gen
         # unsaved quick-edit: selecting something else (or nothing) asks first; "Keep editing" stays put
         if self.editing_pinned and (e is None or e.path != self.edit_path):
@@ -1194,6 +1330,17 @@ class MainWindow(Gtk.ApplicationWindow):
             self._show_edit_caption()
             self._show_preview("text")      # same file re-selected: keep the edits
             return
+        if seq:
+            key = ("seq",) + tuple(x.path for x in seq)
+            if key == getattr(self, "_preview_key", None) and self.preview_stack.get_visible_child_name() == "model":
+                self._drop_snapshot()
+                return
+            self._preview_key = key
+            if self.video is not None and self.preview_stack.get_visible_child_name() == "video":
+                self.video.stop()
+            self._load_model_sequence(seq, e, gen)
+            return
+        self._seq_stop()
         # Re-selecting the item already on screen (same path, size and mtime) keeps the finished preview:
         # re-decoding a model or a big image on every click made double-clicks feel laggy.
         key = (e.path, e.size, e.mtime) if e is not None else None
@@ -1312,13 +1459,21 @@ class MainWindow(Gtk.ApplicationWindow):
                 return False
             threading.Thread(target=work, daemon=True).start()
             return
+        if e.path and e.ext.lower() in SHADER_PREVIEW_EXTS and (e.size or 0) <= (64 << 20) and shader_preview_kind(e.path):
+            self._load_breakdown(e, gen, shader=True)
+            return
+        if e.path and (e.ext in SCENE_BREAKDOWN_EXTS or e.ext.lower() in SCENE_BREAKDOWN_EXTS) \
+                and not (e.ext == ".blend" and self.cfg.get("blend_view") == "3d") and scene_breakdown_kind(e.path):
+            self._load_breakdown(e, gen)
+            return
         model_exts = (".obj", ".stl", ".ply", ".fbx", ".usd", ".usda", ".usdc", ".usdz", ".abc", ".gltf", ".glb", ".dae", ".blend", ".3ds", ".x3d", ".lwo", ".off")
         # text formats are parsed whole, so cap them; Alembic/USD/.blend readers only touch the first sample
-        model_cap = (16 << 30) if e.ext in (".abc", ".usd", ".usdc", ".usdz", ".blend") else (600 << 20)
-        if e.path and e.ext in model_exts and (e.size or 0) >= model_cap:
+        hou_cache = bool(e.path and houdini_kind(e.name))
+        model_cap = (16 << 30) if (hou_cache or e.ext in (".abc", ".usd", ".usdc", ".usdz", ".blend")) else (600 << 20)
+        if e.path and (e.ext in model_exts or hou_cache) and (e.size or 0) >= model_cap:
             self._preview_as_icon(e, f"Too large to preview ({fmt_size(e.size)})")
             return
-        if e.path and e.ext in model_exts:
+        if e.path and (e.ext in model_exts or hou_cache):
             self._load_model_preview(e, gen)
             return
         if e.path and (e.ext in PREVIEW_DECODERS or e.ext in SEVENZIP_EXTS or e.ext in (".obj", ".pdf", ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".jar", ".whl",
@@ -1412,6 +1567,12 @@ class MainWindow(Gtk.ApplicationWindow):
             lang = self._lang_mgr.get_language({"makefile": "makefile", "dockerfile": "dockerfile", "cmakelists.txt": "cmake"}[os.path.basename(path).lower()])
         buf.set_language(lang)
         buf.set_highlight_syntax(lang is not None)
+        scheme = self._source_scheme()
+        if scheme is not None:
+            buf.set_style_scheme(scheme)
+
+    def _source_scheme(self):
+        """GtkSourceView colour scheme matching the light / dark theme."""
         settings = Gtk.Settings.get_default()
         dark = bool(settings and settings.get_property("gtk-application-prefer-dark-theme"))
         if not dark and settings:
@@ -1419,8 +1580,8 @@ class MainWindow(Gtk.ApplicationWindow):
         for name in (("Adwaita-dark", "oblivion", "cobalt", "classic") if dark else ("Adwaita", "classic", "tango")):
             scheme = self._style_mgr.get_scheme(name)
             if scheme is not None:
-                buf.set_style_scheme(scheme)
-                break
+                return scheme
+        return None
 
     def prompt_save(self) -> bool:
         """Ask Save / Discard / Keep editing for unsaved quick-edit changes. Returns True if it's OK to move on."""
@@ -1695,8 +1856,34 @@ class MainWindow(Gtk.ApplicationWindow):
         if self.cfg.get("gl_preview", True) and HAVE_GL:
             v = GLModelView()
             v.on_error = self._gl_failed
-            return v
-        return ModelView()
+            v.on_cache_failed = self._gl_cache_failed
+        else:
+            v = ModelView()
+        v.connect("key-press-event", self._model_key)
+        return v
+
+    def _gl_cache_failed(self, m: dict, msg: str):
+        """The GL viewer can't draw particles/volumes here (no float render targets…): software for caches."""
+        self._gl_cache_ok = False
+        self.flash("OpenGL can't draw volumes on this system; using the software renderer for caches")
+        mv = self._ensure_model_view(software=True)
+        mv.set_model(m)
+        st = self.preview_stack.get_allocation()
+        mv.prime(max(mv.get_allocated_width(), st.width), max(mv.get_allocated_height(), st.height - 60))
+
+    def _model_key(self, w, event):
+        """Sequence keys in the 3D viewer: Space plays/pauses, ← → step one frame."""
+        if self._seq is None:
+            return False
+        if event.keyval == Gdk.KEY_space:
+            self._seq_toggle_play()
+            return True
+        if event.keyval in (Gdk.KEY_Left, Gdk.KEY_Right):
+            self._seq_set_playing(False)
+            n = len(self._seq["paths"])
+            self._seq_goto((self._seq["cur"] + (1 if event.keyval == Gdk.KEY_Right else -1)) % n)
+            return True
+        return False
 
     def _gl_failed(self, msg: str):
         """OpenGL viewer reported a failure: show it where the user is looking, drop to the software renderer."""
@@ -1707,12 +1894,24 @@ class MainWindow(Gtk.ApplicationWindow):
         self.model_count.set_markup(f"<span foreground='#c0392b'>OpenGL failed: {GLib.markup_escape_text(msg[:160])}</span>")
         self.model_count.set_tooltip_text(msg)
 
-    def _ensure_model_view(self):
-        if self.model_view is None:
-            self.model_view = self._make_model_view()
-            self.model_slot.pack_start(self.model_view, True, True, 0)
-            self.model_view.show()
-        return self.model_view
+    def _ensure_model_view(self, software: bool = False):
+        """The viewer widget. software=True (particles / volumes, which only the software renderer draws)
+        swaps in a ModelView even when OpenGL is on; the next plain mesh swaps the GL viewer back."""
+        want_soft = software or not (self.cfg.get("gl_preview", True) and HAVE_GL)
+        cur = self.model_view
+        if cur is not None and isinstance(cur, ModelView) != want_soft:
+            self.model_slot.remove(cur)
+            cur = None
+        if cur is None:
+            if want_soft:
+                cur = ModelView()
+                cur.connect("key-press-event", self._model_key)
+            else:
+                cur = self._make_model_view()
+            self.model_slot.pack_start(cur, True, True, 0)
+            cur.show()
+            self.model_view = cur
+        return cur
 
     def toggle_gl_preview(self):
         """Preferences → Optional. Swaps the viewer widget in place and re-shows the model."""
@@ -1761,9 +1960,19 @@ class MainWindow(Gtk.ApplicationWindow):
                 return False
             for k, v in m["info"]:
                 self._qv_add(k, v)
-            mv = self._ensure_model_view()
+            cache = any(k in m for k in ("points", "vpts"))
+            mv = self._ensure_model_view(software=cache and not getattr(self, "_gl_cache_ok", True))
             shown, total = len(m["faces"]), m.get("nfaces_total", len(m["faces"]))
-            self.model_count.set_text(f"{shown:,} of {total:,} faces" if shown < total else f"{total:,} faces")
+            self.model_full_toggle.set_visible(bool(total))      # nothing to un-cap on a volume / point cache
+            self.model_bd_btn.set_visible(e.ext == ".blend")
+            parts = []
+            if total:
+                parts.append(f"{shown:,} of {total:,} faces" if shown < total else f"{total:,} faces")
+            if "points" in m:
+                parts.append(f"{len(m['points']):,} points")
+            if "vpts" in m:
+                parts.append(f"{len(m['vpts']):,} voxels")
+            self.model_count.set_text("  ·  ".join(parts) or "empty")
             if isinstance(mv, ModelView) and np is not None:
                 # software renderer: fade in when the first frame arrives, not before (the widget would be blank)
                 mv.on_first_frame = lambda: gen == self._side_gen and self._show_preview("model")
@@ -1778,11 +1987,711 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _toggle_model_full(self, btn):
         e = getattr(self, "_model_entry", None)
+        if getattr(self, "_seq", None) is not None:
+            self._preview_key = None              # reload the whole sequence at the new detail level
+            self._update_side()
+            return
         if e is None or self.preview_stack.get_visible_child_name() not in ("model", "info"):
             return
         self._side_gen += 1
         self._preview_key = None            # force a reload of the same file at the new detail level
         self._load_model_preview(e, self._side_gen)
+
+    # ---- scene breakdowns (Unreal / Unity / Maya / Blender)
+    def _build_breakdown_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        head = Gtk.Box(spacing=6)
+        self.bd_title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.bd_title.get_style_context().add_class("dim-label")
+        head.pack_start(self.bd_title, True, True, 4)
+        self.bd_copy = Gtk.Button.new_from_icon_name("edit-copy-symbolic", Gtk.IconSize.BUTTON)
+        self.bd_copy.set_tooltip_text("Copy the breakdown as text")
+        self.bd_copy.get_style_context().add_class("flat")
+        self.bd_copy.connect("clicked", self._bd_copy_all)
+        head.pack_end(self.bd_copy, False, False, 0)
+        self.bd_3d = Gtk.Button(label="3D view")
+        self.bd_3d.set_tooltip_text("Preview the geometry instead (starts Blender in the background)")
+        self.bd_3d.get_style_context().add_class("flat")
+        self.bd_3d.connect("clicked", lambda b: self._switch_blend_view("3d"))
+        self.bd_3d.set_no_show_all(True)
+        head.pack_end(self.bd_3d, False, False, 0)
+        self.bd_code_btn = Gtk.ToggleButton(label="Code")
+        self.bd_code_btn.set_tooltip_text("Show the source instead of the breakdown")
+        self.bd_code_btn.get_style_context().add_class("flat")
+        self.bd_code_btn.set_active(bool(self.cfg.get("bd_code")))
+        self.bd_code_btn.connect("toggled", self._bd_code_toggled)
+        self.bd_code_btn.set_no_show_all(True)
+        head.pack_end(self.bd_code_btn, False, False, 0)
+        box.pack_start(clip_width(head), False, False, 0)
+        # top half: stored preview / material ball / light pattern / live GLSL; bottom half: tree or code
+        self.bd_paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL, wide_handle=False)
+        self.bd_paned.connect("notify::position", self._bd_pane_moved)
+        self._bd_ratio, self._bd_pos_busy = None, False
+        media = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.bd_media_stack = Gtk.Stack()
+        self.bd_image = FitImage()
+        self.bd_media_stack.add_named(self.bd_image, "image")
+        self.bd_glsl: Optional[GLSLView] = None             # created on first use (needs a GL context)
+        media.pack_start(self.bd_media_stack, True, True, 0)
+        cap = Gtk.Box(spacing=4)
+        self.bd_media_label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.bd_media_label.get_style_context().add_class("dim-label")
+        cap.pack_start(self.bd_media_label, True, True, 4)
+        self.bd_play = Gtk.Button.new_from_icon_name("media-playback-pause-symbolic", Gtk.IconSize.MENU)
+        self.bd_play.set_relief(Gtk.ReliefStyle.NONE)
+        self.bd_play.set_tooltip_text("Pause / play (double-click the picture to restart the clock)")
+        self.bd_play.connect("clicked", self._bd_glsl_toggle)
+        self.bd_play.set_no_show_all(True)
+        cap.pack_end(self.bd_play, False, False, 0)
+        media.pack_start(clip_width(cap), False, False, 0)
+        media.show_all()
+        media.set_no_show_all(True)
+        media.hide()
+        self.bd_media = media
+        self.bd_paned.pack1(media, True, False)
+        lower = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.bd_err = Gtk.Label(xalign=0, wrap=True, selectable=True)
+        self.bd_err.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.bd_err.get_style_context().add_class("bd-error")
+        self.bd_err.set_no_show_all(True)
+        lower.pack_start(self.bd_err, False, False, 0)
+        self.bd_filter = Gtk.SearchEntry()
+        self.bd_filter.set_placeholder_text("Filter names, types and paths")
+        self.bd_filter.connect("search-changed", self._bd_refilter)
+        lower.pack_start(self.bd_filter, False, False, 0)
+        self.bd_notes = Gtk.Label(xalign=0, wrap=True)
+        self.bd_notes.get_style_context().add_class("dim-label")
+        self.bd_notes.set_no_show_all(True)
+        lower.pack_start(self.bd_notes, False, False, 0)
+        # name, info, path, colour, visible, tooltip, key (material:N rows)
+        self.bd_store = Gtk.TreeStore(str, str, str, str, bool, str, str)
+        self.bd_model = self.bd_store.filter_new()
+        self.bd_model.set_visible_column(4)
+        tv = Gtk.TreeView(model=self.bd_model)
+        tv.set_enable_search(False)
+        tv.set_tooltip_column(5)
+        for title, col, ell, expand in (("Name", 0, Pango.EllipsizeMode.END, True), ("Info", 1, Pango.EllipsizeMode.END, True),
+                                         ("Location", 2, Pango.EllipsizeMode.START, True)):
+            r = Gtk.CellRendererText(ellipsize=ell)
+            c = Gtk.TreeViewColumn(title, r)
+            c.set_resizable(True)
+            c.set_expand(expand)
+            c.set_min_width(60)
+            c.set_cell_data_func(r, self._bd_cell, col)
+            tv.append_column(c)
+        tv.connect("row-activated", self._bd_activate)
+        tv.connect("button-press-event", self._bd_button)
+        tv.get_selection().connect("changed", self._bd_selection)
+        self.bd_view = tv
+        sw = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        sw.add(tv)
+        if GtkSource is not None:
+            self.bd_code = GtkSource.View.new_with_buffer(GtkSource.Buffer())
+            self.bd_code.set_show_line_numbers(True)
+            self.bd_code.set_tab_width(4)
+        else:
+            self.bd_code = Gtk.TextView()
+        self.bd_code.set_monospace(True)
+        self.bd_code.set_editable(False)
+        self.bd_code.set_left_margin(6)
+        csw = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        csw.add(self.bd_code)
+        self.bd_lower = Gtk.Stack()
+        self.bd_lower.add_named(sw, "tree")
+        self.bd_lower.add_named(csw, "code")
+        lower.pack_start(self.bd_lower, True, True, 0)
+        self.bd_paned.pack2(lower, True, False)
+        self.bd_paned.connect("size-allocate", lambda w, a: self._bd_place_pane())
+        box.pack_start(self.bd_paned, True, True, 0)
+        box.show_all()
+        return box
+
+    def _bd_cell(self, col, cell, model, it, idx):
+        text = model.get_value(it, idx) or ""
+        colour = model.get_value(it, 3)
+        if idx == 0:
+            cell.set_property("text", text)
+            cell.set_property("foreground", colour or None)
+            cell.set_property("foreground-set", bool(colour))
+            cell.set_property("weight", 700 if model.get_path(it).get_depth() == 1 else 400)
+        else:
+            alpha = "100%" if (idx == 2 and colour) else "62%"
+            fg = f' foreground="{colour}"' if (idx == 2 and colour) else ""
+            cell.set_property("markup", f'<span alpha="{alpha}"{fg}>{GLib.markup_escape_text(text)}</span>' if text else "")
+
+    def _load_breakdown(self, e: Entry, gen: int, shader: bool = False):
+        """Scene breakdown (Unreal / Unity / Maya / Blender) or, with `shader`, a shader / material / IES file:
+        same page, plus a picture on top (stored thumbnail, material ball, light pattern or live GLSL)."""
+        self._placeholder("Reading shader…" if shader else "Reading scene…", gen)
+        path = e.path
+        self._bd_entry = e
+
+        def work():
+            try:
+                res = run_heavy(shader_preview if shader else scene_breakdown, path)
+            except Exception as ex:
+                res = {"error": str(ex)}
+            GLib.idle_add(done, res)
+
+        def done(res):
+            if gen != self._side_gen:
+                return False
+            if not res or "error" in res:
+                if e.ext == ".blend":
+                    self._load_model_preview(e, gen)          # fall back to the 3D preview
+                elif shader and self._bd_text_fallback(e):
+                    pass
+                else:
+                    self._preview_as_icon(e, ("Couldn't read this file" if shader else "Couldn't read this scene")
+                                          + (f"\n{res.get('error', '')}" if res else ""))
+                return False
+            self._bd_res = res
+            for k, v in res.get("info", []):
+                self._qv_add(k, v)
+            self.bd_title.set_text(res.get("kind", "") + (f"  ·  read in {res['seconds']:.2f} s" if res.get("seconds", 0) >= 0.5 else ""))
+            notes = res.get("notes") or []
+            self.bd_notes.set_text("\n".join(notes))
+            self.bd_notes.set_visible(bool(notes))
+            self.bd_3d.set_visible(e.ext == ".blend")
+            self.bd_filter.set_text("")
+            self._bd_fill(res)
+            self._bd_set_code(res.get("code"), path)
+            self._bd_set_media(res)
+            self._show_preview("breakdown")
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _bd_text_fallback(self, e: Entry) -> bool:
+        """A shader file the reader choked on still previews as plain text."""
+        try:
+            with open(e.path, "rb") as f:
+                data = f.read(64 << 10)
+        except OSError:
+            return False
+        if b"\0" in data:
+            return False
+        self._load_text(e.path, data, (e.size or 0) <= 64 << 10)
+        self.edit_entry = e
+        self._show_preview("text")
+        return True
+
+    def _bd_set_code(self, code, path: str):
+        """Source view for the Code toggle: (text, language id) or None."""
+        buf = self.bd_code.get_buffer()
+        has = bool(code and code[0])
+        self.bd_code_btn.set_visible(has)
+        buf.set_text(code[0][:2 << 20] if has else "")
+        if GtkSource is not None and has:
+            lang = None
+            for lid in {"glsl": ("glsl", "c"), "c": ("c",), "xml": ("xml",), "yaml": ("yaml",), "json": ("json", "js")}.get(code[1] or "", ()):
+                lang = self._lang_mgr.get_language(lid)
+                if lang is not None:
+                    break
+            if lang is None:
+                ct, _ = Gio.content_type_guess(path, None)
+                lang = self._lang_mgr.guess_language(path, ct)
+            buf.set_language(lang)
+            buf.set_highlight_syntax(lang is not None)
+            scheme = self._source_scheme()
+            if scheme is not None:
+                buf.set_style_scheme(scheme)
+        self.bd_lower.set_visible_child_name("code" if has and self.bd_code_btn.get_active() else "tree")
+        self.bd_filter.set_visible(not (has and self.bd_code_btn.get_active()))
+
+    def _bd_code_toggled(self, btn):
+        on = btn.get_active()
+        self.cfg["bd_code"] = on
+        save_config(self.cfg)
+        self.bd_lower.set_visible_child_name("code" if on else "tree")
+        self.bd_filter.set_visible(not on)
+
+    def _bd_set_media(self, res: dict):
+        """Top half of the page: live GLSL when the file is a runnable fragment shader (and GL works), else
+        the first stored / rendered picture, else nothing."""
+        self.bd_err.hide()
+        self.bd_play.hide()
+        if self.bd_glsl is not None:
+            self.bd_glsl.set_playing(False)
+        glsl = res.get("glsl")
+        if glsl and self.cfg.get("gl_preview", True) and HAVE_GL and not getattr(self, "_glsl_broken", False):
+            if self.bd_glsl is None:
+                self.bd_glsl = GLSLView()
+                self.bd_glsl.on_status = self._bd_glsl_status
+                self.bd_glsl.show()
+                self.bd_media_stack.add_named(self.bd_glsl, "glsl")
+            self.bd_media_stack.set_visible_child_name("glsl")
+            self.bd_glsl.load(glsl["source"], glsl["style"])
+            self.bd_media_label.set_text({"shadertoy": "Shadertoy shader", "sandbox": "Fragment shader"}.get(glsl["style"], "Shader")
+                                         + " · live")
+            self.bd_play.set_image(Gtk.Image.new_from_icon_name("media-playback-pause-symbolic", Gtk.IconSize.MENU))
+            self.bd_play.show()
+            self._bd_show_media(True)
+            return
+        imgs = res.get("images") or []
+        if imgs:
+            self._bd_show_image(imgs[0][1], imgs[0][0])
+            return
+        self._bd_show_media(False)
+
+    def _bd_show_image(self, img, label: str):
+        pb = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(img.rgb), GdkPixbuf.Colorspace.RGB, False, 8, img.w, img.h, img.w * 3)
+        self.bd_image.set_from_pixbuf(pb)
+        self.bd_media_stack.set_visible_child_name("image")
+        self.bd_media_label.set_text(label)
+        self.bd_play.hide()
+        if self.bd_glsl is not None:
+            self.bd_glsl.set_playing(False)
+        self._bd_show_media(True, img.h + 30)
+
+    def _bd_show_media(self, on: bool, want: int = 0):
+        """Show / hide the picture half. `want` = height the content needs (small thumbnails get less room)."""
+        was = self.bd_media.get_visible()
+        self.bd_media.set_visible(on)
+        if on and (not was or want != getattr(self, "_bd_want", 0)):
+            self._bd_want = want
+            self._bd_placed = False
+            self._bd_place_pane()
+
+    def _bd_place_pane(self):
+        """Give the picture about half the page (or what the user dragged it to) once the page has a size."""
+        if getattr(self, "_bd_placed", True) or not self.bd_media.get_visible():
+            return
+        h = self.bd_paned.get_allocated_height()
+        w = self.bd_paned.get_allocated_width()
+        if h < 50:
+            return
+        self._bd_placed = True
+        pos = int(h * self._bd_ratio) if self._bd_ratio else min(int(h * 0.55), w + 30, getattr(self, "_bd_want", 0) or h)
+        self._bd_pos_busy = True
+        GLib.idle_add(lambda: (self.bd_paned.set_position(max(80, pos)), setattr(self, "_bd_pos_busy", False), False)[2])
+
+    def _bd_pane_moved(self, paned, pspec):
+        h = paned.get_allocated_height()
+        if not self._bd_pos_busy and getattr(self, "_bd_placed", False) and h > 50 and self.bd_media.get_visible():
+            self._bd_ratio = paned.get_position() / h
+
+    def _bd_glsl_status(self, msg: str):
+        if msg and msg.startswith("OpenGL"):
+            # no usable GL context: don't try again this session; show the source instead of a black box
+            self._glsl_broken = True
+            self._bd_show_media(False)
+            self.bd_err.set_text(msg)
+            self.bd_err.show()
+            if self.bd_code_btn.get_visible():
+                self.bd_lower.set_visible_child_name("code")
+                self.bd_filter.hide()
+        elif msg:
+            self.bd_err.set_text("Shader didn't compile:\n" + msg)
+            self.bd_err.show()
+        else:
+            self.bd_err.hide()
+
+    def _bd_glsl_toggle(self, btn):
+        v = self.bd_glsl
+        if v is None:
+            return
+        v.set_playing(not v.playing)
+        btn.set_image(Gtk.Image.new_from_icon_name("media-playback-pause-symbolic" if v.playing else "media-playback-start-symbolic",
+                                                   Gtk.IconSize.MENU))
+
+    def _bd_selection(self, sel):
+        """A material row picked in a breakdown: show its stored preview or render a ball for it."""
+        m, it = sel.get_selected()
+        key = m.get_value(it, 6) if it is not None else ""
+        res = getattr(self, "_bd_res", None) or {}
+        mats = res.get("materials") or []
+        if not key or not key.startswith("material:") or res.get("glsl"):
+            return
+        try:
+            mat = mats[int(key.split(":", 1)[1])]
+        except (ValueError, IndexError):
+            return
+        gen = self._side_gen
+        name = mat.get("name") or "Material"
+
+        def work():
+            try:
+                img = run_heavy(material_ball_for, mat)
+            except Exception:
+                img = None
+            GLib.idle_add(done, img)
+
+        def done(img):
+            if gen == self._side_gen and img is not None and self.preview_stack.get_visible_child_name() == "breakdown":
+                self._bd_show_image(img, name + (" · stored preview" if mat.get("_image") is not None else " · material ball"))
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _bd_fill(self, res: dict):
+        st = self.bd_store
+        self.bd_view.set_model(None)                          # detached: tens of thousands of rows fill fast
+        st.clear()
+        missing = "#e5534b"
+
+        def add(parent, nodes):
+            for label, detail, kids, path, ok in nodes:
+                tip = None
+                if path:
+                    tip = GLib.markup_escape_text(path) + ("\n<b>Missing on this machine</b>" if ok is False else
+                                                           ("\n<i>Not checked: a path from another machine</i>" if ok is None else ""))
+                key = ""
+                if path and path.startswith("material:"):
+                    key, path, tip = path, "", "Select to preview this material"
+                it = st.append(parent, [label, detail, path, missing if ok is False else "", True, tip, key])
+                if kids:
+                    add(it, kids)
+        add(None, res.get("tree", []))
+        self.bd_view.set_model(self.bd_model)
+        self._bd_default_expand()
+
+    def _bd_default_expand(self):
+        """Sections open; outliners and reference groups one level deeper (when not huge)."""
+        tv, m = self.bd_view, self.bd_model
+        it = m.get_iter_first()
+        while it is not None:
+            p = m.get_path(it)
+            tv.expand_row(p, False)
+            if m.get_value(it, 0) in ("Outliner", "Hierarchy", "Scenes", "References") and m.iter_n_children(it) <= 60:
+                c = m.iter_children(it)
+                while c is not None:
+                    if m.iter_n_children(c) <= 200:
+                        tv.expand_row(m.get_path(c), False)
+                    c = m.iter_next(c)
+            it = m.iter_next(it)
+
+    def _bd_refilter(self, entry):
+        q = entry.get_text().strip().lower()
+        st = self.bd_store
+
+        def visit(it, shown_by_ancestor):
+            vis_any = False
+            while it is not None:
+                hit = bool(q) and (q in (st.get_value(it, 0) or "").lower() or q in (st.get_value(it, 1) or "").lower()
+                                   or q in (st.get_value(it, 2) or "").lower())
+                kids = visit(st.iter_children(it), shown_by_ancestor or hit or not q)
+                vis = not q or shown_by_ancestor or hit or kids
+                st.set_value(it, 4, vis)
+                vis_any = vis_any or vis
+                it = st.iter_next(it)
+            return vis_any
+        visit(st.get_iter_first(), False)
+        self.bd_model.refilter()
+        if q:
+            self.bd_view.expand_all()
+        else:
+            self.bd_view.collapse_all()
+            self._bd_default_expand()
+
+    def _bd_row_path(self, tree_path) -> str:
+        it = self.bd_model.get_iter(tree_path)
+        return self.bd_model.get_value(it, 2) or ""
+
+    def _bd_reveal(self, path: str):
+        if not path:
+            return
+        if os.path.isdir(path):
+            self.navigate(path)
+            return
+        d = os.path.dirname(path)
+        if not os.path.isdir(d):
+            self.flash(f"Not on this machine: {path}")
+            return
+        self.tab.remember[d] = os.path.basename(path)
+        self.navigate(d)
+
+    def _bd_activate(self, tv, tree_path, col):
+        p = self._bd_row_path(tree_path)
+        if p:
+            if os.path.exists(p):
+                self._bd_reveal(p)
+            else:
+                self.flash(f"Missing: {p}")
+        elif tv.row_expanded(tree_path):
+            tv.collapse_row(tree_path)
+        else:
+            tv.expand_row(tree_path, False)
+
+    def _bd_button(self, tv, event):
+        if event.button != 3:
+            return False
+        hit = tv.get_path_at_pos(int(event.x), int(event.y))
+        if not hit:
+            return False
+        tv.get_selection().select_path(hit[0])
+        it = self.bd_model.get_iter(hit[0])
+        name, path = self.bd_model.get_value(it, 0), self.bd_model.get_value(it, 2)
+        menu = Gtk.Menu()
+        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        items = [("Copy name", lambda *_: cb.set_text(name, -1))]
+        if path:
+            items = [("Show in folder", lambda *_: self._bd_reveal(path)), ("Copy path", lambda *_: cb.set_text(path, -1))] + items
+        for label, fn in items:
+            mi = Gtk.MenuItem(label=label)
+            mi.connect("activate", fn)
+            menu.append(mi)
+        menu.show_all()
+        menu.attach_to_widget(tv, None)
+        menu.popup_at_pointer(event)
+        return True
+
+    def _bd_copy_all(self, btn):
+        res = getattr(self, "_bd_res", None)
+        if res:
+            e = getattr(self, "_bd_entry", None)
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(breakdown_text(res, f"{e.path if e else ''}\n{res.get('kind', '')}"), -1)
+            self.flash("Breakdown copied")
+
+    def _switch_blend_view(self, which: str):
+        """.blend files: breakdown (default) or 3D preview; the choice is remembered."""
+        self.cfg["blend_view"] = which
+        save_config(self.cfg)
+        e = getattr(self, "_bd_entry", None) if which == "3d" else getattr(self, "_model_entry", None)
+        if e is None:
+            return
+        self._side_gen += 1
+        self._preview_key = None
+        if which == "3d":
+            self._load_model_preview(e, self._side_gen)
+        else:
+            self._load_breakdown(e, self._side_gen)
+
+    # ---- cache sequences: time slider over several selected .vdb / .bgeo frames
+    SEQ_MAX_VOXELS = 1_000_000           # per frame (~16 MB): a sequence keeps many frames in memory
+
+    @staticmethod
+    def _seq_budget() -> int:
+        """Bytes of decoded frames to keep: a third of RAM, at most 3 GB."""
+        try:
+            with open("/proc/meminfo") as f:
+                tot = int(next(l for l in f if l.startswith("MemTotal")).split()[1]) * 1024
+        except Exception:
+            tot = 8 << 30
+        return int(min(3 << 30, tot // 3))
+
+    def _load_model_sequence(self, seq: list, focus: Optional[Entry], gen: int):
+        self._seq_stop()
+        paths = [x.path for x in seq]
+        start = next((i for i, x in enumerate(seq) if focus is not None and x.path == focus.path), 0)
+        self._seq = {"paths": paths, "gen": gen, "cur": start, "shown": -1, "frames": {}, "futures": {},
+                     "norm": None, "bytes": 0, "fbytes": 0, "budget": self._seq_budget(), "playing": False,
+                     "timer": None, "failed": set()}
+        self._model_entry = seq[start]
+        self._placeholder(f"Loading sequence ({len(paths)} frames)…", gen)
+        self._seq_guard = True
+        self.seq_scale.set_range(0, max(1, len(paths) - 1))
+        self.seq_scale.set_value(start)
+        self._seq_guard = False
+        self.seq_scale.clear_marks()
+        self._seq_label()
+        self._seq_request(start)
+
+    def _seq_button_clicked(self, btn):
+        cands = getattr(self, "_seq_candidates", None)
+        if not cands:
+            return
+        self._seq_requested = tuple(x.path for x in cands)
+        self._preview_key = None
+        self._update_side()
+
+    def _seq_stop(self):
+        s, self._seq = getattr(self, "_seq", None), None
+        if s is None:
+            return
+        if s["timer"]:
+            GLib.source_remove(s["timer"])
+        for fut in s["futures"].values():
+            fut.cancel()
+        self.seq_bar.hide()
+        self.seq_label.hide()
+        self.seq_play.set_image(Gtk.Image.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.BUTTON))
+
+    def _seq_request(self, i: int):
+        s = self._seq
+        if s is None or i in s["frames"] or i in s["futures"] or i in s["failed"]:
+            return
+        if s["norm"] is None and s["futures"]:
+            return                                    # frame 1 sets the box: wait for it before the rest
+        full = self.model_full_toggle.get_active()
+        try:
+            fut = seq_pool().submit(load_model, s["paths"][i], sys.maxsize if full else 500000, s["norm"], self.SEQ_MAX_VOXELS)
+        except Exception as ex:
+            bench(f"sequence: worker pool failed: {ex}")
+            return
+        s["futures"][i] = fut
+        fut.add_done_callback(lambda f, i=i, s=s: GLib.idle_add(self._seq_loaded, s, i, f))
+
+    def _seq_loaded(self, s, i: int, fut):
+        if s is not self._seq or fut.cancelled():
+            return False
+        s["futures"].pop(i, None)
+        try:
+            m = fut.result()
+        except Exception as ex:
+            m = {"error": str(ex)}
+        if not m or "error" in m:
+            s["failed"].add(i)
+            if s["shown"] < 0 and (i == s["cur"] or s["norm"] is None):
+                self._preview_as_icon(self._model_entry, "Couldn't read this frame" + (f"\n{m['error']}" if m else ""))
+                self._seq_stop()
+                return False
+        else:
+            if s["norm"] is None:
+                s["norm"] = m.get("norm")
+            nb = sum(getattr(v, "nbytes", 0) for v in m.values())
+            s["frames"][i] = m
+            s["bytes"] += nb
+            s["fbytes"] = max(s["fbytes"], nb)
+            if i == s["cur"]:
+                self._seq_show(i)
+        self._seq_pump()
+        self._seq_label()
+        return False
+
+    def _seq_window(self) -> list:
+        """Frames worth holding: from the current one onwards (wrapping, playback loops), as many as fit."""
+        s = self._seq
+        n = len(s["paths"])
+        fit = n if not s["fbytes"] else max(2, int(s["budget"] // max(s["fbytes"], 1)))
+        return [(s["cur"] + k) % n for k in range(min(n, fit))]
+
+    def _seq_pump(self):
+        """Keep the worker processes busy on the frames ahead; drop decoded frames outside the window."""
+        s = self._seq
+        if s is None or s["norm"] is None:
+            return
+        win = self._seq_window()
+        keep = set(win)
+        for i in [i for i in s["frames"] if i not in keep]:
+            m = s["frames"].pop(i)
+            s["bytes"] -= sum(getattr(v, "nbytes", 0) for v in m.values())
+        for i, fut in list(s["futures"].items()):
+            if i not in keep and fut.cancel():
+                s["futures"].pop(i, None)
+        slots = 2 * max(1, min(4, (os.cpu_count() or 2) // 4)) - len(s["futures"])
+        for i in win:
+            if slots <= 0:
+                break
+            if i not in s["frames"] and i not in s["futures"] and i not in s["failed"]:
+                self._seq_request(i)
+                slots -= 1
+
+    def _seq_show(self, i: int):
+        s = self._seq
+        m = s["frames"][i]
+        first = s["shown"] < 0
+        s["shown"] = i
+        if first:
+            for k, v in m["info"]:
+                self._qv_add(k, v)
+            self._qv_add("Sequence", f"{len(s['paths'])} frames")
+        cache = any(k in m for k in ("points", "vpts"))
+        mv = self._ensure_model_view(software=cache and not getattr(self, "_gl_cache_ok", True))
+        total = m.get("nfaces_total", len(m["faces"]))
+        self.model_full_toggle.set_visible(bool(total))
+        parts = []
+        if total:
+            parts.append(f"{total:,} faces")
+        if "points" in m:
+            parts.append(f"{len(m['points']):,} points")
+        if "vpts" in m:
+            parts.append(f"{len(m['vpts']):,} voxels")
+        self.model_count.set_text("  ·  ".join(parts) or "empty")
+        if first:
+            self._set_caption(f"{os.path.basename(s['paths'][0])} … {os.path.basename(s['paths'][-1])}  ·  {len(s['paths'])} frames")
+            self.seq_bar.show()
+            self.seq_label.show()
+            if isinstance(mv, ModelView) and np is not None:
+                gen = s["gen"]
+                mv.on_first_frame = lambda: gen == self._side_gen and self._show_preview("model")
+                mv.set_model(m)
+                st = self.preview_stack.get_allocation()
+                mv.prime(max(mv.get_allocated_width(), st.width), max(mv.get_allocated_height(), st.height - 60))
+            else:
+                mv.set_model(m)
+                self._show_preview("model")
+        else:
+            mv.set_model(m, keep_view=True)
+
+    def _seq_label(self):
+        s = self._seq
+        if s is None:
+            return
+        n = len(s["paths"])
+        name = os.path.basename(s["paths"][s["cur"]])
+        held = len(s["frames"])
+        self.seq_counter.set_text(f"{s['cur'] + 1}/{n}")
+        self.seq_label.set_text(name)
+        # shade the slider up to the last frame decoded ahead of the playhead (like a video player's buffer)
+        k = 0
+        while k < n and (s["cur"] + k) % n in s["frames"]:
+            k += 1
+        self.seq_scale.set_fill_level(n - 1 if k >= n else min(n - 1, s["cur"] + max(k - 1, 0)))
+        self.seq_label.set_tooltip_text(f"{held} of {n} frames decoded and held in memory"
+                                        f" ({fmt_size(max(s['bytes'], 0))})")
+
+    def _seq_goto(self, i: int):
+        s = self._seq
+        if s is None:
+            return
+        s["cur"] = i
+        self._seq_guard = True
+        self.seq_scale.set_value(i)
+        self._seq_guard = False
+        if i in s["frames"]:
+            self._seq_show(i)
+        else:
+            self._seq_request(i)
+        self._seq_pump()
+        self._seq_label()
+
+    def _seq_scrub(self, scale):
+        if getattr(self, "_seq_guard", False) or self._seq is None:
+            return
+        i = int(round(scale.get_value()))
+        if i != self._seq["cur"]:
+            self._seq_goto(i)
+
+    def _seq_toggle_play(self):
+        if self._seq is not None:
+            self._seq_set_playing(not self._seq["playing"])
+
+    def _seq_set_playing(self, on: bool):
+        s = self._seq
+        if s is None or s["playing"] == on:
+            return
+        s["playing"] = on
+        if s["timer"]:
+            GLib.source_remove(s["timer"])
+            s["timer"] = None
+        if on:
+            s["timer"] = GLib.timeout_add(max(15, int(1000 / self.seq_fps.get_value())), self._seq_tick)
+        icon = "media-playback-pause-symbolic" if on else "media-playback-start-symbolic"
+        self.seq_play.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON))
+
+    def _seq_tick(self):
+        s = self._seq
+        if s is None or not s["playing"]:
+            return False
+        nxt = (s["cur"] + 1) % len(s["paths"])
+        if nxt in s["frames"]:
+            self._seq_goto(nxt)
+        else:
+            self._seq_request(nxt)                    # not decoded yet: hold this frame until it is
+            self.seq_label.set_text(f"buffering {nxt + 1}…")
+        return True
+
+    def _seq_focus_changed(self, win, pspec):
+        """Playback pauses when the Kestrel window loses focus (and stays paused until Play is pressed)."""
+        if not self.is_active() and self._seq is not None and self._seq["playing"]:
+            self._seq_set_playing(False)
+
+    def _seq_fps_changed(self, spin):
+        self.cfg["seq_fps"] = int(spin.get_value())
+        save_config(self.cfg)
+        s = self._seq
+        if s is not None and s["playing"]:
+            self._seq_set_playing(False)
+            self._seq_set_playing(True)
 
     FADE_MS = 125
 
@@ -1840,6 +2749,31 @@ class MainWindow(Gtk.ApplicationWindow):
             surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, a.width * scale, a.height * scale)
             surf.set_device_scale(scale, scale)
             cr = cairo.Context(surf)
+            # Preferred: copy the pane's pixels straight off the window — exactly what the user sees (GL
+            # viewport and video included). Re-drawing the widgets (below) fails with "gtk_widget_draw:
+            # assertion '!widget->priv->alloc_needed'" whenever the pane is mid-relayout, which happens on
+            # most selection changes, and then the snapshot comes out empty (a flash instead of a fade).
+            pb = None
+            try:
+                # a no-window widget's allocation is in the coordinates of the GdkWindow it draws into
+                win = self.preview_stack.get_window()
+                if win is not None and win.is_viewable() and not self.preview_stack.get_has_window():
+                    pb = Gdk.pixbuf_get_from_window(win, a.x, a.y, a.width, a.height)
+            except Exception:
+                pb = None
+            if pb is not None:
+                cr.save()
+                cr.scale(a.width / pb.get_width(), a.height / pb.get_height())
+                Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
+                cr.paint()
+                cr.restore()
+                self._snap_surface = surf
+                if hold:
+                    self._fade_token = getattr(self, "_fade_token", 0) + 1
+                    self._snap_draw = surf
+                    self._snap_alpha = 1.0
+                    self.snap_area.queue_draw()
+                return
             # The snapshot must be OPAQUE or the new content shows through it from frame one (only the old
             # text/image would appear to fade). Most of our containers have no background of their own —
             # the colour comes from the toplevel — so paint the theme's window colour first, then any
@@ -1853,7 +2787,8 @@ class MainWindow(Gtk.ApplicationWindow):
             Gtk.render_background(self.get_style_context(), cr, 0, 0, a.width, a.height)
             for wdg in (self.side, self.preview_box, self.preview_stack):
                 Gtk.render_background(wdg.get_style_context(), cr, 0, 0, a.width, a.height)
-            self.preview_stack.draw(cr)
+            if self.preview_stack.get_child_visible() and self.preview_stack.get_mapped():
+                self.preview_stack.draw(cr)
             self._snap_surface = surf
             if not hold:
                 return

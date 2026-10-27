@@ -17,9 +17,11 @@ namespace, so a part may use anything defined in an earlier part, and a class de
 | `p2c.py` | ~90   | `ReportDialog` (review / edit / send a report), `open_report` |
 | `p3b.py` | ~850  | custom widgets: `FitImage`, row hover, soft grid lines, virtualised `IconGrid`, This PC tile view (`PCView`, `DriveBar`) |
 | `p3c.py` | ~1400 | 3D preview: `load_model` + `_finish_model_numpy` (triangulation, decimation, normals), software rasteriser (`_rasterize`, `software_render`) and its `RenderWorker` process, `ModelView` (cairo) and `GLModelView` (Gtk.GLArea), GStreamer `VideoPreview` |
-| `p3d.py` | ~700  | 3D importers for FBX / USD / Alembic (HDF5 via h5py), Blender and assimp bridges, `optional_deps`, `install_script`, `preview_tool_report`, GL status |
+| `p3e.py` | ~2050 | scene breakdowns: `UEPackage` (Unreal package summary / names / imports / exports), Unity YAML + `.meta` GUID index, Maya ASCII statements + IFF (`FOR4`/`FOR8`) chunks, `BlendFile` (blocks + SDNA, gzip/zstd), `scene_breakdown`, `breakdown_text` |
+| `p3f.py` | ~1500 | shader / material / IES previews: `render_material_ball` (numpy GGX), readers for MaterialX, OSL/OSO, GLSL/HLSL, Unity `.mat`/`.shader`/`.shadergraph`, `IESProfile` + `ies_preview`, `shader_preview`, `material_ball_for`; live GLSL: `GLSLRunner` (no GTK) and `GLSLView` (Gtk.GLArea) |
+| `p3d.py` | ~1300 | built-in VDB reader, Houdini / Maya bridges, 3D importers for FBX / USD / Alembic (HDF5 via h5py), Blender and assimp bridges, `optional_deps`, `install_script`, `preview_tool_report`, GL status |
 | `p3.py`  | ~1050 | `IconCache` (icons + thumbnails), `NavNode`, `FolderView` (one folder tab: listing, search, selection, drag-and-drop, views), `Page` (one or two `FolderView`s for split view) |
-| `p4.py`  | ~2700 | `MainWindow`: menus/command bar, navigation pane, tabs, address bar, side pane (preview + details), preview routing and crossfades, drive watching, status bar and spinner, window state |
+| `p4.py`  | ~3000 | `MainWindow`: menus/command bar, navigation pane, tabs, address bar, side pane (preview + details), preview routing and crossfades, cache-sequence player, drive watching, status bar and spinner, window state |
 | `p5.py`  | ~1400 | `MainWindow` continued: context menus, actions (zip, extract, RV, checksum, run script, batch rename…), index scheduling, `ExplorerApp` (Gtk.Application), `probe_gl`, `main()` and all command-line flags |
 
 Keep this order when adding a part; `build.sh` holds the list.
@@ -67,11 +69,66 @@ the GIL handoff quick.
 
 `load_model(path)` → fast numpy paths for OBJ/STL/PLY; FBX/USD text parsers; Alembic: HDF5 via
 h5py, Ogawa via Blender; anything else via Blender (`_BLENDER_SCRIPT`, stdout transport,
-Flatpak-aware) or assimp. `_finish_model_numpy` builds float32/int32 arrays, fixes winding by
+Flatpak-aware), assimp, Maya (`mayapy`, `_MAYA_SCRIPT`, binary triangle dump) or Houdini.
+Houdini caches (`houdini_kind`: `.bgeo*`, `.geo*`, `.vdb`) go through `load_houdini_cache`. VDBs first try
+`load_vdb_native`, a built-in reader for float grids (`read_vdb_grids` → `_vdb_transform` →
+`_VdbFloatTree`: root → 32³ → 16³ → 8³ leaf topology, then leaf buffers vectorised with numpy; zip, blosc
+with a ctypes/python-blosc or pure-Python LZ4/BloscLZ decoder, active-value masks, half floats). Dense
+volumes are averaged into 2ⁿ³ cells down to ~1.5M samples. Otherwise: hython
+runs `_HOU_SCRIPT` (File SOP → Unpack; polygons saved as OBJ, particles + `Cd` and sampled VDB /
+native volume voxels saved as `.npz`; level sets become surface points), then gconvert, then for
+VDBs the OpenVDB Python module or Blender's volume-to-mesh. `_finish_cache_numpy` puts mesh,
+points and voxels in one unit box; `render_cache` draws them: mesh + point splats into a shared
+z-buffer (points shaded from screen-space depth slopes), then voxel densities in front of it are
+summed per pixel and composited as smoke. In OpenGL, `GLScene` draws the same thing on the GPU: mesh,
+particles as sphere-shaded sprites, and volumes in two offscreen passes — opaque scene into an RGBA8
+texture + depth, each voxel splatted as its exact pixel footprint (box filter) into an R32F/R16F texture
+with additive blending, depth-tested against the opaque scene — then one full-screen pass applies the
+same `1 − exp(−k·Σdensity)` smoke curve. Exposure is measured once per model (read back from the
+first frame) so orbiting and sequence playback don't pump. `GLScene` has no GTK dependency.
+Two or more selected caches show a *Preview as sequence* button; pressing it starts the sequence
+player (`MainWindow._load_model_sequence`) for that selection: frames
+decode in `seq_pool()` worker processes, all with the first frame's `norm` (box, density scale,
+coarsening step), within a memory budget window ahead of the playhead. `_finish_model_numpy` builds float32/int32 arrays, fixes winding by
 signed volume, computes smooth vertex normals and, above the face cap (500k default, "All
 triangles" overrides), decimates by vertex clustering. Software rendering runs in `RenderWorker`
 (z-buffer, Gouraud, sub-pixel splat lane). `GLModelView` negotiates a context across GL/GLES
 versions (`gl_try_contexts`) and renders white-shaded.
+
+## Scene breakdowns (`p3e.py`)
+
+`scene_breakdown(path)` runs in the `run_heavy` worker and returns `{kind, info, tree, notes}`; tree nodes are
+`[label, detail, children, path, exists]`, shown by the side pane's `breakdown` page (a filtered `TreeStore`).
+Every reader works from the file alone:
+
+- **Unreal**: package summary for legacy versions −2 … −9 (UE 4.0 – 5.6); the generations table is found by its
+  content (last entry = export/name counts) so the saved-by engine version reads even when newer versions add
+  summary fields. Levels: exports whose outer is `PersistentLevel`; labels/folders by scanning the export's
+  tagged properties for `ActorLabel` / `FolderPath`.
+- **Unity**: documents split on `--- !u!<class> &<id>`; flow mappings that wrap are re-joined; the hierarchy is
+  rebuilt from Transform `m_Father`/`m_Children`, `SceneRoots`, and PrefabInstance `m_TransformParent`.
+- **Maya**: ASCII by MEL statement (`createNode`, `setAttr … -type "string"`, `file -r`, `requires`, `fileInfo`);
+  binary by IFF chunk (`CREA` name/parent, `STR ` attributes, `FINF`, `PLUG`). Path attributes per node type
+  (`_MAYA_PATH_ATTRS`) plus any string ending in a known file extension.
+- **Blender**: block headers (old 20/24-byte and 5.x 32-byte), struct offsets from the file's own SDNA, so
+  `Object.parent`, `Scene.r.engine`, `Image.filepath` etc. are found by name in every version.
+
+Breakdowns may also carry `images` (`[(label, RawImage)]`: Blender `TEST` thumbnail, Unreal package thumbnail)
+and `materials` (dicts in `MATERIAL_DEFAULTS` form). Material rows have the path `material:<i>`; the page keeps
+that in a hidden column and renders `material_ball_for(materials[i])` in the worker when the row is selected.
+
+## Shader, material and IES previews (`p3f.py`)
+
+`shader_preview(path)` returns the breakdown shape plus `code` (`(text, language)`) and `glsl` (`{source,
+style}`) and is shown on the same `breakdown` page: a picture on top (ball / light pattern / `GLSLView`), the tree
+or the code view below. Every reader reduces a material to one dict (linear base colour, metallic, roughness,
+specular, coat, emission, opacity, transmission, texture paths); `render_material_ball` shades a sphere with GGX
+specular under a procedural studio environment, ACES-tonemapped, 2× supersampled.
+
+Live GLSL wraps the user's code: Shadertoy sources get the `iTime` / `iResolution` / `iMouse` / `iChannel0-3`
+uniforms and a `main()` that calls `mainImage`; glslsandbox sources get `gl_FragColor` mapped to an output. A
+`#line` directive (0 for GLSL < 3.30, 1 otherwise) keeps compile errors on the user's line numbers. The view
+animates through a tick callback only while mapped and while the window is active.
 
 ## Encrypted index (`p1d.py`)
 

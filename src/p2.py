@@ -43,17 +43,204 @@ def ask_text(parent, title: str, label: str, value: str = "", select_stem: bool 
     return txt if r == Gtk.ResponseType.OK else None
 
 
-def pick_folder(parent, title: str, start: str) -> Optional[str]:
-    d = Gtk.FileChooserDialog(title=title, transient_for=parent, action=Gtk.FileChooserAction.SELECT_FOLDER)
-    d.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_Select", Gtk.ResponseType.OK)
-    d.set_default_response(Gtk.ResponseType.OK)
-    if start and os.path.isdir(start):
-        d.set_current_folder(start)
-    d.set_create_folders(True)
-    r = d.run()
-    p = d.get_filename()
-    d.destroy()
-    return p if r == Gtk.ResponseType.OK else None
+class FolderPicker(Gtk.Dialog):
+    """Kestrel's own "Browse for folder" (like Explorer's): a folder tree rooted at Quick access, Home, the
+    user folders and every drive, with a path field. Used instead of GTK's file chooser, which on GNOME is
+    the Nautilus-style chooser (or the Nautilus portal). Subfolders are listed in a thread when a branch is
+    opened, so a slow network share never freezes the dialog."""
+    DUMMY = "\u2026"
+
+    def __init__(self, parent, title: str, start: str, ok_label: str = "_Select"):
+        super().__init__(title=title, transient_for=parent, modal=True)
+        self.set_default_size(480, 560)
+        self.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_New folder", 1, ok_label, Gtk.ResponseType.OK)
+        self.set_default_response(Gtk.ResponseType.OK)
+        cfg = getattr(parent, "cfg", None) or load_config()
+        self.show_hidden = bool(cfg.get("show_hidden"))
+        box = self.get_content_area()
+        box.set_spacing(6)
+        box.set_border_width(10)
+        self.entry = Gtk.Entry(text=start or HOME, activates_default=True)
+        self.entry.set_tooltip_text("Type or paste a path, or pick a folder below")
+        box.pack_start(self.entry, False, False, 0)
+        self.store = Gtk.TreeStore(str, str, str, bool)          # label, path, icon name, loaded
+        self.tv = Gtk.TreeView(model=self.store, headers_visible=False, enable_search=True, search_column=0)
+        col = Gtk.TreeViewColumn()
+        ri = Gtk.CellRendererPixbuf()
+        rt = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+        col.pack_start(ri, False)
+        col.pack_start(rt, True)
+        col.add_attribute(ri, "icon-name", 2)
+        col.add_attribute(rt, "text", 0)
+        self.tv.append_column(col)
+        sw = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        sw.set_shadow_type(Gtk.ShadowType.IN)
+        sw.add(self.tv)
+        box.pack_start(sw, True, True, 0)
+        self.tv.connect("row-expanded", self._expanded)
+        self.tv.connect("row-activated", lambda tv, path, c: tv.collapse_row(path) if tv.row_expanded(path) else tv.expand_row(path, False))
+        self.tv.get_selection().connect("changed", self._selected)
+        self._reveal_target: Optional[str] = None
+        self._roots()
+        self.show_all()
+        if start and os.path.isdir(start):
+            self._reveal(os.path.abspath(start))
+
+    # ---- tree
+    def _add(self, parent_it, label: str, path: str, icon: str):
+        it = self.store.append(parent_it, [label, path, icon, False])
+        self.store.append(it, [self.DUMMY, "", "", True])        # expander until the real children load
+        return it
+
+    def _roots(self):
+        cfg = load_config()
+        for p in cfg.get("pinned", [])[:12]:
+            if PATHS.isdir(p):                                       # cached, never blocks on a dead share
+                self._add(None, os.path.basename(p.rstrip("/")) or p, p, "folder")
+        self._add(None, os.path.basename(HOME) or "Home", HOME, "user-home")
+        for label, p, icon in xdg_user_dirs():
+            self._add(None, label, p, icon)
+        try:
+            for label, p, _icon, kind in drives():
+                self._add(None, label, p, {"network": "network-server", "removable": "drive-removable-media"}.get(kind, "drive-harddisk"))
+        except Exception:
+            self._add(None, "Local Disk (/)", "/", "drive-harddisk")
+
+    def _expanded(self, tv, it, path):
+        if self.store[it][3]:
+            return
+        self.store[it][3] = True
+        folder = self.store[it][1]
+        ref = Gtk.TreeRowReference.new(self.store, path)
+        show_hidden = self.show_hidden
+
+        def work():
+            subs = []
+            try:
+                with os.scandir(folder) as sd:
+                    for d in sd:
+                        try:
+                            if d.is_dir() and (show_hidden or not d.name.startswith(".")):
+                                subs.append(d.name)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+            subs.sort(key=lambda n: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", n)])
+            GLib.idle_add(done, subs)
+
+        def done(subs):
+            if not ref.valid():
+                return False
+            pit = self.store.get_iter(ref.get_path())
+            child = self.store.iter_children(pit)
+            while child is not None:                            # drop the placeholder
+                nxt = self.store.iter_next(child)
+                if self.store[child][1] == "":
+                    self.store.remove(child)
+                child = nxt
+            for n in subs:
+                self._add(pit, n, os.path.join(folder, n), "folder")
+            self._continue_reveal(pit)
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _selected(self, sel):
+        model, it = sel.get_selected()
+        if it is not None and model[it][1]:
+            self.entry.set_text(model[it][1])
+
+    # ---- open the tree down to a path (one level per async listing)
+    def _reveal(self, target: str):
+        best, best_len = None, -1
+        it = self.store.get_iter_first()
+        while it is not None:
+            p = self.store[it][1]
+            if p and (target == p or target.startswith(p.rstrip("/") + "/")) and len(p) > best_len:
+                best, best_len = it, len(p)
+            it = self.store.iter_next(it)
+        if best is None:
+            return
+        self._reveal_target = target
+        self._step_into(best)
+
+    def _step_into(self, it):
+        path = self.store.get_path(it)
+        if self.store[it][1] == self._reveal_target:
+            self.tv.expand_to_path(path)
+            self.tv.get_selection().select_path(path)
+            self.tv.scroll_to_cell(path, None, True, 0.3, 0)
+            self._reveal_target = None
+            return
+        if self.store[it][3]:
+            self._continue_reveal(it)
+        else:
+            self.tv.expand_row(path, False)                      # lists children; done() continues
+
+    def _continue_reveal(self, pit):
+        t = self._reveal_target
+        if not t:
+            return
+        child = self.store.iter_children(pit)
+        while child is not None:
+            p = self.store[child][1]
+            if p and (t == p or t.startswith(p + "/")):
+                self.tv.expand_row(self.store.get_path(pit), False)
+                self._step_into(child)
+                return
+            child = self.store.iter_next(child)
+        self._reveal_target = None
+
+    # ---- run
+    def choose(self) -> Optional[str]:
+        while True:
+            r = self.run()
+            path = os.path.abspath(os.path.expanduser(self.entry.get_text().strip())) if self.entry.get_text().strip() else ""
+            if r == 1:                                           # New folder inside the current one
+                base = path if os.path.isdir(path) else HOME
+                name = ask_text(self, "New folder", f"New folder in {base}:", "New folder")
+                if name and "/" not in name:
+                    target = unique_name(os.path.join(base, name))
+                    try:
+                        os.makedirs(target)
+                        self.entry.set_text(target)
+                        self._reload_and_reveal(target)
+                    except OSError as ex:
+                        message(self, "New folder", str(ex), Gtk.MessageType.ERROR)
+                continue
+            if r == Gtk.ResponseType.OK:
+                if path and os.path.isdir(path):
+                    self.destroy()
+                    return path
+                message(self, "Folder not found", path or "No folder chosen.", Gtk.MessageType.WARNING)
+                continue
+            self.destroy()
+            return None
+
+    def _reload_and_reveal(self, target: str):
+        """A folder was created: forget the loaded children of its parent so the next listing shows it."""
+        parent_dir = os.path.dirname(target)
+
+        def walk(it):
+            while it is not None:
+                if self.store[it][1] == parent_dir and self.store[it][3]:
+                    child = self.store.iter_children(it)
+                    while child is not None:
+                        nxt = self.store.iter_next(child)
+                        self.store.remove(child)
+                        child = nxt
+                    self.store[it][3] = False
+                    self.store.append(it, [self.DUMMY, "", "", True])
+                    self.tv.collapse_row(self.store.get_path(it))
+                walk(self.store.iter_children(it))
+                it = self.store.iter_next(it)
+        walk(self.store.get_iter_first())
+        self._reveal(target)
+
+
+def pick_folder(parent, title: str, start: str, ok_label: str = "_Select") -> Optional[str]:
+    """Folder chooser used everywhere in Kestrel (Move to / Copy to, index roots, batch-rename repath)."""
+    return FolderPicker(parent, title, start, ok_label).choose()
 
 
 def conflict_dialog(parent, src: str, dst: str) -> Tuple[Optional[str], bool]:
@@ -606,13 +793,9 @@ class OptionsDialog(Gtk.Dialog):
             pass
 
     def _root_add(self):
-        d = Gtk.FileChooserDialog(title="Folder to index", transient_for=self, action=Gtk.FileChooserAction.SELECT_FOLDER)
-        d.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_Add", Gtk.ResponseType.OK)
-        if d.run() == Gtk.ResponseType.OK and d.get_filename():
-            p = d.get_filename()
-            if p not in [r[0] for r in self.roots_store]:
-                self.roots_store.append([p])
-        d.destroy()
+        p = pick_folder(self, "Folder to index", HOME, "_Add")
+        if p and p not in [r[0] for r in self.roots_store]:
+            self.roots_store.append([p])
 
     def _root_remove(self, tv):
         model, it = tv.get_selection().get_selected()

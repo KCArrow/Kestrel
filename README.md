@@ -5,7 +5,7 @@
 A fast, Windows-Explorer-style file manager for the Linux desktop, built for Rocky Linux 9
 and VFX/animation workstations.
 
-Single-file GTK 3 application (`kestrel.py`, ~13k lines), **no pip dependencies**: it needs only
+Single-file GTK 3 application (`kestrel.py`, ~21k lines), **no pip dependencies**: it needs only
 `python3`, `python3-gobject` and `gtk3`, which every GNOME install already has. Everything else
 (video, 3D formats, EXR tools, archives, OpenRV…) is optional and detected at runtime.
 
@@ -65,7 +65,8 @@ rows so 100k-file folders scroll like 100-file ones.
 speed, remaining, pause, cancel) and Replace / Skip / Keep-both conflicts. Clipboard and
 drag-and-drop interoperate with Nautilus and other GTK apps. Undo (Ctrl+Z). Real freedesktop
 Recycle Bin. Folders auto-refresh when changed on disk. Batch rename (Ctrl+F2) with patterns,
-numbering and regex. SHA-256 to clipboard. Run scripts in a terminal.
+numbering, regex, frame-number offsets (`shot.1001.exr` +60 → `shot.1061.exr`, padding kept) and
+repathing (move the renamed files into another folder, e.g. `../v005` or `/mnt/show/{parent}`). SHA-256 to clipboard. Run scripts in a terminal.
 
 **Archives.** Zip / tar.gz / tar.xz / tar natively; `.7z`, `.rar`, `.cab`, `.iso` and more through
 7-Zip when installed. Double-clicking an archive extracts it (configurable); Extract here / Extract
@@ -75,9 +76,29 @@ to…; progress with pause.
 **Maya IFF**, **Photoshop PSD/PSB**), text with syntax highlighting and an inline quick editor,
 PDF, folder contents with sizes, archive listings, media info, **video and audio playback**
 (GStreamer), and a **3D model previewer** for OBJ, STL, PLY, FBX, glTF, Alembic (`.abc`, both Ogawa
-and legacy HDF5), USD and `.blend` — software rasteriser (multi-process, 5 M-triangle meshes in
-under a second) or OpenGL. Smooth shading, orbit/zoom, wireframe, "all triangles" override. Every
-preview switch crossfades in ⅛ s; preview and details panes are resizable and remembered.
+and legacy HDF5), USD and `.blend` — software rasteriser (multi-process, 5 M-triangle meshes in under a
+second) or OpenGL. Smooth shading, orbit/zoom, wireframe, "all triangles" override. Every preview switch
+crossfades in ⅛ s; preview and details panes are resizable and remembered.
+
+**Houdini caches and VDBs.** `.bgeo` / `.bgeo.sc` / `.geo` meshes and particles (coloured by `Cd`, via
+Houdini) and `.vdb` volumes rendered as **smoke** (level sets as surfaces). VDBs are read by Kestrel itself —
+Houdini, EmberGen and Blender files, blosc/zip, half-float — so no Houdini is needed; with OpenGL, particles
+and smoke are drawn on the GPU. Select the frames of a cache and press **Preview as sequence** for a time
+slider with playback (Space, ← →, adjustable fps; pauses when the window loses focus).
+
+**Scene breakdowns.** See what's in a scene before you open it: Unreal (`.umap`, `.uasset`, `.uproject`),
+Unity (`.unity`, `.prefab`, `.unitypackage`), Maya (`.ma`, `.mb`) and Blender (`.blend`) show an outliner,
+actors / components / materials, render settings and **every referenced file with its full path, flagged
+when it's missing** — read directly from the file, no Unreal, Unity, Maya or Blender needed. Filter, copy as
+text, double-click a reference to jump to it. Blender and Unreal files show their saved thumbnail, and
+picking a material in a Maya or Blender breakdown renders it on a material ball.
+
+**Shaders, materials and lights.** MaterialX (`.mtlx`), OSL (`.osl`, `.oso`), Unity materials (`.mat`),
+ShaderLab (`.shader`) and Shader Graph show their inputs and textures on a **material ball** (GGX, clearcoat,
+normal maps, transmission, UDIM textures). GLSL fragment shaders — Shadertoy and glslsandbox / Book of
+Shaders style — **run live** on the GPU, with compile errors on the right line; GLSL / HLSL sources get a
+breakdown (uniforms, inputs, functions, includes) and a highlighted **Code** view. **IES light profiles**
+show the light pattern on a wall and a polar candela diagram with beam / field angles, lumens and wattage.
 
 **Removable drives.** Live detection (no restart), USB badge on removable media, Eject and Format
 (UDisks2, no root prompt in the app), physical-disk grouping on This PC so you can see which
@@ -174,8 +195,11 @@ script for whatever is missing.
 | Fast 3D / EXR | numpy | `python3-numpy` |
 | FBX, glTF, DAE, PLY… | Blender (any install incl. Flatpak `org.blender.Blender`) or `assimp` | `flatpak install org.blender.Blender` / `assimp` |
 | Alembic `.abc` (Ogawa), USD, `.blend` | Blender | as above; `pip install usd-core` also works for USD |
+| FBX / Alembic / USD without Blender | Maya (`mayapy`) | found under `/usr/autodesk/maya*` or `$MAYA_LOCATION` |
+| Houdini caches: `.bgeo` `.bgeo.sc` `.geo` | Houdini (`hython`, else `gconvert`) | found under `/opt/hfs*` or `$HFS` |
+| `.vdb` volumes | built in (needs numpy) | `python3-blosc` or Houdini make blosc-compressed VDBs decode faster |
 | Alembic `.abc` (legacy HDF5) | h5py | `python3-h5py` |
-| OpenGL preview | PyOpenGL | `python3-pyopengl` |
+| OpenGL preview, live GLSL shaders | PyOpenGL | `python3-pyopengl` |
 | EXR/DPX/TX conversions | OpenImageIO `oiiotool`, ImageMagick | `OpenImageIO-utils ImageMagick` |
 | Thumbnails for movies, extra image formats | `ffmpeg` | RPM Fusion |
 | PDF preview | `pdftoppm` | `poppler-utils` |
@@ -213,6 +237,7 @@ Press **F1** in the app for the full list.
 | Alt+Enter | properties |
 | Ctrl+O | open with… |
 | Ctrl+Shift+R | open in RV (when enabled) |
+| Space, ← → (3D preview) | play / pause, step a cache sequence |
 | F5, F11, Ctrl+Q | refresh, full screen, quit |
 
 ---
@@ -232,6 +257,7 @@ kestrel --nav-bench folder         open every subfolder, report listing/paint ti
 kestrel --profile                  run normally with cProfile on the UI thread (Tools → Performance report)
 kestrel --probe-gl [--no-save]     test OpenGL context creation under each GDK backend
 kestrel --probe-model file         run the 3D import chain on one file and report
+kestrel --dcc-test [files…]        generate test caches with Houdini / Maya and read them back through every route
 ```
 
 ---

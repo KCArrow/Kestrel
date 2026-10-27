@@ -353,6 +353,10 @@ def preview_tool_report() -> str:
     bl = _find_blender()
     L.append(f"  blender    {bl[0] if bl else '—'}")
     L.append(f"  assimp     {shutil.which('assimp') or '—'}")
+    hou = _find_houdini()
+    L.append(f"  hython     {hou['hython'] or '—'}" + (f"   (Houdini {hou['version']})" if hou["version"] else ""))
+    L.append(f"  gconvert   {hou['gconvert'] or '—'}")
+    L.append(f"  mayapy     {_find_mayapy() or '—'}")
     usd = shutil.which("usdcat")
     L.append(f"  USD        {usd or ('pxr (Python module)' if _has_py_module('pxr') else '—')}")
     L.append(f"  7-Zip      {sevenzip() or '—'}")
@@ -445,6 +449,22 @@ try:
         res = (first("wm.obj_import") or bpy.ops.import_scene.obj)(filepath=path)
     elif ext == "x3d":
         res = bpy.ops.import_scene.x3d(filepath=path)
+    elif ext == "vdb":
+        # OpenVDB volume: Blender imports it as a Volume object; a Volume-to-Mesh modifier turns the main grid
+        # into a surface (iso 0 for level sets, a low density threshold for fog) that the mesh export below handles
+        res = bpy.ops.object.volume_import(filepath=path)
+        for vo in [o for o in bpy.data.objects if o.type == "VOLUME"]:
+            vo.data.grids.load()
+            names = [g.name for g in vo.data.grids]
+            grid = next((n for n in ("density", "surface", "sdf") if n in names), names[0] if names else "density")
+            me = bpy.data.meshes.new("kestrel_v2m")
+            mo = bpy.data.objects.new("kestrel_v2m", me)
+            bpy.context.scene.collection.objects.link(mo)
+            md = mo.modifiers.new("v2m", "VOLUME_TO_MESH")
+            md.object = vo
+            md.grid_name = grid
+            md.threshold = 0.0 if grid in ("surface", "sdf") else 0.1
+            print("KESTREL vdb grid:", grid, names)
     else:
         res = "unsupported"
     print("KESTREL import:", res)
@@ -461,7 +481,7 @@ try:
         mw = ob.matrix_world
         for v in me.vertices:
             co = mw @ v.co
-            out.append("v %r %r %r" % (co.x, co.y, co.z))
+            out.append("v %r %r %r" % (co.x, co.z, -co.y))      # Blender Z-up -> Y-up (Maya/Houdini/OBJ convention)
         for pg in me.polygons:
             out.append("f " + " ".join(str(i + base + 1) for i in pg.vertices))
         base += len(me.vertices)
@@ -679,6 +699,15 @@ def optional_deps() -> List[dict]:
              cmd="sudo dnf install -y https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-9.noarch.rpm && sudo dnf install -y gstreamer1-plugins-ugly gstreamer1-libav"),
         dict(key="rv", name="OpenRV", gives="Open in RV (right-click, Ctrl+Shift+R)",
              found=find_rv(load_config().get("rv_path", "")), cmd="echo 'Download OpenRV from https://github.com/AcademySoftwareFoundation/OpenRV/releases and unpack it under /opt or ~/, then set the path in Preferences → Optional'"),
+        dict(key="houdini", name="Houdini (hython / gconvert)", gives=".bgeo / .bgeo.sc / .geo and .vdb previews: meshes, particles, volumes; also reads Alembic",
+             found=(_find_houdini()["hython"] or _find_houdini()["gconvert"]),
+             cmd="echo 'Install Houdini from https://www.sidefx.com/download/ (it installs under /opt/hfs*; Kestrel finds it there or via $HFS)'"),
+        dict(key="maya", name="Maya (mayapy)", gives="FBX, Alembic and USD previews when Blender isn't available",
+             found=_find_mayapy(),
+             cmd="echo 'Maya is installed by your studio / Autodesk installer under /usr/autodesk/maya*; Kestrel finds mayapy there or via $MAYA_LOCATION'"),
+        dict(key="openvdb", name="OpenVDB (Python)", gives=".vdb volume previews without Houdini",
+             found="importable" if (_has_py_module("pyopenvdb") or _has_py_module("openvdb")) else None,
+             cmd="sudo dnf install -y python3-openvdb || echo 'python3-openvdb is not packaged for this release; Houdini or Blender also preview VDBs'"),
         dict(key="7z", name="7-Zip (p7zip)", gives=".7z, .rar, .cab, .iso archives: preview, extract and create",
              found=sevenzip(), cmd="sudo dnf install -y p7zip p7zip-plugins"),
         dict(key="xdotool", name="xdotool", gives="fm-bench.py benchmark script only",
@@ -710,4 +739,1013 @@ def describe_alembic(path: str) -> Optional[str]:
                     return r.stdout[:20000]
             except (OSError, subprocess.TimeoutExpired):
                 pass
+    return None
+
+
+# --------------------------------------------------------------------------- Houdini caches (.bgeo / .geo / .vdb) and the Maya bridge
+# Houdini geometry and VDB volumes are read through Houdini itself when it is installed (hython, then gconvert):
+# that is the only reader that handles every variant (blosc-compressed .bgeo.sc, packed primitives, every VDB
+# compression). Without Houdini: VDBs go through the optional `pyopenvdb` module or Blender (volume → mesh).
+# Maya (mayapy) is a fallback for the formats Blender normally imports, for studios that don't deploy Blender.
+
+HOUDINI_GEO_EXTS = (".bgeo.sc", ".geo.sc", ".bgeo.gz", ".geo.gz", ".bgeo.lzma", ".bgeo.bz2", ".bgeo", ".geo",
+                    ".bhclassic", ".hclassic", ".bpoly", ".poly")
+
+
+def houdini_kind(name: str) -> str:
+    """'geo' for Houdini geometry files, 'vdb' for OpenVDB, '' otherwise (handles compound extensions)."""
+    low = name.lower()
+    if low.endswith(".vdb"):
+        return "vdb"
+    return "geo" if low.endswith(HOUDINI_GEO_EXTS) else ""
+
+
+_HOUDINI_CACHE: Optional[dict] = None
+
+
+def _find_houdini() -> dict:
+    """{'hython': path|None, 'gconvert': path|None, 'version': str} — PATH, $HFS, then the newest /opt/hfs*."""
+    global _HOUDINI_CACHE
+    if _HOUDINI_CACHE is not None:
+        return _HOUDINI_CACHE
+    dirs = []
+    if os.environ.get("HFS"):
+        dirs.append(os.path.join(os.environ["HFS"], "bin"))
+
+    def ver_key(p):
+        m = re.search(r"hfs(\d+)\.(\d+)(?:\.(\d+))?", p)
+        return tuple(int(x or 0) for x in m.groups()) if m else (0,)
+    dirs += [os.path.join(d, "bin") for d in sorted(glob.glob("/opt/hfs*") + glob.glob(os.path.expanduser("~/hfs*")) +
+                                                     glob.glob("/opt/sidefx/hfs*"), key=ver_key, reverse=True)]
+    found = {"hython": shutil.which("hython"), "gconvert": shutil.which("gconvert"), "version": ""}
+    for d in dirs:
+        for tool in ("hython", "gconvert"):
+            p = os.path.join(d, tool)
+            if not found[tool] and os.access(p, os.X_OK):
+                found[tool] = p
+    src = found["hython"] or found["gconvert"] or ""
+    m = re.search(r"hfs(\d+\.\d+(?:\.\d+)?)", src)
+    found["version"] = m.group(1) if m else ""
+    _HOUDINI_CACHE = found
+    return found
+
+
+_HOU_SCRIPT = r'''
+import sys, json, math, traceback
+try:
+    import numpy as np
+    import hou
+    path, out, objout, maxpts, maxvox = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+    info = [["Houdini", hou.applicationVersionString()]]
+    node = hou.node("/obj").createNode("geo", "kestrel_preview")
+    for c in node.children():
+        c.destroy()
+    fsop = node.createNode("file")
+    fsop.parm("file").set(path)
+    unp = node.createNode("unpack")
+    unp.setFirstInput(fsop)
+    g = unp.geometry()
+    if fsop.errors():
+        raise RuntimeError("; ".join(fsop.errors()))
+    npts = int(g.intrinsicValue("pointcount"))
+    nprims = int(g.intrinsicValue("primitivecount"))
+    npoly = g.countPrimType(hou.primType.Polygon)
+    nvdb = g.countPrimType(hou.primType.VDB)
+    nvol = g.countPrimType(hou.primType.Volume)
+    info += [["Points", "{:,}".format(npts)], ["Primitives", "{:,}".format(nprims)]]
+    attrs = [a.name() for a in g.pointAttribs()][:14]
+    if attrs:
+        info.append(["Point attributes", ", ".join(attrs)])
+    arrays = {}
+    if npoly:
+        if npoly == nprims:
+            g.saveToFile(objout)
+        else:
+            gp = hou.Geometry()
+            gp.merge(g)
+            gp.deletePrims([p for p in gp.prims() if p.type() != hou.primType.Polygon])
+            gp.saveToFile(objout)
+        arrays["has_obj"] = np.array([1])
+    elif npts and not (nvdb or nvol):
+        P = np.frombuffer(g.pointFloatAttribValuesAsString("P"), dtype=np.float32).reshape(-1, 3)
+        step = max(1, int(math.ceil(len(P) / float(maxpts))))
+        arrays["P"] = P[::step]
+        if g.findPointAttrib("Cd") is not None:
+            cd = np.frombuffer(g.pointFloatAttribValuesAsString("Cd"), dtype=np.float32)
+            if cd.size == len(P) * 3:
+                arrays["Cd"] = cd.reshape(-1, 3)[::step]
+        if step > 1:
+            info.append(["Shown", "every {}th point".format(step)])
+    vols = []
+    vP, vD, vS, sP, sS = [], [], [], [], []
+    if nvdb or nvol:
+        per = max(20000, maxvox // max(1, nvdb + nvol))
+        namea = g.findPrimAttrib("name")
+        for i, prim in enumerate(g.iterPrims()):
+            if i > 200000:
+                break
+            t = prim.type()
+            if t not in (hou.primType.VDB, hou.primType.Volume):
+                continue
+            name = prim.attribValue("name") if namea is not None else "volume"
+            o = np.array(prim.indexToPos((0, 0, 0)))
+            ex = np.array(prim.indexToPos((1, 0, 0))) - o
+            ey = np.array(prim.indexToPos((0, 1, 0))) - o
+            ez = np.array(prim.indexToPos((0, 0, 1))) - o
+            vs = float(np.linalg.norm(ex))
+            idx, val, sdf, desc = [], [], False, ""
+            if t == hou.primType.VDB:
+                sdf = bool(prim.isSDF())
+                bb = prim.activeVoxelBoundingBox()
+                mn, mx = bb.minvec(), bb.maxvec()
+                x0, y0, z0 = int(mn[0]), int(mn[1]), int(mn[2])
+                x1, y1, z1 = int(mx[0]), int(mx[1]), int(mx[2])
+                nx, ny, nz = x1 - x0 + 1, y1 - y0 + 1, z1 - z0 + 1
+                act = int(prim.activeVoxelCount())
+                desc = "{} VDB{}, {:,} active voxels, voxel {:.3g}".format(name, " (SDF)" if sdf else "", act, vs)
+                if nx > 0 and ny > 0 and nz > 0:
+                    step = max(1, int(math.ceil((nx * ny * nz / float(per)) ** (1 / 3.0))))
+                    order = None
+                    for z in range(z0, z1 + 1, step):
+                        arr = np.array(prim.voxelRangeAsTuple(hou.BoundingBox(x0, y0, z, x1, y1, z)), dtype=np.float32)
+                        if arr.size != nx * ny:
+                            continue
+                        if order is None and nx > 1 and ny > 1:
+                            a1, ay1 = prim.voxel((x0 + 1, y0, z)), prim.voxel((x0, y0 + 1, z))
+                            if a1 != ay1:
+                                order = "x" if abs(arr[1] - a1) < 1e-9 else ("y" if abs(arr[1] - ay1) < 1e-9 else None)
+                        a = arr.reshape(ny, nx) if order != "y" else arr.reshape(nx, ny).T
+                        a = a[::step, ::step]
+                        m = (np.abs(a) < vs * step * 0.9) if sdf else (a > 1e-4)
+                        ys, xs = np.nonzero(m)
+                        if len(xs):
+                            idx.append(np.stack([x0 + xs * step, y0 + ys * step, np.full(len(xs), z)], 1))
+                            val.append(np.ones(len(xs), np.float32) if sdf else a[m])
+                    vs *= step
+            else:
+                rx, ry, rz = prim.resolution()
+                desc = "{} volume {}×{}×{}".format(name, rx, ry, rz)
+                if rx * ry * rz <= 96 * 1024 * 1024:
+                    a = np.array(prim.allVoxels(), dtype=np.float32).reshape(rz, ry, rx)
+                    step = max(1, int(math.ceil((rx * ry * rz / float(per)) ** (1 / 3.0))))
+                    a = a[::step, ::step, ::step]
+                    m = a > 1e-4
+                    zs, ys, xs = np.nonzero(m)
+                    if len(xs):
+                        idx.append(np.stack([xs * step, ys * step, zs * step], 1))
+                        val.append(a[m])
+                    vs *= step
+            vols.append(desc)
+            if idx:
+                I = np.concatenate(idx).astype(np.float64)
+                V = np.concatenate(val).astype(np.float32)
+                if not sdf and len(V):
+                    keep = V > V.max() * 0.01
+                    I, V = I[keep], V[keep]
+                W = o + I[:, :1] * ex + I[:, 1:2] * ey + I[:, 2:3] * ez
+                if sdf:
+                    sP.append(W.astype(np.float32))       # level set: its narrow band is drawn as a surface
+                    sS.append(vs)
+                else:
+                    vP.append(W.astype(np.float32))
+                    vD.append(V)
+                    vS.append(vs)
+    if sP:
+        S = np.concatenate(sP)
+        if len(S) > maxpts:
+            S = S[np.random.default_rng(0).choice(len(S), maxpts, replace=False)]
+        arrays["P"] = np.concatenate([arrays["P"], S]) if "P" in arrays else S
+        arrays["pS"] = np.array([max(sS)], np.float32)
+        arrays.pop("Cd", None)
+    if vols:
+        info.append(["Volumes", " | ".join(vols[:6]) + (" …" if len(vols) > 6 else "")])
+    if vP:
+        P = np.concatenate(vP)
+        D = np.concatenate(vD)
+        if len(P) > maxvox:
+            sel = np.random.default_rng(0).choice(len(P), maxvox, replace=False)
+            P, D = P[sel], D[sel]
+        arrays["vP"], arrays["vD"], arrays["vS"] = P, D, np.array([max(vS)], np.float32)
+    arrays["info"] = np.array([json.dumps(info)])
+    np.savez(out, **arrays)
+    print("KESTREL-OK")
+except Exception:
+    traceback.print_exc(file=sys.stdout)
+    print("KESTREL-FAIL")
+'''
+
+
+def load_via_houdini(path: str, max_points: int = 2_000_000, max_voxels: int = 1_500_000) -> Optional[dict]:
+    """hython: Houdini reads the file (any .bgeo/.geo variant, packed prims unpacked, VDB and native volumes) and
+    hands back polygons (as OBJ), particles and sampled volume voxels (as .npz). Needs numpy on our side."""
+    h = _find_houdini()
+    if not h["hython"]:
+        _vfx_err("Houdini: hython not found (PATH, $HFS or /opt/hfs*)")
+        return None
+    if np is None:
+        _vfx_err("Houdini caches need numpy (sudo dnf install python3-numpy)")
+        return None
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="kestrel-hou-")
+    script = os.path.join(tmp, "read.py")
+    out, objout = os.path.join(tmp, "out.npz"), os.path.join(tmp, "mesh.obj")
+    try:
+        with open(script, "w") as f:
+            f.write(_HOU_SCRIPT)
+        rc, so, se = _run_streaming([h["hython"], script, os.path.abspath(path), out, objout, str(max_points), str(max_voxels)],
+                                    timeout=200, verbose=BLENDER_VERBOSE)
+        if "KESTREL-OK" not in so or not os.path.exists(out):
+            tail = [l for l in so + se if l.strip() and ("rror" in l or "icense" in l or "timed out" in l)][-3:]
+            _vfx_err("Houdini (hython): " + (" | ".join(x[:200] for x in tail) or f"exit {rc}"))
+            return None
+        z = np.load(out, allow_pickle=False)
+        res = {k: z[k] for k in z.files}
+        res["info"] = [tuple(r) for r in json.loads(str(res["info"][0]))]
+        if "has_obj" in res and os.path.exists(objout):
+            with open(objout, "rb") as f:
+                res["V"], res["F"] = _read_obj_numpy(f.read())
+        res["source"] = "Houdini " + (h["version"] or "")
+        return res
+    except Exception as ex:
+        _vfx_err(f"Houdini: {ex}")
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def load_via_gconvert(path: str) -> Optional[dict]:
+    """Houdini's gconvert (no hython / no licence available): geometry → OBJ. Polygons and points only."""
+    h = _find_houdini()
+    if not h["gconvert"] or np is None:
+        return None
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="kestrel-gconv-")
+    out = os.path.join(tmp, "mesh.obj")
+    try:
+        rc, so, se = _run_streaming([h["gconvert"], os.path.abspath(path), out], timeout=120)
+        if not os.path.exists(out):
+            _vfx_err("gconvert: " + (" | ".join((so + se)[-2:]) or f"exit {rc}"))
+            return None
+        with open(out, "rb") as f:
+            V, F = _read_obj_numpy(f.read())
+        res = {"info": [("Points", f"{len(V):,}")], "source": "Houdini gconvert"}
+        if len(F):
+            res["V"], res["F"] = V, F
+        else:
+            res["P"] = V
+        return res
+    except Exception as ex:
+        _vfx_err(f"gconvert: {ex}")
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def load_vdb_openvdb(path: str, max_voxels: int = 1_500_000) -> Optional[dict]:
+    """Optional `pyopenvdb` / `openvdb` Python module: sample the first fog/SDF float grid."""
+    vdbmod = None
+    for name in ("pyopenvdb", "openvdb"):
+        try:
+            vdbmod = __import__(name)
+            break
+        except ImportError:
+            continue
+    if vdbmod is None or np is None:
+        return None
+    try:
+        grids, meta = vdbmod.readAll(path)
+        g = next((x for x in grids if "Float" in type(x).__name__ or "float" in getattr(x, "valueTypeName", "")), None)
+        if g is None:
+            _vfx_err("OpenVDB: no float grid")
+            return None
+        (i0, j0, k0), (i1, j1, k1) = g.evalActiveVoxelBoundingBox()
+        dims = (i1 - i0 + 1, j1 - j0 + 1, k1 - k0 + 1)
+        if dims[0] * dims[1] * dims[2] > 256 * 1024 * 1024:
+            _vfx_err("OpenVDB: grid too large for a dense preview")
+            return None
+        a = np.zeros(dims, dtype=np.float32)
+        g.copyToArray(a, ijk=(i0, j0, k0))
+        sdf = "LEVEL_SET" in str(getattr(g, "gridClass", "")).upper()
+        step = max(1, int(math.ceil((a.size / float(max_voxels)) ** (1 / 3.0))))
+        b = a[::step, ::step, ::step]
+        try:
+            vs = float(g.transform.voxelSize()[0])
+            org = np.array(g.transform.indexToWorld((0, 0, 0)), dtype=np.float64)
+        except Exception:
+            vs, org = 1.0, np.zeros(3)
+        m = (np.abs(b) < vs * step * 0.9) if sdf else (b > max(1e-4, float(b.max()) * 0.01))
+        ii, jj, kk = np.nonzero(m)
+        I = np.stack([i0 + ii * step, j0 + jj * step, k0 + kk * step], 1).astype(np.float64)
+        W = org + I * vs                      # axis-aligned transform assumed (the common case)
+        info = [("Volumes", f"{g.name or 'grid'} ({'SDF' if sdf else 'fog'}), {g.activeVoxelCount():,} active voxels")]
+        if sdf:
+            return {"P": W.astype(np.float32), "pS": np.array([vs * step], np.float32), "info": info, "source": "OpenVDB (Python)"}
+        D = b[m][:len(W)]
+        return {"vP": W.astype(np.float32), "vD": D.astype(np.float32), "vS": np.array([vs * step], np.float32),
+                "info": [("Volumes", f"{g.name or 'grid'} ({'SDF' if sdf else 'fog'}), {g.activeVoxelCount():,} active voxels")],
+                "source": "OpenVDB (Python)"}
+    except Exception as ex:
+        _vfx_err(f"OpenVDB: {ex}")
+        return None
+
+
+# ---- built-in OpenVDB reader: float grids (fog volumes and level sets) without Houdini or the OpenVDB library
+# Implements the parts of the .vdb format Houdini, EmberGen, Blender and Maya write for scalar grids: file
+# version 222+, Tree_float_5_4_3 (optionally _HalfFloat), zip / blosc / no compression, active-value
+# masks, linear transforms. Blosc is decoded by python-blosc or the C library when either is found
+# (Houdini ships one), otherwise by a small pure-Python LZ4 / BloscLZ decoder.
+
+VDB_MAX_VOXELS = 1_500_000
+
+
+def _lz4_block_decode(src: bytes, out_len: int) -> bytes:
+    """LZ4 block format (no frame)."""
+    dst = bytearray()
+    i, n = 0, len(src)
+    while i < n:
+        tok = src[i]
+        i += 1
+        lit = tok >> 4
+        if lit == 15:
+            while True:
+                b = src[i]
+                i += 1
+                lit += b
+                if b != 255:
+                    break
+        dst += src[i:i + lit]
+        i += lit
+        if i >= n:
+            break
+        off = src[i] | (src[i + 1] << 8)
+        i += 2
+        ml = tok & 15
+        if ml == 15:
+            while True:
+                b = src[i]
+                i += 1
+                ml += b
+                if b != 255:
+                    break
+        ml += 4
+        start = len(dst) - off
+        if off >= ml:
+            dst += dst[start:start + ml]
+        else:                                  # overlapping copy: repeat the period
+            chunk = dst[start:]
+            reps, rem = divmod(ml, off)
+            dst += chunk * reps + chunk[:rem]
+    if len(dst) != out_len:
+        raise ValueError(f"lz4: {len(dst)} bytes, expected {out_len}")
+    return bytes(dst)
+
+
+def _blosclz_decode(src: bytes, out_len: int) -> bytes:
+    """BloscLZ (FastLZ level 1 variant used by c-blosc 1.x)."""
+    dst = bytearray()
+    i, n = 0, len(src)
+    ctrl = src[i] & 31
+    i += 1
+    while True:
+        if ctrl >= 32:
+            ln = (ctrl >> 5) - 1
+            ofs = (ctrl & 31) << 8
+            if ln == 7 - 1:
+                while True:
+                    c = src[i]
+                    i += 1
+                    ln += c
+                    if c != 255:
+                        break
+            c = src[i]
+            i += 1
+            ln += 3
+            ofs += c
+            if c == 255 and ofs == (31 << 8) + 255:          # far distance
+                ofs = (src[i] << 8) + src[i + 1] + 8191
+                i += 2
+            start = len(dst) - ofs - 1
+            if ofs + 1 >= ln:
+                dst += dst[start:start + ln]
+            else:
+                chunk = dst[start:]
+                reps, rem = divmod(ln, ofs + 1)
+                dst += chunk * reps + chunk[:rem]
+        else:
+            ctrl += 1
+            dst += src[i:i + ctrl]
+            i += ctrl
+        if i >= n:
+            break
+        ctrl = src[i]
+        i += 1
+    if len(dst) != out_len:
+        raise ValueError(f"blosclz: {len(dst)} bytes, expected {out_len}")
+    return bytes(dst)
+
+
+_BLOSC_C = None
+_BLOSC_MODS = None
+_LZ4_C = None
+
+
+def _lz4_c():
+    """ctypes LZ4_decompress_safe from the system liblz4 (installed on practically every Linux: systemd needs
+    it), or False. ~50× faster than the pure-Python decoder."""
+    global _LZ4_C
+    if _LZ4_C is None:
+        _LZ4_C = False
+        import ctypes
+        import ctypes.util
+        for name in (ctypes.util.find_library("lz4"), "liblz4.so.1", "liblz4.so"):
+            if not name:
+                continue
+            try:
+                f = ctypes.CDLL(name).LZ4_decompress_safe
+                f.restype = ctypes.c_int
+                f.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+                _LZ4_C = (f, ctypes.create_string_buffer)
+                break
+            except (OSError, AttributeError):
+                continue
+    return _LZ4_C
+
+
+def _blosc_mods():
+    """(python-blosc module or None, lz4.block module or None), looked up once."""
+    global _BLOSC_MODS
+    if _BLOSC_MODS is None:
+        mods = []
+        for name in ("blosc", "lz4.block"):
+            try:
+                mods.append(__import__(name, fromlist=["x"]))
+            except Exception:
+                mods.append(None)
+        _BLOSC_MODS = tuple(mods)
+    return _BLOSC_MODS
+
+
+def _blosc_c():
+    """ctypes handle to a c-blosc library (system, Houdini's dsolib, Blender), or False."""
+    global _BLOSC_C
+    if _BLOSC_C is not None:
+        return _BLOSC_C
+    _BLOSC_C = False
+    import ctypes
+    import ctypes.util
+    cands = [ctypes.util.find_library("blosc")]
+    for pat in ("/opt/hfs*/dsolib/libblosc.so*", os.path.expandvars("$HFS/dsolib/libblosc.so*"),
+                "/usr/lib64/libblosc.so*", "/usr/local/lib*/libblosc.so*"):
+        cands += sorted(glob.glob(pat), reverse=True)
+    for c in cands:
+        if not c:
+            continue
+        try:
+            lib = ctypes.CDLL(c)
+            f = lib.blosc_decompress_ctx
+            f.restype = ctypes.c_int
+            f.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+            _BLOSC_C = (f, ctypes)
+            break
+        except (OSError, AttributeError):
+            continue
+    return _BLOSC_C
+
+
+def blosc_decompress(buf: bytes) -> bytes:
+    """Decode one Blosc-1 chunk (the format OpenVDB writes)."""
+    nbytes, blocksize, cbytes = struct.unpack_from("<III", buf, 4)
+    pyblosc, lz4b = _blosc_mods()
+    if pyblosc is not None:
+        return pyblosc.decompress(buf)
+    c = _blosc_c()
+    if c:
+        f, ctypes = c
+        out = ctypes.create_string_buffer(nbytes)
+        if f(buf, out, nbytes, 1) == nbytes:
+            return out.raw
+    flags, typesize = buf[2], buf[3]
+    if flags & 0x02:                                               # stored (memcpy) chunk
+        return bytes(buf[16:16 + nbytes])
+    lz4c = _lz4_c()
+    codec = flags >> 5
+    if flags & 0x04:
+        raise ValueError("blosc: bit-shuffle is not supported")
+    nblocks = (nbytes + blocksize - 1) // blocksize
+    bstarts = struct.unpack_from(f"<{nblocks}i", buf, 16)
+    out = bytearray()
+    for b in range(nblocks):
+        bsize = min(blocksize, nbytes - b * blocksize)
+        split = (not flags & 0x10) and typesize <= 16 and (bsize // typesize) >= 1 and (bsize % typesize == 0)
+        nsplits = typesize if split else 1
+        neblock = bsize // nsplits
+        pos = bstarts[b]
+        block = bytearray()
+        for _ in range(nsplits):
+            cb = struct.unpack_from("<i", buf, pos)[0]
+            pos += 4
+            if cb == 0:
+                block += bytes(neblock)
+            elif cb < 0:
+                block += bytes([(-cb) & 0xFF]) * neblock
+            elif cb == neblock:
+                block += buf[pos:pos + cb]
+            else:
+                data = bytes(buf[pos:pos + cb])
+                if codec == 1:
+                    if lz4b is not None:
+                        block += lz4b.decompress(data, uncompressed_size=neblock)
+                    elif lz4c:
+                        out_ = lz4c[1](neblock)
+                        if lz4c[0](data, out_, cb, neblock) != neblock:
+                            raise ValueError("lz4: corrupt block")
+                        block += out_.raw
+                    else:
+                        block += _lz4_block_decode(data, neblock)
+                elif codec == 0:
+                    block += _blosclz_decode(data, neblock)
+                elif codec == 3:
+                    block += zlib.decompress(data)
+                elif codec == 4:
+                    import zstandard
+                    block += zstandard.ZstdDecompressor().decompress(data, max_output_size=neblock)
+                else:
+                    raise ValueError(f"blosc: codec {codec} not supported")
+            pos += max(cb, 0)
+        if flags & 0x01 and typesize > 1:                          # undo byte shuffle
+            full = (bsize // typesize) * typesize
+            arr = np.frombuffer(bytes(block[:full]), dtype=np.uint8).reshape(typesize, -1).T.reshape(-1)
+            block = bytearray(arr.tobytes()) + block[full:]
+        out += block
+    return bytes(out)
+
+
+class _VdbStream:
+    def __init__(self, data: bytes, pos: int = 0):
+        self.d, self.p = data, pos
+
+    def read(self, n: int) -> bytes:
+        b = self.d[self.p:self.p + n]
+        if len(b) != n:
+            raise ValueError("unexpected end of VDB file")
+        self.p += n
+        return b
+
+    def u32(self):
+        return struct.unpack("<I", self.read(4))[0]
+
+    def i32(self):
+        return struct.unpack("<i", self.read(4))[0]
+
+    def i64(self):
+        return struct.unpack("<q", self.read(8))[0]
+
+    def string(self) -> str:
+        return self.read(self.u32()).decode("utf-8", "replace")
+
+    def meta(self) -> dict:
+        out = {}
+        for _ in range(self.u32()):
+            name, typ = self.string(), self.string()
+            raw = self.read(self.u32())
+            try:
+                if typ == "string":
+                    out[name] = raw.decode("utf-8", "replace")
+                elif typ == "bool":
+                    out[name] = bool(raw[0])
+                elif typ in ("int32", "int64", "float", "double") and len(raw) in (4, 8):
+                    out[name] = struct.unpack({"int32": "<i", "int64": "<q", "float": "<f", "double": "<d"}[typ], raw)[0]
+                elif typ == "vec3i":
+                    out[name] = struct.unpack("<3i", raw)
+                else:
+                    out[name] = raw
+            except Exception:
+                out[name] = raw
+        return out
+
+
+def _vdb_transform(s: _VdbStream):
+    """→ 4×4 row-vector matrix (world = [i j k 1] @ M)."""
+    typ = s.string()
+    d = lambda n: struct.unpack(f"<{n}d", s.read(8 * n))
+    M = np.eye(4)
+    if typ in ("ScaleMap", "UniformScaleMap"):
+        sc = d(3)
+        d(12)                                                # voxelSize, inverse, invScaleSqr, invTwiceScale
+        M[0, 0], M[1, 1], M[2, 2] = sc
+    elif typ == "TranslationMap":
+        M[3, :3] = d(3)
+    elif typ in ("ScaleTranslateMap", "UniformScaleTranslateMap"):
+        tr, sc = d(3), d(3)
+        d(12)
+        M[0, 0], M[1, 1], M[2, 2] = sc
+        M[3, :3] = tr
+    elif typ in ("AffineMap", "UnitaryMap"):
+        M = np.array(d(16)).reshape(4, 4)
+    else:
+        raise ValueError(f"transform {typ} not supported")
+    return M
+
+
+class _VdbFloatTree:
+    """Reads topology + buffers of a Tree_float_5_4_3 grid into flat arrays of active voxels."""
+
+    def __init__(self, s: _VdbStream, compression: int, half: bool):
+        self.s, self.comp, self.half = s, compression, half
+        self.vt = np.float16 if half else np.float32
+
+    def _data(self, count: int):
+        """readData: count values of the stored type, honouring the grid's compression."""
+        s, isz = self.s, (2 if self.half else 4)
+        if self.half and count < 1:                          # OpenVDB's HalfReader writes nothing for 0 values
+            return np.zeros(0, dtype=self.vt)
+        nbytes = count * isz
+        if self.comp & 0x5:                                  # zip or blosc: size-prefixed
+            n = s.i64()
+            if n <= 0:
+                raw = s.read(-n)
+            else:
+                blob = s.read(n)
+                raw = blosc_decompress(blob) if self.comp & 0x4 else zlib.decompress(blob)
+        else:
+            raw = s.read(nbytes)
+        return np.frombuffer(raw, dtype=self.vt, count=count)
+
+    def _compressed_values(self, count: int, mask_on: int):
+        """readCompressedValues → (values array, all_values_stored)."""
+        s = self.s
+        meta = s.read(1)[0]
+        if meta in (2, 4, 5):
+            s.read(4 if meta != 5 else 8)                    # inactive value(s), full precision
+        if meta in (3, 4, 5):
+            s.read(count // 8)                               # selection mask
+        if self.comp & 0x2 and meta != 6:
+            return self._data(mask_on), False
+        return self._data(count), True
+
+    @staticmethod
+    def _mask(raw: bytes):
+        return np.unpackbits(np.frombuffer(raw, dtype=np.uint8), bitorder="little").astype(bool)
+
+    def read(self):
+        s = self.s
+        if s.u32() != 1:
+            raise ValueError("multi-buffer trees are not supported")
+        self.background = struct.unpack("<f", s.read(4))[0]
+        ntiles, nchild = s.u32(), s.u32()
+        s.read(ntiles * (12 + 4 + 1))
+        # topology: depth-first, upper(32³) → lower(16³) → leaf masks
+        self.leaf_origins, self.leaf_tmask = [], []
+        tile_pts, tile_vals = [], []
+        lower_offsets = np.array([(n >> 8, (n >> 4) & 15, n & 15) for n in range(4096)], dtype=np.int32)
+        upper_offsets = None
+        # each root child (upper node) is read in full, recursively, before the next one
+        for _ in range(nchild):
+            org = np.array(struct.unpack("<3i", s.read(12)), dtype=np.int64)
+            cm, vm = self._mask(s.read(4096)), self._mask(s.read(4096))
+            self._compressed_values(32768, int(vm.sum()))    # upper tiles (128³ each) — ignored
+            if upper_offsets is None:
+                n = np.arange(32768)
+                upper_offsets = np.stack([n >> 10, (n >> 5) & 31, n & 31], 1)
+            for ci in np.nonzero(cm)[0]:
+                lorg = org + upper_offsets[ci] * 128
+                lcm, lvm = self._mask(s.read(512)), self._mask(s.read(512))
+                vals, allv = self._compressed_values(4096, int(lvm.sum()))
+                if lvm.any():                                 # active 8³ tiles
+                    tv = vals[lvm] if allv else vals
+                    tile_pts.append(lorg + lower_offsets[lvm] * 8)
+                    tile_vals.append(np.asarray(tv, dtype=np.float32))
+                for li in np.nonzero(lcm)[0]:
+                    self.leaf_origins.append(lorg + lower_offsets[li] * 8)
+                    s.read(64)                                # leaf topology mask (repeated with the buffers)
+        self.tile_pts = np.concatenate(tile_pts) if tile_pts else np.zeros((0, 3), np.int64)
+        self.tile_vals = np.concatenate(tile_vals) if tile_vals else np.zeros(0, np.float32)
+        return self
+
+    def read_leaves(self, stride: int = 1):
+        """Leaf buffers in topology order → (origins int32 L×3, masks uint8 L×64, active values float32 in
+        (leaf, bit) order). Every `stride`-th leaf is decoded; the rest are skipped without decompressing.
+        Hot loop: ~25k–500k leaves, so plain locals and offsets instead of stream objects."""
+        data, p = self.s.d, self.s.p
+        half, comp = self.half, self.comp
+        isz = 2 if half else 4
+        dt = np.float16 if half else np.float32
+        sized = bool(comp & 0x5)
+        maskc = bool(comp & 0x2)
+        q64 = struct.Struct("<q").unpack_from
+        zero64 = bytes(64)
+        dec = blosc_decompress if comp & 0x4 else zlib.decompress
+        masks, chunks, used = [], [], []
+        for idx in range(len(self.leaf_origins)):
+            m = data[p:p + 64]
+            meta = data[p + 64]
+            p += 65
+            if meta in (2, 4, 5):
+                p += 8 if meta == 5 else 4                    # inactive value(s): full precision even for half grids
+            if meta in (3, 4, 5):
+                p += 64                                       # selection mask
+            allv = (not maskc) or meta == 6
+            if half and not allv and m == zero64:
+                continue                                      # no active values: OpenVDB wrote nothing at all
+            if sized:
+                n = q64(data, p)[0]
+                p += 8
+                if idx % stride:
+                    p += abs(n)
+                    continue
+                if n <= 0:
+                    raw = data[p:p - n]
+                    p -= n
+                else:
+                    raw = dec(data[p:p + n])
+                    p += n
+            else:
+                cnt = 512 if allv else bin(int.from_bytes(m, "little")).count("1")
+                raw = data[p:p + cnt * isz]
+                p += cnt * isz
+                if idx % stride:
+                    continue
+            if allv:                                          # all 512 stored: keep the active ones
+                raw = np.frombuffer(raw, dt)[self._mask(m)].tobytes()
+            masks.append(m)
+            chunks.append(raw)
+            used.append(idx)
+        self.s.p = p
+        org = np.asarray(self.leaf_origins, dtype=np.int32).reshape(-1, 3)[np.asarray(used, dtype=np.int64)]
+        mb = np.frombuffer(b"".join(masks), dtype=np.uint8).reshape(-1, 64)
+        vals = np.frombuffer(b"".join(chunks), dtype=dt).astype(np.float32)
+        return org, mb, vals
+
+    def _skip_values(self, count: int, on: int):
+        s = self.s
+        meta = s.read(1)[0]
+        if meta in (2, 4, 5):
+            s.read(4 if meta != 5 else 8)
+        if meta in (3, 4, 5):
+            s.read(count // 8)
+        n = on if (self.comp & 0x2 and meta != 6) else count
+        if self.half and n < 1:
+            return
+        if self.comp & 0x5:
+            k = s.i64()
+            s.p += abs(k)
+        else:
+            s.p += n * (2 if self.half else 4)
+
+
+def read_vdb_grids(path: str):
+    """Header + grid descriptors of a .vdb: (data, [dict(name, type, pos, block, end)])."""
+    with open(path, "rb") as f:
+        data = f.read()                                       # caches are tens of MB; one read beats many seeks
+    s = _VdbStream(data)
+    if s.i64() != 0x56444220:
+        raise ValueError("not an OpenVDB file")
+    ver = s.u32()
+    if ver < 222:
+        raise ValueError(f"VDB file version {ver} is too old for the built-in reader")
+    s.u32(), s.u32()
+    has_offsets = s.read(1)[0]
+    s.read(36)
+    s.meta()
+    grids = []
+    for _ in range(s.i32()):
+        name, typ = s.string(), s.string()
+        s.string()                                            # instance parent
+        pos, block, end = s.i64(), s.i64(), s.i64()
+        grids.append({"name": name.split("\x1e")[0], "type": typ, "pos": pos, "block": block, "end": end})
+        if not has_offsets:
+            raise ValueError("VDB without grid offsets")
+        s.p = end
+    return data, grids
+
+
+def _vdb_pick_step(mb, max_voxels: int) -> int:
+    """Coarsening for a preview: the smallest of 1, 2, 4, 8 whose occupied cells (any active voxel among the
+    step³ it averages) fit in max_voxels, with 30 % slack so a sequence doesn't drop a whole level of detail
+    for one frame a little over. Leaf-aligned steps make coarsening a reshape, not a sort."""
+    occ = {1: 0, 2: 0, 4: 0, 8: 0}
+    for b0 in range(0, len(mb), 32768):
+        bits = np.unpackbits(mb[b0:b0 + 32768], axis=1, bitorder="little").astype(bool).reshape(-1, 8, 8, 8)
+        n = len(bits)
+        occ[1] += int(bits.sum())
+        for st in (2, 4, 8):
+            d = 8 // st
+            occ[st] += int(bits.reshape(n, d, st, d, st, d, st).any(axis=(2, 4, 6)).sum())
+    return next((st for st in (1, 2, 4) if occ[st] <= max_voxels * 1.3), 8)
+
+
+def _vdb_leaf_samples(org, mb, vals, step: int, keep):
+    """Leaves → sample centres (index space, float64 N×3) and values, averaging step³ cells inside each leaf.
+    keep(cell_values, active_bits) selects cells. Works in blocks of 32k leaves (64 MB) so memory stays flat."""
+    counts = np.unpackbits(mb, axis=1, bitorder="little").sum(1, dtype=np.int64) if len(mb) else np.zeros(0, np.int64)
+    starts = np.concatenate([np.zeros(1, np.int64), np.cumsum(counts)])
+    d = 8 // step
+    n_cells = d * d * d
+    cidx = np.arange(n_cells)
+    coff = np.stack([cidx // (d * d), (cidx // d) % d, cidx % d], 1).astype(np.float64) * step + (step - 1) / 2.0
+    out_c, out_v = [], []
+    for b0 in range(0, len(mb), 32768):
+        b1 = min(len(mb), b0 + 32768)
+        bits = np.unpackbits(mb[b0:b1], axis=1, bitorder="little").astype(bool)
+        dense = np.zeros(bits.shape, np.float32)
+        dense[bits] = vals[starts[b0]:starts[b1]]
+        n = b1 - b0
+        if step > 1:
+            cv = dense.reshape(n, d, step, d, step, d, step).mean(axis=(2, 4, 6)).reshape(n, n_cells)
+            cb = bits.reshape(n, d, step, d, step, d, step).any(axis=(2, 4, 6)).reshape(n, n_cells)
+        else:
+            cv, cb = dense, bits
+        li, ci = np.nonzero(keep(cv, cb) & cb)
+        out_c.append(org[b0 + li].astype(np.float64) + coff[ci])
+        out_v.append(cv[li, ci])
+    if not out_c:
+        return np.zeros((0, 3)), np.zeros(0, np.float32)
+    return np.concatenate(out_c), np.concatenate(out_v).astype(np.float32)
+
+
+def load_vdb_native(path: str, max_voxels: int = VDB_MAX_VOXELS, step: Optional[int] = None) -> Optional[dict]:
+    """Built-in reader: the density grid (or the first float grid) as smoke voxels, a level set as surface points.
+    step: coarsening factor to use (a sequence keeps the first frame's, so detail doesn't flicker)."""
+    if np is None:
+        return None
+    t0 = time.monotonic()
+    try:
+        data, grids = read_vdb_grids(path)
+        floats = [g for g in grids if g["type"].startswith("Tree_float_5_4_3")]
+        if not floats:
+            _vfx_err("VDB: no float grid the built-in reader understands (" + ", ".join(g["type"] for g in grids) + ")")
+            return None
+        others = ", ".join(g["name"] for g in grids)
+        metas = []
+        for g in floats:
+            s = _VdbStream(data, g["pos"])
+            g["comp"] = s.u32()
+            g["meta"] = s.meta()
+            g["tf_pos"] = s.p
+            metas.append(g)
+        cls = lambda g: str(g["meta"].get("class", "")).lower()
+        pick = (next((g for g in floats if g["name"].lower() == "density"), None)
+                or next((g for g in floats if cls(g) != "level set"), None) or floats[0])
+        sdf = cls(pick) == "level set"
+        s = _VdbStream(data, pick["tf_pos"])
+        M = _vdb_transform(s)
+        tree = _VdbFloatTree(s, pick["comp"], pick["type"].endswith("_HalfFloat")).read()
+        if s.p != pick["block"]:
+            raise ValueError(f"topology ended at {s.p}, expected {pick['block']}")
+        nleaves = len(tree.leaf_origins)
+        est = int(pick["meta"].get("file_voxel_count", nleaves * 300))
+        stride = 1
+        blosc_slow = bool(pick["comp"] & 0x4) and not _blosc_c() and not _lz4_c() and not any(_blosc_mods())
+        if blosc_slow and nleaves > 250_000:                   # pure-Python LZ4 (~10 µs a leaf): cap the decode time
+            stride = int(math.ceil(nleaves / 250_000))
+        org, mb, vals = tree.read_leaves(stride)
+        if s.p != pick["end"]:
+            raise ValueError(f"leaf data ended at {s.p}, expected {pick['end']}")
+        if len(tree.tile_vals):                              # active 8³ tiles are leaf-sized blocks of one value
+            org = np.concatenate([org, tree.tile_pts.astype(np.int32)])
+            mb = np.concatenate([mb, np.full((len(tree.tile_vals), 64), 255, np.uint8)])
+            vals = np.concatenate([vals, np.repeat(tree.tile_vals.astype(np.float32), 512)])
+        vs = float(np.linalg.norm(M[0, :3]))
+        # EmberGen and Blender write Z-up volumes; Kestrel's viewer (like Houdini and Maya) is Y-up
+        tags = " ".join(f"{k} {v}" for g in metas for k, v in g["meta"].items() if not isinstance(v, bytes)).lower()
+        zup = "embergen" in tags or "blender" in tags
+        if zup:
+            M = M @ np.array([[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]], dtype=np.float64)
+        info = [("Volumes", f"{pick['name']} ({'SDF' if sdf else 'fog'}), {est:,} active voxels"
+                 + (f"; grids: {others}" if len(grids) > 1 else ""))]
+        if sdf:
+            centre, _ = _vdb_leaf_samples(org, mb, vals, 1, lambda d, bits: bits & (np.abs(d) < vs * 0.87))
+            step = max(1, int(math.ceil((len(centre) / 2_000_000) ** 0.5)))
+            centre = centre[::step]
+            P = np.c_[centre, np.ones(len(centre))] @ M
+            return {"P": P[:, :3].astype(np.float32), "pS": np.array([vs * math.sqrt(step)], np.float32), "info": info,
+                    "source": "built-in VDB reader"}
+        thr = 0.004 * (float(vals.max()) if len(vals) else 0.0)   # faint haze: invisible, but widens the framing
+        step_fixed = int(step or 0)
+        if step_fixed:
+            step = 1 if step_fixed < 2 else 2 if step_fixed < 4 else 4 if step_fixed < 8 else 8
+        else:
+            step = _vdb_pick_step(mb, max_voxels)
+        # a cell is kept when its average holds at least one voxel's worth of visible density
+        centre, val = _vdb_leaf_samples(org, mb, vals, step, lambda d, bits: d > thr / step ** 3)
+        P = np.c_[centre, np.ones(len(centre))] @ M
+        if stride > 1:
+            info.append(("Note", f"every {stride}th block read (install lz4-libs or python3-blosc for full detail)"))
+        bench(f"vdb native: {pick['name']} {len(val):,} samples, {nleaves:,} leaves, stride {stride}, "
+              f"{time.monotonic() - t0:.2f}s")
+        return {"vP": P[:, :3].astype(np.float32), "vD": val.astype(np.float32), "vS": np.array([vs * step], np.float32),
+                "vStep": step, "info": info, "source": "built-in VDB reader"}
+    except Exception as ex:
+        _vfx_err(f"VDB reader: {ex}")
+        return None
+
+
+# ---- Maya (mayapy) — fallback for FBX / Alembic / USD / OBJ when Blender isn't available
+_MAYA_CACHE: Optional[str] = None
+
+
+def _find_mayapy() -> Optional[str]:
+    global _MAYA_CACHE
+    if _MAYA_CACHE is not None:
+        return _MAYA_CACHE or None
+    c = [shutil.which("mayapy")]
+    if os.environ.get("MAYA_LOCATION"):
+        c.append(os.path.join(os.environ["MAYA_LOCATION"], "bin", "mayapy"))
+    c += sorted(glob.glob("/usr/autodesk/maya*/bin/mayapy") + glob.glob("/opt/autodesk/maya*/bin/mayapy"), reverse=True)
+    _MAYA_CACHE = next((p for p in c if p and os.access(p, os.X_OK)), "")
+    return _MAYA_CACHE or None
+
+
+_MAYA_SCRIPT = r'''
+import sys, struct, array, traceback
+try:
+    path, out = sys.argv[1], sys.argv[2]
+    import maya.standalone
+    maya.standalone.initialize(name="python")
+    import maya.cmds as cmds
+    import maya.api.OpenMaya as om
+    for plug in ("fbxmaya", "AbcImport", "mayaUsdPlugin", "objExport"):
+        try:
+            cmds.loadPlugin(plug, quiet=True)
+        except Exception:
+            pass
+    ext = path.lower().rsplit(".", 1)[-1]
+    if ext == "abc":
+        cmds.AbcImport(path, mode="import")
+    elif ext == "fbx":
+        cmds.file(path, i=True, type="FBX", ignoreVersion=True)
+    elif ext in ("usd", "usda", "usdc", "usdz"):
+        cmds.file(path, i=True, type="USD Import", ignoreVersion=True)
+    else:
+        cmds.file(path, i=True, ignoreVersion=True)
+    V, F, base = array.array("f"), array.array("i"), 0
+    it = om.MItDag(om.MItDag.kDepthFirst, om.MFn.kMesh)
+    while not it.isDone():
+        dp = it.getPath()
+        if not om.MFnDagNode(dp).isIntermediateObject:
+            fn = om.MFnMesh(dp)
+            pts = fn.getPoints(om.MSpace.kWorld)
+            for p in pts:
+                V.extend((p.x, p.y, p.z))
+            counts, ids = fn.getTriangles()
+            F.extend([i + base for i in ids])
+            base += len(pts)
+        it.next()
+    with open(out, "wb") as f:
+        f.write(b"KSTM" + struct.pack("<QQ", len(V) // 3, len(F) // 3))
+        f.write(V.tobytes())
+        f.write(F.tobytes())
+    print("KESTREL-OK")
+except Exception:
+    traceback.print_exc(file=sys.stdout)
+    print("KESTREL-FAIL")
+'''
+
+
+def load_via_maya(path: str) -> Optional[Tuple[list, list, str]]:
+    """mayapy standalone import → triangles. Slow to start (Maya boots and checks out a licence), so it's the
+    last resort after Blender and assimp."""
+    mp = _find_mayapy()
+    if not mp:
+        _vfx_err("Maya: mayapy not found (PATH, $MAYA_LOCATION or /usr/autodesk/maya*)")
+        return None
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="kestrel-maya-")
+    script, out = os.path.join(tmp, "read.py"), os.path.join(tmp, "mesh.bin")
+    try:
+        with open(script, "w") as f:
+            f.write(_MAYA_SCRIPT)
+        rc, so, se = _run_streaming([mp, script, os.path.abspath(path), out], timeout=200, verbose=BLENDER_VERBOSE)
+        if "KESTREL-OK" not in so or not os.path.exists(out):
+            tail = [l for l in so + se if l.strip() and ("rror" in l or "icense" in l or "timed out" in l)][-3:]
+            _vfx_err("Maya: " + (" | ".join(x[:200] for x in tail) or f"exit {rc}"))
+            return None
+        with open(out, "rb") as f:
+            head = f.read(20)
+            if head[:4] != b"KSTM":
+                return None
+            nv, nf = struct.unpack("<QQ", head[4:20])
+            if np is not None:
+                V = np.frombuffer(f.read(nv * 12), dtype=np.float32).reshape(-1, 3)
+                F = np.frombuffer(f.read(nf * 12), dtype=np.int32).reshape(-1, 3)
+            else:
+                import array
+                va, fa = array.array("f"), array.array("i")
+                va.frombytes(f.read(nv * 12))
+                fa.frombytes(f.read(nf * 12))
+                V = [tuple(va[i:i + 3]) for i in range(0, len(va), 3)]
+                F = [tuple(fa[i:i + 3]) for i in range(0, len(fa), 3)]
+        return (V, F, "Maya") if len(V) else None
+    except Exception as ex:
+        _vfx_err(f"Maya: {ex}")
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def load_via_houdini_mesh(path: str) -> Optional[Tuple[list, list, str]]:
+    """Houdini as a mesh importer for Alembic (File SOP reads .abc; packed prims are unpacked)."""
+    r = load_via_houdini(path)
+    if r and "F" in r and len(r["F"]):
+        return r["V"], r["F"], r["source"]
     return None

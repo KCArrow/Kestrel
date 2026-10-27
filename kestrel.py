@@ -76,7 +76,7 @@ def bench(label: str):
 APP_ID = "io.github.kestrel_files"
 APP_NAME = "Kestrel"
 APP_FULL_NAME = "Kestrel File Browser"
-VERSION = "1.0"
+VERSION = "1.1"
 HOME = os.path.expanduser("~")
 
 # --------------------------------------------------------------------------- demo mode (kestrel --demo folder)
@@ -186,7 +186,7 @@ DEFAULT_CONFIG = {
     "open_to": "quick", "browse_in_new_tab": False, "single_click": False,
     "show_recent": True, "show_frequent": True,
     "show_hidden": False, "hide_extensions": False, "full_path_title": False, "folders_first": True,
-    "confirm_delete": True, "checkboxes": False, "gl_preview": True, "gdk_backend": "", "rv_enabled": False, "rv_path": "", "ui_cores": 2, "archive_action": "extract", "index_enabled": False, "index_roots": [HOME], "index_network": False, "index_hidden": False, "index_interval_h": 6, "nav_pane": True, "preview_pane": False, "details_pane": False,
+    "confirm_delete": True, "checkboxes": False, "gl_preview": True, "seq_fps": 24, "blend_view": "breakdown", "gdk_backend": "", "rv_enabled": False, "rv_path": "", "ui_cores": 2, "archive_action": "extract", "index_enabled": False, "index_roots": [HOME], "index_network": False, "index_hidden": False, "index_interval_h": 6, "nav_pane": True, "preview_pane": False, "details_pane": False,
     "size_in_bytes": False, "date_format": "%Y-%m-%d %H:%M", "layout": "details",
     "sort_key": "name", "sort_desc": False, "group_by": "none",
     "columns": ["name", "modified", "type", "size"],
@@ -2498,12 +2498,29 @@ def run_heavy(fn, *args):
         return fn(*args)
 
 
+_SEQ_POOL = None
+
+
+def seq_pool():
+    """Separate worker processes for loading the frames of a cache sequence in parallel, so prefetching a
+    128-frame VDB sequence never queues in front of the single preview decoder."""
+    global _SEQ_POOL
+    if _SEQ_POOL is None:
+        from concurrent.futures import ProcessPoolExecutor
+        import multiprocessing
+        n = max(1, min(4, (os.cpu_count() or 2) // 4))
+        _SEQ_POOL = ProcessPoolExecutor(max_workers=n, mp_context=multiprocessing.get_context("fork"), initializer=pin_worker)
+    return _SEQ_POOL
+
+
 def shutdown_workers():
     """Quit: kill the decoder pool and the render process instead of letting multiprocessing's exit handler
     join them — a worker busy with a big model or EXR made closing the window hang for seconds."""
-    global _POOL
-    pool, _POOL = _POOL, None
-    if pool is not None:
+    global _POOL, _SEQ_POOL
+    pools, _POOL, _SEQ_POOL = (_POOL, _SEQ_POOL), None, None
+    for pool in pools:
+        if pool is None:
+            continue
         try:
             for p in list(getattr(pool, "_processes", {}).values()):
                 p.kill()
@@ -2750,6 +2767,37 @@ def profiling_report(top: int = 40) -> str:
 
 
 # --------------------------------------------------------------------------- self-test / benchmark
+def write_test_vdb(path: str):
+    """A minimal valid .vdb (format 224, zip + active-mask compression): one fog grid named 'density' with five
+    active voxels in one leaf at index (8..12, 16, 24), voxel size 0.5, translated by (10, 20, 30)."""
+    S = lambda t: struct.pack("<I", len(t.encode())) + t.encode()
+    out = bytearray(struct.pack("<qIIIB", 0x56444220, 224, 8, 1, 1) + b"0" * 36 + struct.pack("<Ii", 0, 1))
+    out += S("density") + S("Tree_float_5_4_3") + S("")
+    gpos = len(out) + 24
+    grid = bytearray(struct.pack("<I", 3))                                     # COMPRESS_ZIP | COMPRESS_ACTIVE_MASK
+    grid += struct.pack("<I", 1) + S("class") + S("string") + S("fog volume")
+    grid += S("UniformScaleTranslateMap") + struct.pack("<18d", 10, 20, 30, *([0.5] * 15))
+    bit0 = lambda nbytes: b"\x01" + bytes(nbytes - 1)
+    no_vals = b"\x00" + struct.pack("<q", 0)                                 # metadata 0, zero active values
+    grid += struct.pack("<IfII", 1, 0.0, 0, 1) + struct.pack("<3i", 0, 0, 0)
+    grid += bit0(4096) + bytes(4096) + no_vals                                # upper: child 0
+    leaf_n = (1 << 8) | (2 << 4) | 3                                          # lower-node offset → leaf origin (8, 16, 24)
+    lm = bytearray(512)
+    lm[leaf_n >> 3] |= 1 << (leaf_n & 7)
+    grid += bytes(lm) + bytes(512) + no_vals                                  # lower at (0,0,0): one leaf
+    mask = bytearray(64)
+    for x in range(5):
+        n = x << 6                                                            # voxel (x, 0, 0) in the leaf
+        mask[n >> 3] |= 1 << (n & 7)
+    grid += mask                                                              # leaf topology
+    block = gpos + len(grid)
+    z = zlib.compress(struct.pack("<5f", 0.2, 0.4, 0.6, 0.8, 1.0))
+    grid += mask + b"\x00" + struct.pack("<q", len(z)) + z                    # leaf buffer
+    out += struct.pack("<qqq", gpos, block, gpos + len(grid)) + grid
+    with open(path, "wb") as f:
+        f.write(out)
+
+
 def run_selftest(bench: bool = False) -> int:
     """`kestrel.py --selftest [--bench]`: unit tests for the non-GUI machinery (listing, sorting, decoders,
     mesh pipeline, rasteriser, archives, rename, helpers) with timings, so a slowdown can be pinned to a
@@ -2853,6 +2901,208 @@ def run_selftest(bench: bool = False) -> int:
                 self.assertNotIn(os.path.expanduser("~"), txt)
             cr.archive(paths[0], "sent")
             self.assertEqual(len(cr.pending()), 1)
+
+        @timed("houdini cache render (points + volume)")
+        def test_cache_render(self):
+            self.assertEqual(houdini_kind("a.0001.bgeo.sc"), "geo")
+            self.assertEqual(houdini_kind("smoke.vdb"), "vdb")
+            self.assertEqual(houdini_kind("x.obj"), "")
+            if np is None:
+                self.skipTest("numpy not installed")
+            rng = np.random.default_rng(3)
+            P = rng.normal(size=(50000, 3)).astype(np.float32)
+            g = np.stack(np.meshgrid(*[np.linspace(-1, 1, 24)] * 3, indexing="ij"), -1).reshape(-1, 3)
+            d = np.clip(1 - np.linalg.norm(g, axis=1), 0, None)
+            m = _finish_cache_numpy({"P": P, "Cd": np.abs(P) % 1, "vP": g[d > 0] + 4, "vD": d[d > 0], "vS": [2 / 23],
+                                     "info": [("Points", "50,000")], "source": "test"}, 500000)
+            self.assertEqual(len(m["points"]), 50000)
+            self.assertTrue(len(m["vpts"]) > 1000)
+            self.assertLessEqual(float(np.abs(np.concatenate([m["points"], m["vpts"]])).max()), 0.5001)   # one shared unit box
+            EX = {k: m[k] for k in ("points", "pcolor", "psize", "vpts", "vden", "vsize") if k in m}
+            r = software_render(m["verts"], m["faces"], m["normals"], m["vnormals"], (200, 150, 0.5, 0.3, 1.0, 0, 0, True, False, (30, 30, 30), (1, 1, 1)), EX)
+            self.assertIsNotNone(r)
+            img = np.frombuffer(r[2], np.uint8).reshape(150, 200, 4)
+            self.assertGreater(int((img[:, :, :3].astype(int).sum(2) != 90).sum()), 2000)     # something was drawn
+
+        @timed("built-in VDB reader")
+        @timed("shader & IES previews")
+        def test_shader_previews(self):
+            j = lambda n: os.path.join(self.tmp, n)
+            # MaterialX: one standard_surface with a texture that exists
+            open(j("albedo.png"), "w").close()
+            with open(j("red.mtlx"), "w") as f:
+                f.write('<?xml version="1.0"?>\n<materialx version="1.38">\n'
+                        '  <image name="tex" type="color3"><input name="file" type="filename" value="albedo.png"/></image>\n'
+                        '  <standard_surface name="SR_red" type="surfaceshader">\n'
+                        '    <input name="base_color" type="color3" value="0.8, 0.1, 0.1"/>\n'
+                        '    <input name="specular_roughness" type="float" value="0.3"/>\n'
+                        '    <input name="metalness" type="float" value="1"/>\n'
+                        '  </standard_surface>\n'
+                        '  <surfacematerial name="M_red" type="material"><input name="surfaceshader" type="surfaceshader" nodename="SR_red"/></surfacematerial>\n'
+                        '</materialx>\n')
+            self.assertEqual(shader_preview_kind(j("red.mtlx")), "materialx")
+            r = shader_preview(j("red.mtlx"))
+            self.assertNotIn("error", r, r.get("error"))
+            m = r["materials"][0]
+            self.assertAlmostEqual(m["base_color"][0], 0.8, 3)
+            self.assertEqual(m.get("metallic"), 1.0)
+            self.assertEqual(r["code"][1], "xml")
+            mats = {n[0]: n for n in r["tree"]}["Materials"][2]
+            self.assertTrue(mats[0][3].startswith("material:"))
+            # Unity .mat (YAML) vs a MATLAB .mat that only shares the extension
+            with open(j("Brick.mat"), "w") as f:
+                f.write("%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!21 &2100000\nMaterial:\n  m_Name: Brick\n"
+                        "  m_Shader: {fileID: 46, guid: 0000000000000000f000000000000000, type: 0}\n"
+                        "  m_SavedProperties:\n    m_Floats:\n    - _Metallic: 0\n    - _Glossiness: 0.25\n"
+                        "    m_Colors:\n    - _Color: {r: 0.6, g: 0.3, b: 0.2, a: 1}\n")
+            with open(j("data.mat"), "wb") as f:
+                f.write(b"MATLAB 5.0 MAT-file" + b"\0" * 64)
+            self.assertEqual(shader_preview_kind(j("Brick.mat")), "unity-mat")
+            self.assertEqual(shader_preview_kind(j("data.mat")), "")
+            r = shader_preview(j("Brick.mat"))
+            self.assertNotIn("error", r, r.get("error"))
+            self.assertAlmostEqual(r["materials"][0]["base_color"][1], 0.0732, 3)        # Unity stores sRGB
+            # GLSL: Shadertoy and glslsandbox styles are runnable, a vertex shader isn't; F# .fs isn't a shader
+            toy = "void mainImage(out vec4 c, in vec2 p) { c = vec4(p / iResolution.xy, 0.5 + 0.5 * sin(iTime), 1.0); }\n"
+            box = "uniform float time;\nuniform vec2 resolution;\nvoid main() { gl_FragColor = vec4(gl_FragCoord.xy / resolution, 0.0, 1.0); }\n"
+            vert = "#version 330\nlayout(location = 0) in vec3 P;\nuniform mat4 mvp;\nvoid main() { gl_Position = mvp * vec4(P, 1.0); }\n"
+            self.assertEqual(glsl_style(toy), "shadertoy")
+            self.assertEqual(glsl_style(box), "sandbox")
+            self.assertEqual(glsl_style(vert), "")
+            with open(j("wave.frag"), "w") as f:
+                f.write(toy)
+            with open(j("Program.fs"), "w") as f:
+                f.write("module Program\nopen System\n[<EntryPoint>]\nlet main argv = printfn \"hi\"; 0\n")
+            self.assertEqual(shader_preview_kind(j("Program.fs")), "")
+            r = shader_preview(j("wave.frag"))
+            self.assertEqual(r["glsl"]["style"], "shadertoy")
+            frag, _ = glsl_build_fragment(toy, "shadertoy", "#version 150 core\n")
+            self.assertIn("mainImage(c, gl_FragCoord.xy)", frag)
+            self.assertIn("#line 0", frag)                                 # GLSL 1.50 numbers the next line N+1
+            self.assertIn("#line 1", glsl_build_fragment(box, "sandbox", "#version 300 es\nprecision highp float;\n")[0])
+            self.assertEqual(glsl_error_text(RuntimeError("Shader compile failure (0): b'0:3(2): error: syntax error\\n'", [], 0)),
+                             "0:3(2): error: syntax error")
+            # IES: a small symmetric downlight
+            with open(j("down.ies"), "w") as f:
+                f.write("IESNA:LM-63-2002\n[MANUFAC] Test\nTILT=NONE\n1 1000 1 5 1 1 2 0.1 0.1 0\n1 1 50\n"
+                        "0 22.5 45 67.5 90\n0\n800 700 400 100 0\n")
+            self.assertEqual(shader_preview_kind(j("down.ies")), "ies")
+            if np is not None:
+                ies = IESProfile(j("down.ies"))
+                self.assertEqual(len(ies.v), 5)
+                self.assertAlmostEqual(float(ies.cd.max()), 800.0)
+                r = shader_preview(j("down.ies"))
+                self.assertNotIn("error", r, r.get("error"))
+                img = r["images"][0][1]
+                self.assertEqual(len(img.rgb), img.w * img.h * 3)
+                ball = render_material_ball(dict(MATERIAL_DEFAULTS, base_color=(0.8, 0.1, 0.1)), size=64)
+                px = np.frombuffer(ball.rgb, np.uint8).reshape(ball.h, ball.w, 3)
+                c = px[ball.h // 2, ball.w // 2].astype(int)
+                self.assertGreater(c[0], c[1] + 20)                       # the ball is red where it faces us
+
+        def test_vdb_reader(self):
+            self.assertEqual(_lz4_block_decode(bytes([0x35]) + b"abc" + bytes([3, 0]), 12), b"abcabcabcabc")
+            if np is None:
+                self.skipTest("numpy not installed")
+            path = os.path.join(self.tmp, "fog.vdb")
+            write_test_vdb(path)
+            got = load_vdb_native(path)
+            self.assertIsNotNone(got, LAST_VFX_ERROR)
+            self.assertEqual(len(got["vD"]), 5)
+            # voxel (i, j, k) → translate + 0.5 · ijk; the leaf sits at index (8, 16, 24)
+            self.assertTrue(np.allclose(sorted(got["vP"][:, 0]), [10 + 0.5 * x for x in (8, 9, 10, 11, 12)]))
+            self.assertAlmostEqual(float(got["vD"].max()), 1.0, places=5)
+            # sequences: a later frame loaded with the first frame's norm lands in the same box
+            a = load_model(path)
+            b = load_model(path, 500000, a["norm"], 1000)
+            self.assertEqual(a["norm"], b["norm"])
+            self.assertTrue(np.allclose(a["vpts"], b["vpts"]))
+            import types
+            E = lambda n: types.SimpleNamespace(name=n, path="/s/" + n, is_dir=False)
+            seq = MainWindow._cache_selection([E("Tornado.ember"), E("smoke.10.vdb"), E("smoke.9.vdb"), E("smoke.100.vdb"), E("a.bgeo.sc")])
+            self.assertEqual([x.name for x in seq], ["smoke.9.vdb", "smoke.10.vdb", "smoke.100.vdb"])
+            self.assertIsNone(MainWindow._cache_selection([E("a.vdb"), E("b.txt")]))
+
+        @timed("scene breakdowns (Unity, Maya)")
+        def test_scene_breakdowns(self):
+            # a tiny Unity project: scene with a parent/child, a light, a script and a prefab instance
+            proj = os.path.join(self.tmp, "UnityProj")
+            for d in ("Assets/Scripts", "Assets/Prefabs", "ProjectSettings"):
+                os.makedirs(os.path.join(proj, d), exist_ok=True)
+            with open(os.path.join(proj, "ProjectSettings", "ProjectVersion.txt"), "w") as f:
+                f.write("m_EditorVersion: 2022.3.10f1\n")
+            for rel, g in (("Assets/Scripts/Spin.cs", "a" * 32), ("Assets/Prefabs/Tree.prefab", "b" * 32)):
+                open(os.path.join(proj, rel), "w").close()
+                with open(os.path.join(proj, rel + ".meta"), "w") as f:
+                    f.write(f"fileFormatVersion: 2\nguid: {g}\n")
+            scene = os.path.join(proj, "Assets", "Main.unity")
+            yaml_lines = [
+                "%YAML 1.1", "%TAG !u! tag:unity3d.com,2011:",
+                "--- !u!1 &100", "GameObject:", "  m_Name: World", "  m_IsActive: 1", "  m_Component:",
+                "  - component: {fileID: 101}",
+                "--- !u!4 &101", "Transform:", "  m_GameObject: {fileID: 100}", "  m_Children:", "  - {fileID: 201}",
+                "  m_Father: {fileID: 0}",
+                "--- !u!1 &200", "GameObject:", "  m_Name: Sun", "  m_Component:", "  - component: {fileID: 201}",
+                "  - component: {fileID: 202}", "  - component: {fileID: 203}",
+                "--- !u!4 &201", "Transform:", "  m_GameObject: {fileID: 200}", "  m_Children: []", "  m_Father: {fileID: 101}",
+                "--- !u!108 &202", "Light:", "  m_GameObject: {fileID: 200}", "  m_Type: 1",
+                "--- !u!114 &203", "MonoBehaviour:", "  m_GameObject: {fileID: 200}",
+                "  m_Script: {fileID: 11500000, guid: " + "a" * 32 + ", type: 3}",
+                "--- !u!1001 &300", "PrefabInstance:", "  m_Modification:", "    m_TransformParent: {fileID: 0}",
+                "    m_Modifications:", "    - target: {fileID: 5, guid: " + "b" * 32 + ",", "        type: 3}",
+                "      propertyPath: m_Name", "      value: Oak", "      objectReference: {fileID: 0}",
+                "  m_SourcePrefab: {fileID: 100100000, guid: " + "b" * 32 + ", type: 3}",
+                "--- !u!114 &400", "MonoBehaviour:", "  m_GameObject: {fileID: 100}",
+                "  m_Script: {fileID: 11500000, guid: " + "c" * 32 + ", type: 3}"]
+            with open(scene, "w") as f:
+                f.write("\n".join(yaml_lines) + "\n")
+            self.assertEqual(scene_breakdown_kind(scene), "unity")
+            r = scene_breakdown(scene)
+            self.assertNotIn("error", r, r.get("error"))
+            self.assertIn(("Unity", "2022.3.10f1"), r["info"])
+            tree = {n[0]: n for n in r["tree"]}
+            hier = tree["Hierarchy"][2]
+            self.assertEqual([n[0] for n in hier], ["World", "Oak"])
+            self.assertEqual(hier[0][2][0][0], "Sun")
+            self.assertIn("Light (Directional)", hier[0][2][0][1])
+            self.assertIn("Spin", hier[0][2][0][1])
+            refs = {g[0]: g for g in tree["References"][2]}
+            self.assertTrue(refs["Scripts"][2][0][3].endswith(os.path.join("Assets", "Scripts", "Spin.cs")))
+            self.assertIs(refs["Scripts"][2][0][4], True)
+            self.assertIn("Unresolved (missing or in an unindexed package)", refs)       # guid ccc... has no asset
+            # Maya ASCII: hierarchy, a reference, a found and a missing texture, a plug-in
+            tex = os.path.join(self.tmp, "wood.png")
+            open(tex, "w").close()
+            ma = os.path.join(self.tmp, "shot.ma")
+            ma_lines = [
+                "//Maya ASCII 2024 scene",
+                'file -rdi 1 -ns "chr" -rfn "chrRN" -typ "mayaAscii"', '\t\t"' + self.tmp + '/char.ma";',
+                'requires maya "2024";', 'requires "mtoa" "5.3.0";',
+                "currentUnit -l centimeter -a degree -t film;", 'fileInfo "product" "Maya 2024";',
+                'createNode transform -n "grp";', 'createNode transform -n "box" -p "grp";',
+                'createNode mesh -n "boxShape" -p "box";',
+                'createNode file -n "file1";', '\tsetAttr ".ftn" -type "string" "' + tex + '";',
+                'createNode file -n "file2";', '\tsetAttr ".ftn" -type "string" "/no/such/dir/rust.<UDIM>.exr";']
+            with open(ma, "w") as f:
+                f.write("\n".join(ma_lines) + "\n")
+            self.assertEqual(scene_breakdown_kind(ma), "maya")
+            r = scene_breakdown(ma)
+            self.assertNotIn("error", r, r.get("error"))
+            tree = {n[0]: n for n in r["tree"]}
+            self.assertEqual(tree["Outliner"][2][0][0], "grp")
+            self.assertEqual(tree["Outliner"][2][0][2][0][0], "box")
+            refs = {g[0]: g for g in tree["References"][2]}
+            self.assertEqual(refs["Scene references"][2][0][0], "chr")
+            self.assertIs(refs["Scene references"][2][0][4], False)                    # char.ma doesn't exist
+            texs = {n[0]: n[4] for n in refs["Textures"][2]}
+            self.assertEqual(texs, {"wood.png": True, "rust.<UDIM>.exr": False})
+            self.assertIn("mtoa", [n[0] for n in tree["Plug-ins required"][2]])
+            self.assertIn("rust.<UDIM>.exr", breakdown_text(r))
+            # files that only share an extension
+            matlab = os.path.join(self.tmp, "data.mat")
+            with open(matlab, "wb") as f:
+                f.write(b"MATLAB 5.0 MAT-file")
+            self.assertEqual(scene_breakdown_kind(matlab), "")
 
         @timed("file clipboard formats")
         def test_file_clipboard(self):
@@ -2980,6 +3230,26 @@ def run_selftest(bench: bool = False) -> int:
             self.assertFalse(errors)
             self.assertEqual(len(done), 2)
             self.assertTrue(os.path.exists(os.path.join(d, "a.txt")) and os.path.exists(os.path.join(d, "b.txt")))
+            # frame offset keeps padding; overlapping shift (1001..1003 → 1002..1004) goes through the two-phase rename
+            self.assertEqual(offset_number("shot.1001", 60), ("shot.1061", ""))
+            self.assertEqual(offset_number("f0009", 3), ("f0012", ""))
+            self.assertEqual(offset_number("sh010_v004.0999", 2), ("sh010_v004.1001", ""))
+            self.assertEqual(offset_number("sh010_v004.1001", 5, "first"), ("sh015_v004.1001", ""))
+            self.assertEqual(offset_number("a.0003", -5)[1], "frame would be negative")
+            self.assertEqual(offset_number("nonum", 5)[1], "no number to offset")
+            seq = [os.path.join(d, f"img.{f}.exr") for f in (1001, 1002, 1003)]
+            for p_ in seq:
+                open(p_, "w").close()
+            plan = [(p_, os.path.join(d, "img." + offset_number(os.path.basename(p_)[:-4], 1)[0].split(".")[1] + ".exr")) for p_ in seq]
+            done, errors = apply_renames(plan)
+            self.assertFalse(errors)
+            self.assertEqual(sorted(os.listdir(d))[-3:], ["img.1002.exr", "img.1003.exr", "img.1004.exr"])
+            # repath into a folder that doesn't exist yet
+            self.assertEqual(resolve_dest_dir(os.path.join(d, "x.exr"), "../{parent}_v2"), os.path.normpath(os.path.join(d, "..", "ren_v2")))
+            target = resolve_dest_dir(os.path.join(d, "a.txt"), "../moved/{ext}")
+            done, errors = apply_renames([(os.path.join(d, "a.txt"), os.path.join(target, "a_renamed.txt"))])
+            self.assertFalse(errors)
+            self.assertTrue(os.path.exists(os.path.join(self.tmp, "moved", "txt", "a_renamed.txt")))
 
         @timed("dir_stats (cached)")
         def test_dir_stats(self):
@@ -3570,6 +3840,234 @@ class StressDriver:
         w = self.win
         w.navigate(TRASH)
         GLib.timeout_add(500, lambda: (w.tab.select_names(["scratch-trash-me.txt"]), w.restore(), False)[2])
+
+
+# --------------------------------------------------------------------------- DCC integration test (Houdini / Maya)
+_DCC_HOU_GEN = r'''
+import sys, os, traceback
+out = sys.argv[1]
+import hou
+def step(name, fn):
+    try:
+        fn()
+        print("GEN-OK", name)
+    except Exception:
+        print("GEN-FAIL", name, traceback.format_exc().strip().splitlines()[-1])
+geo = hou.node("/obj").createNode("geo", "kestrel_gen")
+for c in geo.children():
+    c.destroy()
+sph = geo.createNode("sphere")
+for k, v in (("type", "polymesh"), ("rows", 48), ("cols", 64)):
+    try:
+        sph.parm(k).set(v)
+    except Exception:
+        pass
+def mesh():
+    sph.geometry().saveToFile(os.path.join(out, "hou_mesh.bgeo.sc"))
+def particles():
+    sc = geo.createNode("scatter")
+    sc.setFirstInput(sph)
+    for k in ("npts", "forcetotal"):
+        try:
+            sc.parm(k).set(200000 if k == "npts" else 1)
+        except Exception:
+            pass
+    w = geo.createNode("attribwrangle")
+    w.setFirstInput(sc)
+    w.parm("snippet").set("@Cd = relbbox(0, @P);")
+    g = w.geometry()
+    g.saveToFile(os.path.join(out, "hou_particles.bgeo.sc"))
+    print("GEN-INFO particles", len(g.points()))
+def vdb(fog):
+    v = geo.createNode("vdbfrompolygons")
+    v.setFirstInput(sph)
+    for k, val in (("voxelsize", 0.02), ("builddistance", 0 if fog else 1), ("buildfog", 1 if fog else 0)):
+        try:
+            v.parm(k).set(val)
+        except Exception:
+            pass
+    g = v.geometry()
+    if v.errors():
+        raise RuntimeError("; ".join(v.errors()))
+    g.saveToFile(os.path.join(out, "hou_fog.vdb" if fog else "hou_sdf.vdb"))
+def abc():
+    r = geo.createNode("rop_alembic")
+    r.setFirstInput(sph)
+    r.parm("filename").set(os.path.join(out, "hou_mesh.abc"))
+    r.parm("trange").set(0)
+    r.render()
+step("mesh .bgeo.sc", mesh)
+step("particles .bgeo.sc", particles)
+step("fog .vdb", lambda: vdb(True))
+step("sdf .vdb", lambda: vdb(False))
+step("alembic .abc", abc)
+'''
+
+_DCC_MAYA_GEN = r'''
+import sys, os, traceback
+out = sys.argv[1]
+import maya.standalone
+maya.standalone.initialize(name="python")
+import maya.cmds as cmds, maya.mel as mel
+for p in ("fbxmaya", "AbcExport", "mayaUsdPlugin", "objExport"):
+    try:
+        cmds.loadPlugin(p, quiet=True)
+    except Exception:
+        pass
+s = cmds.polySphere(sx=64, sy=48, r=1)[0]
+cmds.polyCube(w=1, h=0.4, d=1.4)
+cmds.move(0, -1.2, 0)
+def step(name, fn):
+    try:
+        fn()
+        print("GEN-OK", name)
+    except Exception:
+        print("GEN-FAIL", name, traceback.format_exc().strip().splitlines()[-1])
+step("fbx", lambda: (cmds.select(all=True), mel.eval('FBXExport -f "%s" -s' % os.path.join(out, "maya_mesh.fbx").replace("\\", "/"))))
+step("abc", lambda: cmds.AbcExport(j="-frameRange 1 1 -file %s" % os.path.join(out, "maya_mesh.abc")))
+def usd():
+    p = os.path.join(out, "maya_mesh.usd")
+    if hasattr(cmds, "mayaUSDExport"):
+        cmds.mayaUSDExport(file=p)
+    else:
+        try:
+            cmds.loadPlugin("mayaUsdPlugin")
+        except Exception as ex:
+            raise RuntimeError("Maya USD plugin (mayaUsdPlugin) is not available to mayapy: %s" % ex)
+        cmds.file(p, force=True, type="USD Export", exportAll=True)
+step("usd", usd)
+step("obj", lambda: cmds.file(os.path.join(out, "maya_mesh.obj"), force=True, options="groups=1;ptgroups=1;materials=0;smoothing=1;normals=1", type="OBJexport", exportAll=True))
+'''
+
+
+def _png_write(path: str, w: int, h: int, rgb: bytes):
+    import zlib
+    raw = b"".join(b"\0" + rgb[y * w * 3:(y + 1) * w * 3] for y in range(h))
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
+                chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def run_dcc_test(extra: List[str]) -> int:
+    """kestrel.py --dcc-test [files…]: generate test caches with the installed Houdini and Maya, read every one
+    back through each route Kestrel has (hython, gconvert, mayapy, Houdini-for-Alembic), render a frame of each
+    and write ~/kestrel-dcc-test/report.txt + sheet.png. Extra files given on the command line are tested too."""
+    global LAST_VFX_ERROR
+    out = os.path.join(HOME, "kestrel-dcc-test")
+    os.makedirs(out, exist_ok=True)
+    rep: List[str] = []
+
+    def log(s=""):
+        print(s, flush=True)
+        rep.append(s)
+    hou = _find_houdini()
+    mp = _find_mayapy()
+    log(f"Kestrel {VERSION} DCC test   {time.strftime('%Y-%m-%d %H:%M')}")
+    log(f"python {sys.version.split()[0]}  numpy {np.__version__ if np is not None else 'MISSING'}")
+    log(f"hython   {hou['hython'] or '—'}   (Houdini {hou['version'] or '?'})")
+    log(f"gconvert {hou['gconvert'] or '—'}")
+    log(f"mayapy   {mp or '—'}")
+    bl = _find_blender()
+    log(f"blender  {bl[0] if bl else '—'}")
+    if np is None:
+        log("numpy is required for Houdini caches — install python3-numpy and re-run.")
+    import tempfile
+    log("")
+    log("== generating test files")
+    for tool, script, label in ((hou["hython"], _DCC_HOU_GEN, "Houdini"), (mp, _DCC_MAYA_GEN, "Maya")):
+        if not tool:
+            log(f"  {label}: not found, skipped")
+            continue
+        sp = os.path.join(tempfile.gettempdir(), f"kestrel-gen-{label.lower()}.py")
+        with open(sp, "w") as f:
+            f.write(script)
+        t0 = time.time()
+        rc, so, se = _run_streaming([tool, sp, out], timeout=400)
+        gen = [l for l in so if l.startswith("GEN-")]
+        log(f"  {label} ({time.time() - t0:.0f}s, exit {rc}):")
+        for l in gen:
+            log("    " + l)
+        if not gen:
+            log("    no output; last lines: " + " | ".join(x[:160] for x in (so + se)[-6:]))
+    cases = []
+    for n, routes in (("hou_mesh.bgeo.sc", ("houdini", "gconvert")), ("hou_particles.bgeo.sc", ("houdini", "gconvert")),
+                      ("hou_fog.vdb", ("houdini", "openvdb", "blender")), ("hou_sdf.vdb", ("houdini", "openvdb", "blender")),
+                      ("hou_mesh.abc", ("houdini-abc", "maya", "blender")),
+                      ("maya_mesh.fbx", ("maya", "blender")), ("maya_mesh.abc", ("maya", "houdini-abc", "blender")),
+                      ("maya_mesh.usd", ("maya", "blender")), ("maya_mesh.obj", ("maya", "builtin"))):
+        p = os.path.join(out, n)
+        if os.path.exists(p):
+            cases += [(p, r) for r in routes]
+    for p in extra:
+        if os.path.exists(p):
+            cases.append((os.path.abspath(p), "auto"))
+    log("")
+    log("== reading back")
+    tiles = []
+    for p, route in cases:
+        LAST_VFX_ERROR = ""
+        t0 = time.time()
+        res, err = None, ""
+        try:
+            if route == "auto":
+                m = load_model(p, 500000)
+            elif route == "builtin":
+                m = load_model(p, 500000)
+            elif route in ("houdini", "gconvert", "openvdb"):
+                got = {"houdini": load_via_houdini, "gconvert": load_via_gconvert, "openvdb": load_vdb_openvdb}[route](p)
+                m = _finish_cache_numpy(got, 500000) if got else None
+            else:
+                fn = {"maya": load_via_maya, "blender": load_via_blender, "houdini-abc": load_via_houdini_mesh}[route]
+                got = fn(p)
+                m = _finish_model_numpy(got[0], got[1], 500000, len(got[1]), [("Source", got[2])]) if got and np is not None else None
+            if m and "error" in m:
+                err, m = m["error"], None
+            res = m
+        except Exception as ex:
+            err = f"{type(ex).__name__}: {ex}"
+        dt = time.time() - t0
+        name = f"{os.path.basename(p)} via {route}"
+        if res is None:
+            log(f"  FAIL  {name:<40} {dt:5.1f}s  {(err or LAST_VFX_ERROR or 'no result')[:300]}")
+            continue
+        parts = []
+        if len(res["faces"]):
+            parts.append(f"{len(res['faces']):,} tris")
+        if "points" in res:
+            parts.append(f"{len(res['points']):,} points" + (" +Cd" if "pcolor" in res else ""))
+        if "vpts" in res:
+            parts.append(f"{len(res['vpts']):,} voxels")
+        log(f"  OK    {name:<40} {dt:5.1f}s  {', '.join(parts) or 'EMPTY'}")
+        for k, v in res.get("info", []):
+            if k in ("Volumes", "Point attributes", "Source", "Houdini"):
+                log(f"          {k}: {v}")
+        if np is not None:
+            EX = {k: res[k] for k in ("points", "pcolor", "psize", "vpts", "vden", "vsize") if k in res} or None
+            V = np.asarray(res["verts"], np.float32).reshape(-1, 3)
+            F = np.asarray(res["faces"], np.int32).reshape(-1, 3)
+            N = np.asarray(res["normals"], np.float32).reshape(-1, 3) if len(res.get("normals", [])) else None
+            VN = np.asarray(res["vnormals"], np.float32).reshape(-1, 3) if len(res.get("vnormals", [])) else None
+            fr = software_render(V, F, N, VN, (320, 240, 0.6, 0.35, 1.0, 0, 0, True, False, (40, 40, 44), (1, 1, 1)), EX)
+            if fr:
+                rgb = np.frombuffer(fr[2], np.uint8).reshape(240, 320, 4)[:, :, [2, 1, 0]]
+                tiles.append((name, rgb))
+    if tiles and np is not None:
+        cols = 3
+        rows = (len(tiles) + cols - 1) // cols
+        sheet = np.full((rows * 244, cols * 324, 3), 20, np.uint8)
+        for i, (_, rgb) in enumerate(tiles):
+            r, c = divmod(i, cols)
+            sheet[r * 244 + 2:r * 244 + 242, c * 324 + 2:c * 324 + 322] = rgb
+        _png_write(os.path.join(out, "sheet.png"), sheet.shape[1], sheet.shape[0], sheet.tobytes())
+        log("")
+        log("contact sheet, left→right, top→bottom: " + "; ".join(n for n, _ in tiles))
+    with open(os.path.join(out, "report.txt"), "w") as f:
+        f.write(CrashReporter.sanitize("\n".join(rep) + "\n"))
+    print(f"\nWrote {out}/report.txt and sheet.png")
+    return 0
 
 
 # =========================================================================== encrypted file index
@@ -4290,17 +4788,204 @@ def ask_text(parent, title: str, label: str, value: str = "", select_stem: bool 
     return txt if r == Gtk.ResponseType.OK else None
 
 
-def pick_folder(parent, title: str, start: str) -> Optional[str]:
-    d = Gtk.FileChooserDialog(title=title, transient_for=parent, action=Gtk.FileChooserAction.SELECT_FOLDER)
-    d.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_Select", Gtk.ResponseType.OK)
-    d.set_default_response(Gtk.ResponseType.OK)
-    if start and os.path.isdir(start):
-        d.set_current_folder(start)
-    d.set_create_folders(True)
-    r = d.run()
-    p = d.get_filename()
-    d.destroy()
-    return p if r == Gtk.ResponseType.OK else None
+class FolderPicker(Gtk.Dialog):
+    """Kestrel's own "Browse for folder" (like Explorer's): a folder tree rooted at Quick access, Home, the
+    user folders and every drive, with a path field. Used instead of GTK's file chooser, which on GNOME is
+    the Nautilus-style chooser (or the Nautilus portal). Subfolders are listed in a thread when a branch is
+    opened, so a slow network share never freezes the dialog."""
+    DUMMY = "\u2026"
+
+    def __init__(self, parent, title: str, start: str, ok_label: str = "_Select"):
+        super().__init__(title=title, transient_for=parent, modal=True)
+        self.set_default_size(480, 560)
+        self.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_New folder", 1, ok_label, Gtk.ResponseType.OK)
+        self.set_default_response(Gtk.ResponseType.OK)
+        cfg = getattr(parent, "cfg", None) or load_config()
+        self.show_hidden = bool(cfg.get("show_hidden"))
+        box = self.get_content_area()
+        box.set_spacing(6)
+        box.set_border_width(10)
+        self.entry = Gtk.Entry(text=start or HOME, activates_default=True)
+        self.entry.set_tooltip_text("Type or paste a path, or pick a folder below")
+        box.pack_start(self.entry, False, False, 0)
+        self.store = Gtk.TreeStore(str, str, str, bool)          # label, path, icon name, loaded
+        self.tv = Gtk.TreeView(model=self.store, headers_visible=False, enable_search=True, search_column=0)
+        col = Gtk.TreeViewColumn()
+        ri = Gtk.CellRendererPixbuf()
+        rt = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+        col.pack_start(ri, False)
+        col.pack_start(rt, True)
+        col.add_attribute(ri, "icon-name", 2)
+        col.add_attribute(rt, "text", 0)
+        self.tv.append_column(col)
+        sw = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        sw.set_shadow_type(Gtk.ShadowType.IN)
+        sw.add(self.tv)
+        box.pack_start(sw, True, True, 0)
+        self.tv.connect("row-expanded", self._expanded)
+        self.tv.connect("row-activated", lambda tv, path, c: tv.collapse_row(path) if tv.row_expanded(path) else tv.expand_row(path, False))
+        self.tv.get_selection().connect("changed", self._selected)
+        self._reveal_target: Optional[str] = None
+        self._roots()
+        self.show_all()
+        if start and os.path.isdir(start):
+            self._reveal(os.path.abspath(start))
+
+    # ---- tree
+    def _add(self, parent_it, label: str, path: str, icon: str):
+        it = self.store.append(parent_it, [label, path, icon, False])
+        self.store.append(it, [self.DUMMY, "", "", True])        # expander until the real children load
+        return it
+
+    def _roots(self):
+        cfg = load_config()
+        for p in cfg.get("pinned", [])[:12]:
+            if PATHS.isdir(p):                                       # cached, never blocks on a dead share
+                self._add(None, os.path.basename(p.rstrip("/")) or p, p, "folder")
+        self._add(None, os.path.basename(HOME) or "Home", HOME, "user-home")
+        for label, p, icon in xdg_user_dirs():
+            self._add(None, label, p, icon)
+        try:
+            for label, p, _icon, kind in drives():
+                self._add(None, label, p, {"network": "network-server", "removable": "drive-removable-media"}.get(kind, "drive-harddisk"))
+        except Exception:
+            self._add(None, "Local Disk (/)", "/", "drive-harddisk")
+
+    def _expanded(self, tv, it, path):
+        if self.store[it][3]:
+            return
+        self.store[it][3] = True
+        folder = self.store[it][1]
+        ref = Gtk.TreeRowReference.new(self.store, path)
+        show_hidden = self.show_hidden
+
+        def work():
+            subs = []
+            try:
+                with os.scandir(folder) as sd:
+                    for d in sd:
+                        try:
+                            if d.is_dir() and (show_hidden or not d.name.startswith(".")):
+                                subs.append(d.name)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+            subs.sort(key=lambda n: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", n)])
+            GLib.idle_add(done, subs)
+
+        def done(subs):
+            if not ref.valid():
+                return False
+            pit = self.store.get_iter(ref.get_path())
+            child = self.store.iter_children(pit)
+            while child is not None:                            # drop the placeholder
+                nxt = self.store.iter_next(child)
+                if self.store[child][1] == "":
+                    self.store.remove(child)
+                child = nxt
+            for n in subs:
+                self._add(pit, n, os.path.join(folder, n), "folder")
+            self._continue_reveal(pit)
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _selected(self, sel):
+        model, it = sel.get_selected()
+        if it is not None and model[it][1]:
+            self.entry.set_text(model[it][1])
+
+    # ---- open the tree down to a path (one level per async listing)
+    def _reveal(self, target: str):
+        best, best_len = None, -1
+        it = self.store.get_iter_first()
+        while it is not None:
+            p = self.store[it][1]
+            if p and (target == p or target.startswith(p.rstrip("/") + "/")) and len(p) > best_len:
+                best, best_len = it, len(p)
+            it = self.store.iter_next(it)
+        if best is None:
+            return
+        self._reveal_target = target
+        self._step_into(best)
+
+    def _step_into(self, it):
+        path = self.store.get_path(it)
+        if self.store[it][1] == self._reveal_target:
+            self.tv.expand_to_path(path)
+            self.tv.get_selection().select_path(path)
+            self.tv.scroll_to_cell(path, None, True, 0.3, 0)
+            self._reveal_target = None
+            return
+        if self.store[it][3]:
+            self._continue_reveal(it)
+        else:
+            self.tv.expand_row(path, False)                      # lists children; done() continues
+
+    def _continue_reveal(self, pit):
+        t = self._reveal_target
+        if not t:
+            return
+        child = self.store.iter_children(pit)
+        while child is not None:
+            p = self.store[child][1]
+            if p and (t == p or t.startswith(p + "/")):
+                self.tv.expand_row(self.store.get_path(pit), False)
+                self._step_into(child)
+                return
+            child = self.store.iter_next(child)
+        self._reveal_target = None
+
+    # ---- run
+    def choose(self) -> Optional[str]:
+        while True:
+            r = self.run()
+            path = os.path.abspath(os.path.expanduser(self.entry.get_text().strip())) if self.entry.get_text().strip() else ""
+            if r == 1:                                           # New folder inside the current one
+                base = path if os.path.isdir(path) else HOME
+                name = ask_text(self, "New folder", f"New folder in {base}:", "New folder")
+                if name and "/" not in name:
+                    target = unique_name(os.path.join(base, name))
+                    try:
+                        os.makedirs(target)
+                        self.entry.set_text(target)
+                        self._reload_and_reveal(target)
+                    except OSError as ex:
+                        message(self, "New folder", str(ex), Gtk.MessageType.ERROR)
+                continue
+            if r == Gtk.ResponseType.OK:
+                if path and os.path.isdir(path):
+                    self.destroy()
+                    return path
+                message(self, "Folder not found", path or "No folder chosen.", Gtk.MessageType.WARNING)
+                continue
+            self.destroy()
+            return None
+
+    def _reload_and_reveal(self, target: str):
+        """A folder was created: forget the loaded children of its parent so the next listing shows it."""
+        parent_dir = os.path.dirname(target)
+
+        def walk(it):
+            while it is not None:
+                if self.store[it][1] == parent_dir and self.store[it][3]:
+                    child = self.store.iter_children(it)
+                    while child is not None:
+                        nxt = self.store.iter_next(child)
+                        self.store.remove(child)
+                        child = nxt
+                    self.store[it][3] = False
+                    self.store.append(it, [self.DUMMY, "", "", True])
+                    self.tv.collapse_row(self.store.get_path(it))
+                walk(self.store.iter_children(it))
+                it = self.store.iter_next(it)
+        walk(self.store.get_iter_first())
+        self._reveal(target)
+
+
+def pick_folder(parent, title: str, start: str, ok_label: str = "_Select") -> Optional[str]:
+    """Folder chooser used everywhere in Kestrel (Move to / Copy to, index roots, batch-rename repath)."""
+    return FolderPicker(parent, title, start, ok_label).choose()
 
 
 def conflict_dialog(parent, src: str, dst: str) -> Tuple[Optional[str], bool]:
@@ -4853,13 +5538,9 @@ class OptionsDialog(Gtk.Dialog):
             pass
 
     def _root_add(self):
-        d = Gtk.FileChooserDialog(title="Folder to index", transient_for=self, action=Gtk.FileChooserAction.SELECT_FOLDER)
-        d.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_Add", Gtk.ResponseType.OK)
-        if d.run() == Gtk.ResponseType.OK and d.get_filename():
-            p = d.get_filename()
-            if p not in [r[0] for r in self.roots_store]:
-                self.roots_store.append([p])
-        d.destroy()
+        p = pick_folder(self, "Folder to index", HOME, "_Add")
+        if p and p not in [r[0] for r in self.roots_store]:
+            self.roots_store.append([p])
 
     def _root_remove(self, tv):
         model, it = tv.get_selection().get_selected()
@@ -5095,9 +5776,11 @@ class BatchRenameDialog(Gtk.Dialog):
     """Rename many files at once with a live preview.
 
     Operations are applied in this order to each file's *name* (the extension is handled separately so
-    'IMG_001.jpg' keeps '.jpg'):  find/replace (plain or regex)  →  prefix / suffix  →  numbering pattern
-    →  case change.  The preview updates on every keystroke; Apply performs the renames in two phases
-    (via temporary names) so swaps and shifts like 1→2, 2→3 never collide."""
+    'IMG_001.jpg' keeps '.jpg'):  frame offset  →  find/replace (plain or regex)  →  prefix / suffix  →
+    numbering pattern  →  case change; then the optional repath moves the result into another folder.
+    The preview is debounced (recomputed ~80 ms after typing stops) and never touches the disk per file:
+    destination folders are listed once and cached. Apply renames in two phases (via temporary names) so
+    swaps and shifts like 1001→1061 over an overlapping range never collide."""
 
     CASE_OPTIONS = [("keep", "Keep case"), ("lower", "lowercase"), ("upper", "UPPERCASE"), ("title", "Title Case"), ("sentence", "Sentence case")]
 
@@ -5172,10 +5855,40 @@ class BatchRenameDialog(Gtk.Dialog):
         self.only_matching = Gtk.CheckButton(label="Only rename items that match Find")
         cb.pack_start(self.only_matching, False, False, 0)
         grid.attach(cb, 1, r, 3, 1)
+        r += 1
+        grid.attach(Gtk.Label(label="Frame offset:", xalign=1), 0, r, 1, 1)
+        fb = Gtk.Box(spacing=6)
+        self.offset = Gtk.SpinButton.new_with_range(-999999, 999999, 1)
+        self.offset.set_value(0)
+        self.offset.set_tooltip_text("Adds this to the frame number in each name, keeping its padding: "
+                                     "shot.1001.exr with offset 60 → shot.1061.exr (0 = off)")
+        fb.pack_start(self.offset, False, False, 0)
+        fb.pack_start(Gtk.Label(label="applied to the"), False, False, 0)
+        self.offset_which = Gtk.ComboBoxText()
+        self.offset_which.append("last", "last number in the name")
+        self.offset_which.append("first", "first number in the name")
+        self.offset_which.set_active_id("last")
+        fb.pack_start(self.offset_which, False, False, 0)
+        grid.attach(fb, 1, r, 3, 1)
+        r += 1
+        grid.attach(Gtk.Label(label="Move to:", xalign=1), 0, r, 1, 1)
+        mb = Gtk.Box(spacing=6)
+        self.dest = Gtk.Entry(hexpand=True, placeholder_text="empty = rename in place   ·   e.g.  ../v004   /mnt/show/{parent}_fixed")
+        self.dest.set_tooltip_text("Repath: move the renamed files into this folder (absolute, or relative to each file's folder).\n"
+                                   "{parent} = the file's folder name, {dir} = its full folder path, {ext} = its extension")
+        mb.pack_start(self.dest, True, True, 0)
+        browse = Gtk.Button(label="Browse…")
+        browse.connect("clicked", self._browse_dest)
+        mb.pack_start(browse, False, False, 0)
+        self.mkdirs = Gtk.CheckButton(label="Create missing folders")
+        self.mkdirs.set_active(True)
+        mb.pack_start(self.mkdirs, False, False, 0)
+        grid.attach(mb, 1, r, 3, 1)
 
         # ---- preview
         self.store = Gtk.ListStore(str, str, str)       # old, new, status
         tv = Gtk.TreeView(model=self.store)
+        self.tv = tv
         for i, title in enumerate(("Original", "New name", "")):
             rend = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.MIDDLE)
             col = Gtk.TreeViewColumn(title, rend, text=i)
@@ -5191,22 +5904,61 @@ class BatchRenameDialog(Gtk.Dialog):
         self.summary.get_style_context().add_class("dim-label")
         box.pack_start(self.summary, False, False, 0)
 
-        for w in (self.find, self.replace, self.prefix, self.suffix, self.pattern):
-            w.connect("changed", lambda *_: self.refresh())
-        for w in (self.regex, self.icase, self.incl_ext, self.only_matching):
-            w.connect("toggled", lambda *_: self.refresh())
-        for w in (self.start, self.step, self.digits):
-            w.connect("value-changed", lambda *_: self.refresh())
-        for w in (self.case, self.order):
-            w.connect("changed", lambda *_: self.refresh())
+        self._paths = {e.path for e in self.entries}
+        self._dir_cache: Dict[str, Optional[set]] = {}      # destination folder → names in it (None = missing)
+        self._order_key, self._order_list = None, []
+        self._timer = 0
+        for w in (self.find, self.replace, self.prefix, self.suffix, self.pattern, self.dest):
+            w.connect("changed", lambda *_: self._schedule())
+        for w in (self.regex, self.icase, self.incl_ext, self.only_matching, self.mkdirs):
+            w.connect("toggled", lambda *_: self._schedule())
+        for w in (self.start, self.step, self.digits, self.offset):
+            w.connect("value-changed", lambda *_: self._schedule())
+        for w in (self.case, self.order, self.offset_which):
+            w.connect("changed", lambda *_: self._schedule())
         self.connect("response", self._response)
+        self.connect("destroy", lambda *_: self._timer and GLib.source_remove(self._timer))
         self.plan: List[Tuple[str, str]] = []
         self.show_all()
         self.refresh()
 
+    def _schedule(self):
+        """Typing re-plans once the keystrokes pause (80 ms), not on every key."""
+        if self._timer:
+            GLib.source_remove(self._timer)
+        self._timer = GLib.timeout_add(80, self._fire)
+
+    def _fire(self):
+        self._timer = 0
+        self.refresh()
+        return False
+
+    def _browse_dest(self, *a):
+        start = resolve_dest_dir(self.entries[0].path, self.dest.get_text().strip()) if (self.entries and self.dest.get_text().strip()) else \
+            (os.path.dirname(self.entries[0].path) if self.entries else HOME)
+        p = pick_folder(self, "Move renamed files to", start)
+        if p:
+            self.dest.set_text(p)
+
+    def _names_in(self, folder: str) -> Optional[set]:
+        """Names in a destination folder, listed once per dialog (None if it doesn't exist)."""
+        if folder not in self._dir_cache:
+            try:
+                self._dir_cache[folder] = set(os.listdir(folder))
+            except OSError:
+                self._dir_cache[folder] = None
+        return self._dir_cache[folder]
+
     # ---- computing the new names
     def _ordered(self) -> List[Entry]:
         key = self.order.get_active_id()
+        if key == self._order_key:
+            return self._order_list
+        self._order_key = key
+        self._order_list = self._compute_order(key)
+        return self._order_list
+
+    def _compute_order(self, key) -> List[Entry]:
         if key == "selection":
             return list(self.entries)
         if key == "modified":
@@ -5215,37 +5967,51 @@ class BatchRenameDialog(Gtk.Dialog):
             return sorted(self.entries, key=lambda e: (e.size or 0, e.name.lower()))
         return sorted(self.entries, key=lambda e: _natural_key(e.name))
 
-    def _new_name(self, e: Entry, idx: int, counter: int) -> Optional[str]:
-        """Apply the operations; None = leave this file alone."""
+    def _params(self) -> dict:
+        """Read every control ONCE per refresh (reading GTK widgets per file was most of the old cost)."""
         import re
-        if e.is_dir or not self.incl_ext.get_active():
+        find = self.find.get_text()
+        pat, bad = None, False
+        if find:
+            try:
+                pat = re.compile(find if self.regex.get_active() else re.escape(find), re.IGNORECASE if self.icase.get_active() else 0)
+            except re.error:
+                bad = True
+        return {"pat": pat, "bad_regex": bad, "repl": self.replace.get_text() if self.regex.get_active() else self.replace.get_text().replace("\\", "\\\\"),
+                "incl_ext": self.incl_ext.get_active(), "only": self.only_matching.get_active(),
+                "prefix": self.prefix.get_text(), "suffix": self.suffix.get_text(), "pattern": self.pattern.get_text(),
+                "digits": int(self.digits.get_value()), "case": self.case.get_active_id(),
+                "offset": int(self.offset.get_value()), "which": self.offset_which.get_active_id() or "last",
+                "dest": self.dest.get_text().strip(), "mkdirs": self.mkdirs.get_active()}
+
+    def _new_name(self, e: Entry, idx: int, counter: int, P: dict) -> Tuple[Optional[str], str]:
+        """(new name, problem). new None = leave this file alone; the name may equal the old one (repath only)."""
+        if e.is_dir or not P["incl_ext"]:
             stem, ext = (e.name, "") if e.is_dir else os.path.splitext(e.name)
         else:
             stem, ext = e.name, ""
-        find = self.find.get_text()
+        if P["offset"]:
+            stem, err = offset_number(stem, P["offset"], P["which"])
+            if err:
+                return None, err
         matched = True
-        if find:
-            flags = re.IGNORECASE if self.icase.get_active() else 0
-            try:
-                pat = re.compile(find if self.regex.get_active() else re.escape(find), flags)
-            except re.error:
-                return None
+        pat = P["pat"]
+        if pat is not None:
             matched = bool(pat.search(stem))
             if matched:
                 try:
-                    stem = pat.sub(self.replace.get_text(), stem)
-                except re.error:
-                    return None
-        if self.only_matching.get_active() and not matched:
-            return None
-        stem = self.prefix.get_text() + stem + self.suffix.get_text()
-        pattern = self.pattern.get_text()
-        if pattern:
-            n = str(counter).zfill(int(self.digits.get_value()))
-            date = fmt_date(e.mtime, "%Y-%m-%d") if e.mtime else ""
-            stem = (pattern.replace("{n}", n).replace("{name}", stem).replace("{ext}", ext.lstrip("."))
+                    stem = pat.sub(P["repl"], stem)
+                except Exception:
+                    return None, "bad replacement"
+        if P["only"] and not matched:
+            return None, ""
+        stem = P["prefix"] + stem + P["suffix"]
+        if P["pattern"]:
+            n = str(counter).zfill(P["digits"])
+            date = fmt_date(e.mtime, "%Y-%m-%d") if (e.mtime and "{date}" in P["pattern"]) else ""
+            stem = (P["pattern"].replace("{n}", n).replace("{name}", stem).replace("{ext}", ext.lstrip("."))
                     .replace("{date}", date).replace("{i}", str(idx + 1)))
-        case = self.case.get_active_id()
+        case = P["case"]
         if case == "lower":
             stem = stem.lower()
         elif case == "upper":
@@ -5254,41 +6020,91 @@ class BatchRenameDialog(Gtk.Dialog):
             stem = stem.title()
         elif case == "sentence":
             stem = stem[:1].upper() + stem[1:].lower()
-        new = stem + ext
-        return new if new and new != e.name else None
+        return stem + ext, ""
 
     def refresh(self):
-        self.store.clear()
-        self.plan = []
+        P = self._params()
+        if P["bad_regex"]:
+            self.summary.set_text("The Find expression isn't a valid regular expression.")
+            self.set_response_sensitive(Gtk.ResponseType.OK, False)
+            return
         counter = int(self.start.get_value())
         step = int(self.step.get_value())
         targets: Dict[str, str] = {}
         problems = 0
+        rows = []
+        self.plan = []
+        here = os.path.dirname(self.entries[0].path) if self.entries else ""
         for idx, e in enumerate(self._ordered()):
-            new = self._new_name(e, idx, counter)
-            status = ""
+            new, status = self._new_name(e, idx, counter, P)
+            shown = new or ""
             if new is not None:
                 counter += step
-                dest = os.path.join(os.path.dirname(e.path), new)
-                if "/" in new or new in (".", ".."):
+                src_dir = os.path.dirname(e.path)
+                ddir = resolve_dest_dir(e.path, P["dest"]) if P["dest"] else src_dir
+                dest = os.path.join(ddir, new)
+                if ddir != src_dir:
+                    shown = os.path.relpath(dest, here) if dest.startswith(here + os.sep) else dest
+                if dest == e.path:
+                    new, shown = None, ""                    # nothing changes for this one
+                elif "/" in new or new in (".", ".."):
                     status, new = "invalid name", None
                 elif dest in targets:
                     status = "duplicate target"
-                elif os.path.lexists(dest) and dest not in {x.path for x in self.entries}:
-                    status = "already exists"
-                if status:
-                    problems += 1
                 else:
+                    names = self._names_in(ddir)
+                    if names is None and not P["mkdirs"]:
+                        status = "folder missing"
+                    elif names is not None and new in names and dest not in self._paths:
+                        status = "already exists"
+                if not status and new is not None:
                     targets[dest] = e.path
                     self.plan.append((e.path, dest))
-            self.store.append([e.name, new or "", status or ("" if new else "—")])
-        self.summary.set_text(f"{len(self.plan)} of {len(self.entries)} items will be renamed" + (f"   ·   {problems} problem{'s' if problems != 1 else ''} (shown in red)" if problems else ""))
+            if status:
+                problems += 1
+            rows.append([e.name, shown, status or ("" if shown else "—")])
+        # refill detached from the view: one relayout instead of one per row
+        self.tv.set_model(None)
+        self.store.clear()
+        for row in rows:
+            self.store.append(row)
+        self.tv.set_model(self.store)
+        moving = sum(1 for s_, d_ in self.plan if os.path.dirname(s_) != os.path.dirname(d_))
+        self.summary.set_text(f"{len(self.plan)} of {len(self.entries)} items will be renamed" + (f" ({moving} moved)" if moving else "")
+                              + (f"   ·   {problems} problem{'s' if problems != 1 else ''} (shown in red)" if problems else ""))
         self.set_response_sensitive(Gtk.ResponseType.OK, bool(self.plan) and not problems)
 
     def _response(self, d, r):
         if r == Gtk.ResponseType.OK and self.plan:
             self.on_done(list(self.plan))
         self.destroy()
+
+
+def offset_number(stem: str, offset: int, which: str = "last") -> Tuple[str, str]:
+    """Add `offset` to the last (or first) run of digits in `stem`, keeping zero padding:
+    ('shot.1001', 60) → 'shot.1061';  ('f0009', 3) → 'f0012';  ('a.0999', 2) → 'a.1001'.
+    Returns (stem, problem); problem is set when there's no number or the result would be negative."""
+    import re
+    runs = list(re.finditer(r"\d+", stem))
+    if not runs:
+        return stem, "no number to offset"
+    m = runs[-1] if which != "first" else runs[0]
+    v = int(m.group()) + offset
+    if v < 0:
+        return stem, "frame would be negative"
+    digits = str(v).zfill(len(m.group()))
+    return stem[:m.start()] + digits + stem[m.end():], ""
+
+
+def resolve_dest_dir(path: str, text: str) -> str:
+    """Repath target for one file: tokens {parent} {dir} {ext}, ~, and paths relative to the file's folder."""
+    src_dir = os.path.dirname(path)
+    t = (text.replace("{parent}", os.path.basename(src_dir)).replace("{dir}", src_dir)
+         .replace("{ext}", os.path.splitext(path)[1].lstrip(".")))
+    t = os.path.expanduser(t)
+    if not os.path.isabs(t):
+        t = os.path.join(src_dir, t)
+    return os.path.normpath(t)
 
 
 def _natural_key(s: str):
@@ -5313,7 +6129,13 @@ def apply_renames(plan: List[Tuple[str, str]]) -> Tuple[List[Tuple[str, str]], L
         try:
             if os.path.lexists(dst):
                 raise OSError("target exists")
-            os.rename(tmp, dst)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)          # repath into a new folder
+            try:
+                os.rename(tmp, dst)
+            except OSError as ex:
+                if ex.errno != 18:                                    # EXDEV: another filesystem → copy + delete
+                    raise
+                shutil.move(tmp, dst)
             done.append((src, dst))
         except OSError as ex:
             errors.append(f"{os.path.basename(src)}: {ex}")
@@ -5414,6 +6236,31 @@ def open_report(parent, path: Optional[str] = None):
         p = CRASH.manual_report()
         GLib.idle_add(lambda: (ReportDialog(parent, p).run_report(), False)[1])
     threading.Thread(target=work, daemon=True).start()
+
+
+# --------------------------------------------------------------------------- input diagnostics
+DEBUG_INPUT = bool(os.environ.get("KESTREL_DEBUG_INPUT"))
+_INPUT_T0 = time.monotonic()
+
+
+def input_log(msg: str):
+    """KESTREL_DEBUG_INPUT=1: one line per click / selection event on stderr (and in error reports)."""
+    line = f"[input {time.monotonic() - _INPUT_T0:8.3f}] {msg}"
+    print(line, file=sys.stderr, flush=True)
+    RECENT_LOG.append(line)
+
+
+def is_double_click(last, item: int, event) -> bool:
+    """Our own double-click test: second press on the same item within the desktop's double-click time and
+    distance. `last` = (item, time, x_root, y_root) of the previous press, or None after a folder change."""
+    if last is None or item < 0 or last[0] != item:
+        return False
+    st = Gtk.Settings.get_default()
+    try:
+        dt, dist = st.props.gtk_double_click_time, st.props.gtk_double_click_distance
+    except Exception:
+        dt, dist = 400, 5
+    return (0 <= event.time - last[1] <= dt and abs(event.x_root - last[2]) <= dist and abs(event.y_root - last[3]) <= dist)
 
 
 # --------------------------------------------------------------------------- row hover for tree views
@@ -5637,6 +6484,8 @@ class IconGrid(Gtk.Layout):
 
     def _reset_press(self):
         """A dialog or drag grab interrupted a click: forget the pending press/rubber band."""
+        if DEBUG_INPUT:
+            input_log("grid: press reset by a grab")
         self.press_index, self.press_pos = -1, None
         if self.rubber is not None:
             self.rubber = None
@@ -5663,8 +6512,11 @@ class IconGrid(Gtk.Layout):
             self._mh = [model.connect("row-changed", self._row_changed),
                         model.connect("row-inserted", lambda m, p, it: self._model_resized()),
                         model.connect("row-deleted", lambda m, p: self._model_resized())]
+        if DEBUG_INPUT:
+            input_log(f"grid: set_model({'None' if model is None else len(model)}) — selection, cursor and shift-anchor reset")
         self.selected.clear()
         self.cursor = self.anchor = -1
+        self._last_click = None          # a click in the previous folder never pairs with one in this folder
         self._model_resized()
 
     def get_model(self):
@@ -5862,7 +6714,10 @@ class IconGrid(Gtk.Layout):
         return path.get_indices()[0] in self.selected
 
     def select_path(self, path):
-        self.selected.add(path.get_indices()[0])
+        i = path.get_indices()[0]
+        self.selected.add(i)
+        if self.anchor < 0:                  # programmatic selection (after a reload / going up) anchors shift-click
+            self.anchor = self.cursor = i
         self._emit_sel()
 
     def unselect_path(self, path):
@@ -5935,13 +6790,22 @@ class IconGrid(Gtk.Layout):
         i = self._index_at(x, y)
         mods = event.state & Gtk.accelerator_get_default_mod_mask()
         ctrl, shift = bool(mods & Gdk.ModifierType.CONTROL_MASK), bool(mods & Gdk.ModifierType.SHIFT_MASK)
-        if event.button == 1 and event.type == Gdk.EventType._2BUTTON_PRESS:
-            if i >= 0 and not self.single_click:
-                self.emit("item-activated", Gtk.TreePath.new_from_indices([i]))
-            return True
+        if DEBUG_INPUT:
+            input_log(f"grid: {event.type.value_nick} button={event.button} item={i} shift={shift} ctrl={ctrl} "
+                      f"anchor={self.anchor} cursor={self.cursor} selected={len(self.selected)} t={event.time}")
         if event.type != Gdk.EventType.BUTTON_PRESS:
+            # GDK's own 2/3-click events are ignored: GDK keeps counting clicks across a folder change, so the
+            # first click of a quick double-click right after opening a folder became the THIRD click of the
+            # double-click that opened it, and the real double-click was lost. We pair clicks ourselves below.
             return True
         if event.button == 1:
+            if is_double_click(getattr(self, "_last_click", None), i, event):
+                self._last_click = None
+                if i >= 0 and not self.single_click:
+                    self.cursor = i
+                    self.emit("item-activated", Gtk.TreePath.new_from_indices([i]))
+                return True
+            self._last_click = (i, event.time, event.x_root, event.y_root)
             self.press_index, self.press_pos = i, (event.x, event.y)
             self.press_was_selected = i in self.selected
             if i < 0:
@@ -5954,7 +6818,9 @@ class IconGrid(Gtk.Layout):
                 (self.selected.discard if i in self.selected else self.selected.add)(i)
                 self.cursor = self.anchor = i
                 self._emit_sel()
-            elif shift and self.anchor >= 0:
+            elif shift and (self.anchor >= 0 or self.cursor >= 0 or self.selected):
+                if self.anchor < 0:
+                    self.anchor = self.cursor if self.cursor >= 0 else min(self.selected)
                 lo, hi = min(self.anchor, i), max(self.anchor, i)
                 self.selected = set(range(lo, hi + 1))
                 self.cursor = i
@@ -6381,10 +7247,45 @@ def file_clipboard() -> FileClipboard:
 
 
 # --------------------------------------------------------------------------- lightweight 3D model preview
-def load_model(path: str, max_faces: int = 500000) -> Optional[dict]:
+def _read_obj_numpy(data: bytes):
+    """OBJ text → (V float64 N×3, F int64 M×3) in bulk with numpy: pull the 'v' and 'f' lines out, drop the
+    /vt/vn parts, fan-triangulate n-gons vectorised. (V empty if the file has no usable vertices.)"""
+    vlines = [l for l in data.split(b"\n") if l[:2] == b"v "]
+    try:
+        V = np.array(b" ".join(l[2:].strip() for l in vlines).split(), dtype=np.float64)
+        V = V.reshape(len(vlines), -1)[:, :3] if len(vlines) else np.zeros((0, 3))
+    except ValueError:
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
+    if not len(V):
+        return V, np.zeros((0, 3), dtype=np.int64)
+    flines = [l[2:].strip() for l in data.split(b"\n") if l[:2] == b"f "]
+    nvert = len(V)
+    if not flines:
+        return V, np.zeros((0, 3), dtype=np.int64)
+    blob = re.sub(rb"[ \t]+", b" ", re.sub(rb"/\S*", b"", b"\n".join(flines))).strip()
+    rows = blob.split(b"\n")
+    counts = np.fromiter((r.count(b" ") + 1 for r in rows), dtype=np.int64, count=len(rows))
+    toks = blob.split()
+    idx = np.array(toks).astype(np.int64) if toks else np.zeros(0, dtype=np.int64)
+    idx = np.where(idx > 0, idx - 1, nvert + idx)
+    starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+    tris = []
+    for t in range(1, int(counts.max()) - 1 if len(counts) else 0):
+        sel = counts > t + 1
+        s0 = starts[sel]
+        tris.append(np.stack((idx[s0], idx[s0 + t], idx[s0 + t + 1]), axis=1))
+    F = np.concatenate(tris) if tris else np.zeros((0, 3), dtype=np.int64)
+    return V, F
+
+
+def load_model(path: str, max_faces: int = 500000, norm=None, max_voxels: Optional[int] = None) -> Optional[dict]:
     """Parse OBJ / STL (ascii+binary) / PLY (ascii) into {verts: [(x,y,z)], faces: [(i,j,k)], info: [...]}.
-    Big meshes are decimated by skipping faces so the preview stays interactive."""
+    Big meshes are decimated by skipping faces so the preview stays interactive. For Houdini caches, `norm`
+    (from a previous frame's result) keeps every frame of a sequence in the same box and brightness."""
     global LAST_VFX_ERROR
+    hk = houdini_kind(os.path.basename(path))
+    if hk:
+        return load_houdini_cache(path, hk, max_faces, norm, max_voxels)
     ext = os.path.splitext(path)[1].lower()
     verts: List[Tuple[float, float, float]] = []
     faces: List[Tuple[int, int, int]] = []
@@ -6393,36 +7294,11 @@ def load_model(path: str, max_faces: int = 500000) -> Optional[dict]:
     if ext == ".obj" and np is None:
         ext = ".obj-slow"
     if ext == ".obj":
-        # numpy fast path: pull the 'v' and 'f' lines out in bulk; the Python fallback below handles the rest
         with open(path, "rb") as f:
-            data = f.read()
-        vlines = [l for l in data.split(b"\n") if l[:2] == b"v "]
-        try:
-            V = np.array(b" ".join(l[2:].strip() for l in vlines).split(), dtype=np.float64)
-            V = V.reshape(len(vlines), -1)[:, :3] if len(vlines) else np.zeros((0, 3))
-        except ValueError:
-            V = None
-        if V is not None and len(V):
-            verts = V
-            flines = [l[2:].strip() for l in data.split(b"\n") if l[:2] == b"f "]
-            nvert = len(V)
-            # drop the /vt/vn parts, then every remaining token is a vertex index; polygons are fan-triangulated
-            # with the same vectorised scheme as the Alembic reader
-            blob = re.sub(rb"[ \t]+", b" ", re.sub(rb"/\S*", b"", b"\n".join(flines))).strip()
-            rows = blob.split(b"\n")
-            counts = np.fromiter((r.count(b" ") + 1 for r in rows), dtype=np.int64, count=len(rows))
-            toks = blob.split()
-            idx = np.array(toks).astype(np.int64) if toks else np.zeros(0, dtype=np.int64)
-            idx = np.where(idx > 0, idx - 1, nvert + idx)
-            starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
-            tris = []
-            for t in range(1, int(counts.max()) - 1 if len(counts) else 0):
-                sel = counts > t + 1
-                s0 = starts[sel]
-                tris.append(np.stack((idx[s0], idx[s0 + t], idx[s0 + t + 1]), axis=1))
-            faces = np.concatenate(tris) if tris else np.zeros((0, 3), dtype=np.int64)
+            V, F = _read_obj_numpy(f.read())
+        if len(V):
+            verts, faces = V, F
             nfaces_total = len(faces)
-            del data, vlines, flines, blob, rows, toks
         else:
             ext = ".obj-slow"
     if ext == ".obj-slow":
@@ -6525,7 +7401,7 @@ def load_model(path: str, max_faces: int = 500000) -> Optional[dict]:
             verts, faces, nm = [], [], 0
         extra = [("Meshes", str(nm)), ("Source", "FBX " + ("binary" if open(path, "rb").read(18) == b"Kaydara FBX Binary" else "ASCII"))]
         if not verts:
-            for loader in (load_via_assimp, load_via_blender):
+            for loader in (load_via_assimp, load_via_blender, load_via_maya):
                 got = loader(path)
                 if got:
                     verts, faces = got[0], got[1]
@@ -6557,7 +7433,13 @@ def load_model(path: str, max_faces: int = 500000) -> Optional[dict]:
             # open-source first: h5py reads the HDF5 container directly; vendor PyAlembic only as a last resort
             loaders = [load_abc_hdf5]          # (Maya's PyAlembic rejects HDF5 too: "Unsupported core type")
         else:
-            loaders = [load_via_blender, load_via_assimp, load_via_vfx_python]
+            # Blender first; Maya for studios that don't deploy Blender; Houdini reads Alembic too
+            loaders = [load_via_blender, load_via_assimp]
+            if ext in (".abc", ".usd", ".usda", ".usdc", ".usdz", ".obj", ".dae"):
+                loaders.append(load_via_maya)
+            if ext == ".abc":
+                loaders.append(load_via_houdini_mesh)
+            loaders.append(load_via_vfx_python)
         for loader in loaders:
             if len(verts):
                 break
@@ -6605,7 +7487,7 @@ def load_model(path: str, max_faces: int = 500000) -> Optional[dict]:
     return {"verts": verts, "faces": faces, "normals": normals, "info": info, "nfaces_total": nfaces_total}
 
 
-def _finish_model_numpy(verts, faces, max_faces: int, nfaces_total: int, extra: list) -> dict:
+def _finish_model_numpy(verts, faces, max_faces: int, nfaces_total: int, extra: list, bounds=None) -> dict:
     """Vectorised post-processing: decimate, drop unused vertices, normalise to a unit box, face + vertex
     normals. verts/faces may be Python lists or numpy arrays. Decimation is by VERTEX CLUSTERING (snap
     vertices to a grid, merge, drop collapsed faces) rather than by skipping faces: skipping leaves a
@@ -6615,7 +7497,7 @@ def _finish_model_numpy(verts, faces, max_faces: int, nfaces_total: int, extra: 
     V = np.asarray(verts, dtype=np.float32).reshape(-1, 3)
     F = np.asarray(faces, dtype=np.int32).reshape(-1, 3)
     nverts_total = len(V)
-    lo, hi = V.min(axis=0), V.max(axis=0)
+    lo, hi = bounds if bounds is not None else (V.min(axis=0), V.max(axis=0))
     size = (hi - lo).astype(np.float64)
     scale = max(float(size.max()), 1e-9)
     V = ((V - (lo + hi) / 2) / scale).astype(np.float32)   # unit box around the origin, longest side = 1
@@ -6696,9 +7578,222 @@ def _finish_model_numpy(verts, faces, max_faces: int, nfaces_total: int, extra: 
 
 
 
-def software_render(V, F, N, VN, params):
+def load_houdini_cache(path: str, kind: str, max_faces: int, norm=None, max_voxels: Optional[int] = None) -> Optional[dict]:
+    """.bgeo/.geo/.vdb → model dict with any of: mesh, particles (points + Cd), volume voxels.
+    Order: VDB: built-in reader (fast, no licence) → Houdini (hython) → gconvert (.geo/.bgeo) →
+    for VDB: OpenVDB Python module → Blender (volume → mesh)."""
+    global LAST_VFX_ERROR
+    LAST_VFX_ERROR = ""
+    if np is None:
+        return {"error": "Houdini caches need numpy (sudo dnf install python3-numpy)."}
+    mv = max_voxels or VDB_MAX_VOXELS
+    got = load_vdb_native(path, mv, norm[3] if norm is not None and len(norm) > 3 else None) if kind == "vdb" else None
+    if got is None:
+        got = load_via_houdini(path, max_voxels=mv)
+    if got is None and kind == "geo":
+        got = load_via_gconvert(path)
+    if got is None and kind == "vdb":
+        got = load_vdb_openvdb(path)
+        if got is None:
+            b = load_via_blender(path)
+            if b:
+                got = {"V": b[0], "F": b[1], "info": [("Volume", "shown as a surface (Blender volume → mesh)")], "source": "Blender"}
+    if got is None:
+        hint = "" if _find_houdini()["hython"] else " Install Houdini (hython) to preview Houdini caches."
+        return {"error": (LAST_VFX_ERROR or "No reader for this cache.") + hint}
+    return _finish_cache_numpy(got, max_faces, norm=norm)
+
+
+def _finish_cache_numpy(got: dict, max_faces: int, max_points: int = 2_000_000, norm=None) -> dict:
+    """Normalise mesh / points / volume voxels into ONE unit box (so they stay registered), then finish the mesh
+    part with the usual pipeline. Returns the model dict plus 'points', 'pcolor', 'vpts', 'vden', 'vsize', and
+    'norm' = (centre, scale, density max): pass it back for the next frame of a sequence so the box and the
+    smoke brightness stay put while it plays."""
+    parts = [np.asarray(got[k], dtype=np.float64).reshape(-1, 3) for k in ("V", "P", "vP") if k in got and len(got[k])]
+    if not parts:
+        return {"error": "The cache contains no points, polygons or volumes."}
+    allp = np.concatenate([p[:: max(1, len(p) // 200000)] for p in parts] + [p.min(0, keepdims=True) for p in parts] + [p.max(0, keepdims=True) for p in parts])
+    lo, hi = allp.min(axis=0), allp.max(axis=0)
+    size = hi - lo
+    if norm is not None:
+        centre, scale, dmax_ref = np.asarray(norm[0], dtype=np.float64), float(norm[1]), norm[2]
+    else:
+        centre, scale, dmax_ref = (lo + hi) / 2, max(float(size.max()), 1e-9), None
+    to_box = lambda A: ((np.asarray(A, dtype=np.float64).reshape(-1, 3) - centre) / scale).astype(np.float32)
+    extra = list(got.get("info", [])) + [("Source", got.get("source", ""))]
+    if "F" in got and len(got["F"]):
+        half = np.full(3, scale / 2)
+        m = _finish_model_numpy(got["V"], got["F"], max_faces, len(got["F"]), [],
+                                bounds=((centre - half).astype(np.float32), (centre + half).astype(np.float32)))
+        info = [r for r in m["info"] if r[0] in ("Vertices", "Faces")]
+    else:
+        m = {"verts": np.zeros((0, 3), np.float32), "faces": np.zeros((0, 3), np.int32), "normals": np.zeros((0, 3), np.float32),
+             "vnormals": np.zeros((0, 3), np.float32), "nfaces_total": 0}
+        info = []
+    if "P" in got and len(got["P"]):
+        P = to_box(got["P"])
+        step = max(1, len(P) // max_points)
+        m["points"] = np.ascontiguousarray(P[::step])
+        if "Cd" in got and len(got["Cd"]) == len(P):
+            m["pcolor"] = np.clip(np.asarray(got["Cd"], dtype=np.float32)[::step], 0, 1)
+        if "pS" in got:
+            m["psize"] = float(np.asarray(got["pS"]).ravel()[0]) * step / scale
+    if "vP" in got and len(got["vP"]):
+        m["vpts"] = to_box(got["vP"])
+        d = np.asarray(got["vD"], dtype=np.float32).ravel()
+        dmax = float(dmax_ref) if dmax_ref else max(float(d.max()), 1e-9)
+        m["vden"] = d / dmax
+        m["vsize"] = float(np.asarray(got.get("vS", [scale / 100])).ravel()[0]) / scale
+    m["info"] = info + [("Bounds", f"{size[0]:.3g} × {size[1]:.3g} × {size[2]:.3g}")] + [r for r in extra if r[1]]
+    vd = got.get("vD")
+    m["norm"] = (tuple(float(x) for x in centre), scale,
+                 dmax_ref or (max(float(np.max(vd)), 1e-9) if vd is not None and len(vd) else None),
+                 norm[3] if norm is not None and len(norm) > 3 else got.get("vStep"))
+    return m
+
+
+def _project(V, W, H, yaw, pitch, zoom, panx, pany):
+    """Camera used by every software path: per-point screen x/y, view depth (larger = nearer) and the
+    perspective factor (screen pixels per model unit at that point)."""
+    f32 = np.float32
+    cy_, sy_ = math.cos(yaw), math.sin(yaw)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    k16 = min(W, H) * 0.8 * zoom * 1.6
+    ox, oy = W / 2 + panx, H / 2 + pany
+    x, y, z = V[:, 0], V[:, 1], V[:, 2]
+    xr = x * f32(cy_) + z * f32(sy_)
+    zr = -x * f32(sy_) + z * f32(cy_)
+    yp = y * f32(cp) - zr * f32(sp)
+    depth = y * f32(sp) + zr * f32(cp)
+    wdiv = f32(k16) / (f32(2.6) - depth)
+    return f32(ox) + xr * wdiv, f32(oy) - yp * wdiv, depth, wdiv
+
+
+def render_cache(V, F, N, VN, EX, params):
+    """Frame for a model with particles and/or volume voxels (mesh optional). Opaque pass (mesh triangles and
+    point splats) into a shared z-buffer, then the volume as smoke: voxel densities in front of the opaque
+    surface are summed per pixel and composited with an auto-exposed absorption curve."""
+    W, H, yaw, pitch, zoom, panx, pany, smooth, wire, bg_rgb, fg_rgb = params
+    if W < 2 or H < 2:
+        return None
+    f32 = np.float32
+    n = W * H
+    zbuf = np.full(n, -np.inf, dtype=f32)
+    col = np.empty((n, 3), dtype=f32)
+    col[:] = np.array(bg_rgb, dtype=f32) / f32(255)
+    drew = False
+    if F is not None and len(F):
+        px, py, depth, _ = _project(V, W, H, yaw, pitch, zoom, panx, pany)
+        cy_, sy_, cp, sp = math.cos(yaw), math.sin(yaw), math.cos(pitch), math.sin(pitch)
+        NN = VN if (smooth and VN is not None and len(VN)) else N
+        nx1 = NN[:, 0] * f32(cy_) + NN[:, 2] * f32(sy_)
+        nz1 = -NN[:, 0] * f32(sy_) + NN[:, 2] * f32(cy_)
+        ny2 = NN[:, 1] * f32(cp) - nz1 * f32(sp)
+        nz2 = NN[:, 1] * f32(sp) + nz1 * f32(cp)
+        sh = f32(0.35) + f32(0.65) * np.minimum(np.abs(nx1 * f32(0.4) + ny2 * f32(0.7) + nz2 * f32(0.6)), f32(1.0))
+        vsh, fsh = (sh, None) if NN is VN else (None, sh)
+        bufs = _rasterize(W, H, px, py, depth, F[:, 0], F[:, 1], F[:, 2], vsh, fsh, bg_rgb, buffers=True)
+        if bufs is not None:
+            zb, sb, hit = bufs
+            zbuf = zb
+            s_ = sb[hit]
+            col[hit, 0] = np.clip(0.42 * s_ + 0.1, 0, 1)
+            col[hit, 1] = np.clip(0.55 * s_ + 0.1, 0, 1)
+            col[hit, 2] = np.clip(0.72 * s_ + 0.12, 0, 1)
+            drew = bool(hit.any())
+    P = EX.get("points")
+    if P is not None and len(P):
+        px, py, depth, wdiv_p = _project(P, W, H, yaw, pitch, zoom, panx, pany)
+        ok = (px >= 0) & (px < W) & (py >= 0) & (py < H)
+        idx = np.nonzero(ok)[0]
+        if len(idx):
+            cue = (f32(0.55) + f32(0.45) * np.clip((depth[idx] + f32(0.6)) / f32(1.2), 0, 1))[:, None]
+            pc = EX.get("pcolor")
+            c = (pc[idx] if pc is not None else np.array([0.62, 0.75, 0.92], dtype=f32)[None, :]) * cue
+            if EX.get("psize"):                                      # known spacing (level-set voxels): close the gaps
+                r = int(np.clip(round(float(EX["psize"]) * float(np.median(wdiv_p[idx])) * 1.15), 1, 12))
+            else:
+                r = 1 if len(idx) > 300_000 else 2                   # 2×2 splats when sparse, so points read
+            before = zbuf.copy()
+            for dx in range(r):
+                for dy in range(r):
+                    sx = np.clip(px[idx].astype(np.int32) + dx, 0, W - 1)
+                    sy = np.clip(py[idx].astype(np.int32) + dy, 0, H - 1)
+                    pix = sy * W + sx
+                    dz = depth[idx]
+                    np.maximum.at(zbuf, pix, dz)
+                    win = dz >= zbuf[pix]
+                    col[pix[win]] = c[win] if c.shape[0] == len(idx) else c[0]
+            # Shade the splats from the depth buffer they just wrote (normals from screen-space depth slopes):
+            # dense particle sheets and level-set surfaces read as 3D forms instead of flat cut-outs.
+            mine = (zbuf > before).reshape(H, W)
+            if mine.any():
+                z = np.where(mine, zbuf.reshape(H, W), np.nan)
+                gx = np.zeros_like(z)
+                gy = np.zeros_like(z)
+                gx[:, 1:-1] = (z[:, 2:] - z[:, :-2]) * 0.5
+                gy[1:-1, :] = (z[2:, :] - z[:-2, :]) * 0.5
+                gx = np.nan_to_num(gx, nan=0.0)
+                gy = np.nan_to_num(gy, nan=0.0)
+                k = float(np.median(wdiv_p[idx])) if len(idx) else 1.0
+                nx, ny = -gx * k, gy * k
+                ln = np.sqrt(nx * nx + ny * ny + 1.0)
+                lam = np.clip((nx * 0.4 + ny * 0.7 + 0.6) / ln, 0, 1)
+                shade = (0.45 + 0.55 * lam).astype(f32).reshape(-1)
+                m1 = mine.reshape(-1)
+                col[m1] *= shade[m1, None]
+            drew = True
+    VP = EX.get("vpts")
+    if VP is not None and len(VP):
+        px, py, depth, wdiv = _project(VP, W, H, yaw, pitch, zoom, panx, pany)
+        dens = EX["vden"]
+        rad = int(np.clip(round(float(EX.get("vsize", 0.01)) * float(np.median(wdiv))), 1, 4))
+        acc = np.zeros(n, dtype=np.float64)
+        ok = (px >= -rad - 1) & (px < W + rad) & (py >= -rad - 1) & (py < H + rad)
+        idx = np.nonzero(ok)[0]
+        if len(idx):
+            # Bilinear splats: each voxel spreads over the pixels it straddles by its sub-pixel position, so a
+            # regular voxel grid seen straight on doesn't alias into dark seams (moiré) between pixel columns.
+            fx = px[idx] - f32(0.5) - f32(rad // 2)
+            fy = py[idx] - f32(0.5) - f32(rad // 2)
+            x0 = np.floor(fx)
+            y0 = np.floor(fy)
+            tx, ty = fx - x0, fy - y0
+            x0 = x0.astype(np.int32)
+            y0 = y0.astype(np.int32)
+            dz = depth[idx]
+            w0 = (dens[idx] / (rad * rad)).astype(np.float64)
+            for cx, cy, wb in ((0, 0, (1 - tx) * (1 - ty)), (1, 0, tx * (1 - ty)), (0, 1, (1 - tx) * ty), (1, 1, tx * ty)):
+                wc = w0 * wb
+                for dx in range(rad):
+                    for dy in range(rad):
+                        sx = x0 + (cx + dx)
+                        sy = y0 + (cy + dy)
+                        inb = (sx >= 0) & (sx < W) & (sy >= 0) & (sy < H)
+                        pix = sy[inb] * W + sx[inb]
+                        front = dz[inb] > zbuf[pix]                      # occluded by the mesh / particles?
+                        acc += np.bincount(pix[front], weights=wc[inb][front], minlength=n)
+            nz = acc[acc > 0]
+            if len(nz):
+                ref = float(np.percentile(nz, 97)) or 1.0
+                a = (1.0 - np.exp(-2.5 * acc / ref)).astype(f32)[:, None]
+                smoke = (f32(0.94) - f32(0.30) * a) * np.array([0.97, 0.98, 1.0], dtype=f32)[None, :]
+                col = col * (f32(1) - a) + smoke * a
+                drew = True
+    if not drew:
+        return None
+    out = np.empty((n, 4), dtype=np.uint8)
+    rgb8 = np.clip(col * 255, 0, 255).astype(np.uint8)
+    out[:, 2], out[:, 1], out[:, 0], out[:, 3] = rgb8[:, 0], rgb8[:, 1], rgb8[:, 2], 255
+    return W, H, out.tobytes()
+
+
+def software_render(V, F, N, VN, params, EX=None):
     """Render one frame of a mesh with the numpy rasteriser. params = (W, H, yaw, pitch, zoom, panx, pany,
-    smooth, wire, bg_rgb, fg_rgb). Returns (W, H, BGRX bytes) or None. Runs in the render worker process."""
+    smooth, wire, bg_rgb, fg_rgb). Returns (W, H, BGRX bytes) or None. Runs in the render worker process.
+    EX (particles / volume voxels from Houdini caches) switches to render_cache."""
+    if EX and (not params[8] or F is None or not len(F)):
+        return render_cache(V, F, N, VN, EX, params)
     W, H, yaw, pitch, zoom, panx, pany, smooth, wire, bg_rgb, fg_rgb = params
     if W < 2 or H < 2 or F is None or not len(F):
         return None
@@ -6765,7 +7860,7 @@ def _wire_render(W, H, px, py, i, j, k, bg_rgb, fg_rgb):
     return W, H, out.reshape(H, W, 4).tobytes()
 
 
-def _rasterize(W, H, px, py, depth, i, j, k, vshade, fshade, bg_rgb):
+def _rasterize(W, H, px, py, depth, i, j, k, vshade, fshade, bg_rgb, buffers=False):
     """Vectorised triangle rasteriser with a z-buffer, in numpy.
 
     px/py/depth are per-VERTEX screen coordinates and view depth (larger = nearer); i/j/k index them per
@@ -6856,6 +7951,8 @@ def _rasterize(W, H, px, py, depth, i, j, k, vshade, fshade, bg_rgb):
                 sbuf[pix[win]] = w0s[win] * sa[tw] + w1s[win] * sb[tw] + w2s[win] * sc[tw]
 
     hit = zbuf > -np.inf
+    if buffers:
+        return zbuf, sbuf, hit
     if not hit.any():
         return None
     out = np.empty((H * W, 4), dtype=np.uint8)
@@ -6873,6 +7970,7 @@ def _render_worker_main(conn):
     """Render worker process: holds one model, answers ('frame', params) with the pixels."""
     pin_worker()
     V = F = N = VN = None
+    EX = None
     while True:
         try:
             msg = conn.recv()
@@ -6882,11 +7980,12 @@ def _render_worker_main(conn):
         if kind == "quit":
             return
         if kind == "model":
-            V, F, N, VN = msg[1]
+            V, F, N, VN = msg[1][:4]
+            EX = msg[1][4] if len(msg[1]) > 4 else None
             continue
         if kind == "frame":
             try:
-                res = software_render(V, F, N, VN, msg[1])
+                res = software_render(V, F, N, VN, msg[1], EX)
             except Exception as ex:          # never let a bad frame kill the worker
                 res = None
                 print("kestrel: render failed —", ex, file=sys.stderr)
@@ -6934,8 +8033,8 @@ class RenderWorker:
             except (OSError, ValueError):
                 return
 
-    def set_model(self, V, F, N, VN):
-        self._q.put(("model", (V, F, N, VN)))      # a 5M-face model takes ~0.3 s to pipe across, off-thread
+    def set_model(self, V, F, N, VN, EX=None):
+        self._q.put(("model", (V, F, N, VN, EX)))      # a 5M-face model takes ~0.3 s to pipe across, off-thread
 
     def render(self, params, cb):
         self._cb = cb
@@ -7068,9 +8167,10 @@ class ModelView(ModelNav, Gtk.DrawingArea):
         self.connect("draw", self._draw)
         # (the render process is shared and lives for the whole session; nothing to tear down per view)
 
-    def set_model(self, model: Optional[dict]):
+    def set_model(self, model: Optional[dict], keep_view: bool = False):
         self.model = model
-        self._reset_view()
+        if not keep_view:
+            self._reset_view()
         self._V = self._F = self._N = self._VN = None
         if model and np is not None:
             # numpy copies for the vectorised path: projection, culling, sorting and lighting become array
@@ -7079,13 +8179,14 @@ class ModelView(ModelNav, Gtk.DrawingArea):
             self._F = np.asarray(model["faces"], dtype=np.int32).reshape(-1, 3)
             self._N = np.asarray(model["normals"], dtype=np.float32).reshape(-1, 3) if model.get("normals") is not None and len(model["normals"]) else None
             self._VN = np.asarray(model["vnormals"], dtype=np.float32).reshape(-1, 3) if model.get("vnormals") is not None and len(model["vnormals"]) else None
+            EX = {k: model[k] for k in ("points", "pcolor", "psize", "vpts", "vden", "vsize") if k in model} or None
             self._worker = get_render_worker()
-            self._worker.set_model(self._V, self._F, self._N, self._VN)
+            self._worker.set_model(self._V, self._F, self._N, self._VN, EX)
         # Keep the previous frame on screen until the new model's first frame lands (model → model would
         # otherwise blank the viewport for the whole load, which reads as a flash before the crossfade).
         self._frame_params = None
         self._want = None
-        self._awaiting_first = True
+        self._awaiting_first = not keep_view
         if model is None:
             self._frame = None
         self.queue_draw()
@@ -7296,13 +8397,404 @@ void main() {
     frag = vec4(vec3(0.08 + 0.90 * sh), 1.0);        // neutral white: tells the GL path from the blue software one
 }
 """
+# Particles: round sprites shaded as little spheres, sized like the software splats.
+_GL_PTS_VERT = """
+in vec3 pos;
+in vec3 col;
+uniform mat4 mvp;
+uniform float pxPerUnit;     // screen pixels per model unit at distance 1 (framebuffer pixels)
+uniform float psize;         // known point spacing in model units (level-set voxels), 0 = unknown
+uniform float defSize;       // sprite size when the spacing is unknown
+out vec3 vCol;
+out float vCue;
+void main() {
+    gl_Position = mvp * vec4(pos, 1.0);
+    float w = max(gl_Position.w, 1e-4);
+    gl_PointSize = psize > 0.0 ? clamp(psize * pxPerUnit / w * 1.15, 1.0, 64.0) : defSize;
+    vCue = 0.55 + 0.45 * clamp((2.6 - w + 0.6) / 1.2, 0.0, 1.0);    // nearer = brighter, as in software
+    vCol = col;
+}
+"""
+_GL_PTS_FRAG = """
+in vec3 vCol;
+in float vCue;
+uniform float round_;
+out vec4 frag;
+void main() {
+    float lam = 0.75;
+    if (round_ > 0.5) {
+        vec2 c = gl_PointCoord * 2.0 - 1.0;
+        float r2 = dot(c, c);
+        if (r2 > 1.0) discard;
+        vec3 n = vec3(c.x, -c.y, sqrt(1.0 - r2));
+        lam = clamp(dot(n, normalize(vec3(0.4, 0.7, 0.6))), 0.0, 1.0);
+    }
+    frag = vec4(vCol * vCue * (0.45 + 0.55 * lam), 1.0);
+}
+"""
+# Volume voxels: each is splatted as its exact screen footprint (box filtered against the pixel grid), adding
+# density x covered pixel area into a float target. A pixel's total is the density summed along its ray, the
+# same quantity the software renderer accumulates, so both paths share the exposure curve.
+_GL_VOX_VERT = """
+in vec3 pos;
+in float den;
+uniform mat4 mvp;
+uniform float pxPerUnit;
+uniform float vsize;
+out float vDen;
+out float vS;
+out float vSprite;
+void main() {
+    gl_Position = mvp * vec4(pos, 1.0);
+    float s = vsize * pxPerUnit / max(gl_Position.w, 1e-4);   // voxel edge in pixels
+    vS = s;
+    vSprite = ceil(s) + 2.0;
+    gl_PointSize = vSprite;
+    vDen = den;
+}
+"""
+_GL_VOX_FRAG = """
+in float vDen;
+in float vS;
+in float vSprite;
+out vec4 frag;
+float cover(float x, float h) { return clamp(min(x + 0.5, h) - max(x - 0.5, -h), 0.0, 1.0); }
+void main() {
+    vec2 p = (gl_PointCoord - 0.5) * vSprite;                  // this pixel's centre relative to the voxel's
+    float h = vS * 0.5;
+    frag = vec4(vDen * cover(p.x, h) * cover(p.y, h), 0.0, 0.0, 0.0);
+}
+"""
+# Final pass: opaque scene + smoke from the accumulated densities (1 - exp(-k·sum), auto-exposed).
+_GL_COMP_VERT = """
+out vec2 uv;
+void main() {
+    vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0, (gl_VertexID == 2) ? 3.0 : -1.0);
+    uv = p * 0.5 + 0.5;
+    gl_Position = vec4(p, 0.0, 1.0);
+}
+"""
+_GL_COMP_FRAG = """
+in vec2 uv;
+uniform sampler2D opaqueTex;
+uniform sampler2D accumTex;
+uniform float k;
+out vec4 frag;
+void main() {
+    vec3 c = texture(opaqueTex, uv).rgb;
+    float a = 1.0 - exp(-k * texture(accumTex, uv).r);
+    vec3 smoke = (0.94 - 0.30 * a) * vec3(0.97, 0.98, 1.0);
+    frag = vec4(mix(c, smoke, a), 1.0);
+}
+"""
+
+
+def gl_matrices(w: int, h: int, yaw: float, pitch: float, zoom: float, pan):
+    """Row-major numpy (upload with transpose=True): mvp, mv, normal matrix, and pixels per model unit at
+    distance 1 (the software path's k16). Same camera as _project: yaw → pitch → distance 2.6, pan in pixels."""
+    cy_, sy_ = math.cos(yaw), math.sin(yaw)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    Ry = np.array([[cy_, 0, sy_, 0], [0, 1, 0, 0], [-sy_, 0, cy_, 0], [0, 0, 0, 1]], dtype=np.float64)
+    Rx = np.array([[1, 0, 0, 0], [0, cp, -sp, 0], [0, sp, cp, 0], [0, 0, 0, 1]], dtype=np.float64)
+    T = np.eye(4)
+    T[2, 3] = -2.6
+    mv = T @ Rx @ Ry
+    s = min(w, h) * 0.8 * zoom * 1.6
+    fx, fy = s / (w / 2), s / (h / 2)
+    near, far = 0.05, 20.0
+    P = np.array([[fx, 0, 0, 0], [0, fy, 0, 0],
+                  [0, 0, (far + near) / (near - far), 2 * far * near / (near - far)],
+                  [0, 0, -1, 0]], dtype=np.float64)
+    Pan = np.eye(4)
+    Pan[0, 3] = pan[0] * 2.0 / w
+    Pan[1, 3] = -pan[1] * 2.0 / h
+    mvp = Pan @ P @ mv
+    return mvp.astype(np.float32), mv.astype(np.float32), (Rx @ Ry)[:3, :3].astype(np.float32), s
+
+
+class GLScene:
+    """Everything the OpenGL previewer draws, independent of GTK (so it can be tested on any GL context):
+    a mesh (one glDrawElements), particles (sphere-shaded sprites) and volumes. Volumes go through an
+    offscreen pass: opaque scene into an RGBA8 texture + depth, voxel densities added into a float texture
+    (depth-tested against the opaque scene), then one full-screen pass composites smoke over it.
+    Methods must be called with the context current."""
+
+    def __init__(self, header: str):
+        self.hdr = header
+        self.es = "300 es" in header
+        self.mesh_prog = self._program(_GL_VERT, _GL_FRAG)
+        self.pts_prog = self.vox_prog = self.comp_prog = None
+        self.vao = _GL.glGenVertexArrays(1)
+        self.vbo = _GL.glGenBuffers(1)
+        self.ebo = _GL.glGenBuffers(1)
+        self.pvao = self.pvbo = self.vvao = self.vvbo = self.evao = None
+        self.fbo_a = self.fbo_b = self.tex_a = self.tex_b = self.rb = None
+        self.fb_size = (0, 0)
+        self.nidx = self.npts = self.nvox = 0
+        self.psize = 0.0
+        self.vsize = 0.0
+        self.k = None                       # smoke exposure, measured on the first frame of each model
+        self.acc_fmt = ""
+
+    def _program(self, vs: str, fs: str):
+        return _GLshaders.compileProgram(_GLshaders.compileShader(self.hdr + vs, _GL.GL_VERTEX_SHADER),
+                                         _GLshaders.compileShader(self.hdr + fs, _GL.GL_FRAGMENT_SHADER))
+
+    def _attribs(self, prog, layout):
+        """layout: [(name, components)] interleaved float32."""
+        import ctypes
+        stride = 4 * sum(n for _, n in layout)
+        off = 0
+        for name, n in layout:
+            loc = _GL.glGetAttribLocation(prog, name)
+            if loc >= 0:
+                _GL.glEnableVertexAttribArray(loc)
+                _GL.glVertexAttribPointer(loc, n, _GL.GL_FLOAT, _GL.GL_FALSE, stride, ctypes.c_void_p(off))
+            off += 4 * n
+
+    # ---- upload
+    def upload(self, m: Optional[dict], keep_exposure: bool = False):
+        self.nidx = self.npts = self.nvox = 0
+        if not keep_exposure:
+            self.k = None
+        if not m:
+            return
+        if len(m.get("faces", ())):
+            V = np.asarray(m["verts"], dtype=np.float32).reshape(-1, 3)
+            F = np.asarray(m["faces"], dtype=np.uint32).reshape(-1, 3)
+            VN = m.get("vnormals")
+            if VN is None or not len(VN):
+                VN = np.zeros_like(V)
+                VN[:, 2] = 1.0
+            data = np.ascontiguousarray(np.hstack((V, np.asarray(VN, dtype=np.float32).reshape(-1, 3))))
+            _GL.glBindVertexArray(self.vao)
+            _GL.glBindBuffer(_GL.GL_ARRAY_BUFFER, self.vbo)
+            _GL.glBufferData(_GL.GL_ARRAY_BUFFER, data.nbytes, data, _GL.GL_STATIC_DRAW)
+            _GL.glBindBuffer(_GL.GL_ELEMENT_ARRAY_BUFFER, self.ebo)
+            idx = np.ascontiguousarray(F)
+            _GL.glBufferData(_GL.GL_ELEMENT_ARRAY_BUFFER, idx.nbytes, idx, _GL.GL_STATIC_DRAW)
+            self._attribs(self.mesh_prog, [("pos", 3), ("nrm", 3)])
+            _GL.glBindVertexArray(0)
+            self.nidx = int(idx.size)
+        P = m.get("points")
+        if P is not None and len(P):
+            if self.pts_prog is None:
+                self.pts_prog = self._program(_GL_PTS_VERT, _GL_PTS_FRAG)
+                self.pvao, self.pvbo = _GL.glGenVertexArrays(1), _GL.glGenBuffers(1)
+            P = np.asarray(P, dtype=np.float32).reshape(-1, 3)
+            C = m.get("pcolor")
+            C = (np.asarray(C, dtype=np.float32).reshape(-1, 3) if C is not None and len(C) == len(P)
+                 else np.broadcast_to(np.array([0.62, 0.75, 0.92], np.float32), P.shape))
+            data = np.ascontiguousarray(np.hstack((P, C)))
+            _GL.glBindVertexArray(self.pvao)
+            _GL.glBindBuffer(_GL.GL_ARRAY_BUFFER, self.pvbo)
+            _GL.glBufferData(_GL.GL_ARRAY_BUFFER, data.nbytes, data, _GL.GL_STATIC_DRAW)
+            self._attribs(self.pts_prog, [("pos", 3), ("col", 3)])
+            _GL.glBindVertexArray(0)
+            self.npts = len(P)
+            self.psize = float(m.get("psize") or 0.0)
+        VP = m.get("vpts")
+        if VP is not None and len(VP):
+            if self.vox_prog is None:
+                self.vox_prog = self._program(_GL_VOX_VERT, _GL_VOX_FRAG)
+                self.comp_prog = self._program(_GL_COMP_VERT, _GL_COMP_FRAG)
+                self.vvao, self.vvbo = _GL.glGenVertexArrays(1), _GL.glGenBuffers(1)
+                self.evao = _GL.glGenVertexArrays(1)        # empty VAO for the full-screen triangle
+            data = np.ascontiguousarray(np.hstack((np.asarray(VP, dtype=np.float32).reshape(-1, 3),
+                                                   np.asarray(m["vden"], dtype=np.float32).reshape(-1, 1))))
+            _GL.glBindVertexArray(self.vvao)
+            _GL.glBindBuffer(_GL.GL_ARRAY_BUFFER, self.vvbo)
+            _GL.glBufferData(_GL.GL_ARRAY_BUFFER, data.nbytes, data, _GL.GL_STATIC_DRAW)
+            self._attribs(self.vox_prog, [("pos", 3), ("den", 1)])
+            _GL.glBindVertexArray(0)
+            self.nvox = len(data)
+            self.vsize = float(m.get("vsize") or 0.01)
+
+    # ---- offscreen targets for volumes
+    def _targets(self, W: int, H: int):
+        if self.fb_size == (W, H) and self.fbo_a:
+            return
+        self._free_targets()
+        self.tex_a, self.tex_b = _GL.glGenTextures(1), _GL.glGenTextures(1)
+        for t in (self.tex_a, self.tex_b):
+            _GL.glBindTexture(_GL.GL_TEXTURE_2D, t)
+            _GL.glTexParameteri(_GL.GL_TEXTURE_2D, _GL.GL_TEXTURE_MIN_FILTER, _GL.GL_NEAREST)
+            _GL.glTexParameteri(_GL.GL_TEXTURE_2D, _GL.GL_TEXTURE_MAG_FILTER, _GL.GL_NEAREST)
+            _GL.glTexParameteri(_GL.GL_TEXTURE_2D, _GL.GL_TEXTURE_WRAP_S, _GL.GL_CLAMP_TO_EDGE)
+            _GL.glTexParameteri(_GL.GL_TEXTURE_2D, _GL.GL_TEXTURE_WRAP_T, _GL.GL_CLAMP_TO_EDGE)
+        _GL.glBindTexture(_GL.GL_TEXTURE_2D, self.tex_a)
+        _GL.glTexImage2D(_GL.GL_TEXTURE_2D, 0, _GL.GL_RGBA8, W, H, 0, _GL.GL_RGBA, _GL.GL_UNSIGNED_BYTE, None)
+        self.rb = _GL.glGenRenderbuffers(1)
+        _GL.glBindRenderbuffer(_GL.GL_RENDERBUFFER, self.rb)
+        _GL.glRenderbufferStorage(_GL.GL_RENDERBUFFER, _GL.GL_DEPTH_COMPONENT24, W, H)
+        self.fbo_a, self.fbo_b = _GL.glGenFramebuffers(1), _GL.glGenFramebuffers(1)
+        _GL.glBindFramebuffer(_GL.GL_FRAMEBUFFER, self.fbo_a)
+        _GL.glFramebufferTexture2D(_GL.GL_FRAMEBUFFER, _GL.GL_COLOR_ATTACHMENT0, _GL.GL_TEXTURE_2D, self.tex_a, 0)
+        _GL.glFramebufferRenderbuffer(_GL.GL_FRAMEBUFFER, _GL.GL_DEPTH_ATTACHMENT, _GL.GL_RENDERBUFFER, self.rb)
+        if _GL.glCheckFramebufferStatus(_GL.GL_FRAMEBUFFER) != _GL.GL_FRAMEBUFFER_COMPLETE:
+            raise RuntimeError("offscreen colour target not supported")
+        _GL.glBindFramebuffer(_GL.GL_FRAMEBUFFER, self.fbo_b)
+        _GL.glFramebufferRenderbuffer(_GL.GL_FRAMEBUFFER, _GL.GL_DEPTH_ATTACHMENT, _GL.GL_RENDERBUFFER, self.rb)
+        for ifmt, typ, label in ((_GL.GL_R32F, _GL.GL_FLOAT, "R32F"), (_GL.GL_R16F, _GL.GL_HALF_FLOAT, "R16F")):
+            _GL.glBindTexture(_GL.GL_TEXTURE_2D, self.tex_b)
+            _GL.glTexImage2D(_GL.GL_TEXTURE_2D, 0, ifmt, W, H, 0, _GL.GL_RED, typ, None)
+            _GL.glFramebufferTexture2D(_GL.GL_FRAMEBUFFER, _GL.GL_COLOR_ATTACHMENT0, _GL.GL_TEXTURE_2D, self.tex_b, 0)
+            if _GL.glCheckFramebufferStatus(_GL.GL_FRAMEBUFFER) == _GL.GL_FRAMEBUFFER_COMPLETE:
+                self.acc_fmt = label
+                break
+        else:
+            raise RuntimeError("float render targets not supported (volumes need them)")
+        _GL.glBindTexture(_GL.GL_TEXTURE_2D, 0)
+        self.fb_size = (W, H)
+
+    def _free_targets(self):
+        try:
+            if self.fbo_a:
+                _GL.glDeleteFramebuffers(2, [self.fbo_a, self.fbo_b])
+            if self.tex_a:
+                _GL.glDeleteTextures(2, [self.tex_a, self.tex_b])
+            if self.rb:
+                _GL.glDeleteRenderbuffers(1, [self.rb])
+        except Exception:
+            pass
+        self.fbo_a = self.fbo_b = self.tex_a = self.tex_b = self.rb = None
+        self.fb_size = (0, 0)
+
+    def free(self):
+        self._free_targets()
+        try:
+            _GL.glDeleteBuffers(1, [self.vbo])
+            _GL.glDeleteBuffers(1, [self.ebo])
+            for b in (self.pvbo, self.vvbo):
+                if b:
+                    _GL.glDeleteBuffers(1, [b])
+            for a in (self.vao, self.pvao, self.vvao, self.evao):
+                if a:
+                    _GL.glDeleteVertexArrays(1, [a])
+            for p in (self.mesh_prog, self.pts_prog, self.vox_prog, self.comp_prog):
+                if p:
+                    _GL.glDeleteProgram(p)
+        except Exception:
+            pass
+
+    # ---- draw
+    def _u(self, prog, name):
+        return _GL.glGetUniformLocation(prog, name)
+
+    def _draw_opaque(self, mvp, mv, nmat, ppu, smooth, wire, fg):
+        _GL.glEnable(_GL.GL_DEPTH_TEST)
+        _GL.glDepthMask(_GL.GL_TRUE)
+        _GL.glDisable(_GL.GL_CULL_FACE)
+        _GL.glDisable(_GL.GL_BLEND)
+        if self.nidx:
+            p = self.mesh_prog
+            _GL.glUseProgram(p)
+            _GL.glUniformMatrix4fv(self._u(p, "mvp"), 1, _GL.GL_TRUE, mvp)
+            _GL.glUniformMatrix4fv(self._u(p, "mv"), 1, _GL.GL_TRUE, mv)
+            _GL.glUniformMatrix3fv(self._u(p, "nmat"), 1, _GL.GL_TRUE, nmat)
+            _GL.glUniform1i(self._u(p, "smoothShade"), 1 if smooth else 0)
+            _GL.glUniform1i(self._u(p, "wire"), 1 if wire else 0)
+            _GL.glUniform3f(self._u(p, "wireColor"), *fg)
+            if not self.es:
+                _GL.glPolygonMode(_GL.GL_FRONT_AND_BACK, _GL.GL_LINE if wire else _GL.GL_FILL)
+            _GL.glBindVertexArray(self.vao)
+            _GL.glDrawElements(_GL.GL_TRIANGLES, self.nidx, _GL.GL_UNSIGNED_INT, None)
+            if not self.es:
+                _GL.glPolygonMode(_GL.GL_FRONT_AND_BACK, _GL.GL_FILL)
+        if self.npts:
+            if not self.es:
+                _GL.glEnable(_GL.GL_PROGRAM_POINT_SIZE)
+            p = self.pts_prog
+            _GL.glUseProgram(p)
+            _GL.glUniformMatrix4fv(self._u(p, "mvp"), 1, _GL.GL_TRUE, mvp)
+            _GL.glUniform1f(self._u(p, "pxPerUnit"), ppu)
+            _GL.glUniform1f(self._u(p, "psize"), self.psize)
+            _GL.glUniform1f(self._u(p, "defSize"), 1.5 if self.npts > 300_000 else 2.5)
+            _GL.glUniform1f(self._u(p, "round_"), 1.0 if self.psize or self.npts <= 300_000 else 0.0)
+            _GL.glBindVertexArray(self.pvao)
+            _GL.glDrawArrays(_GL.GL_POINTS, 0, self.npts)
+        _GL.glBindVertexArray(0)
+        _GL.glUseProgram(0)
+
+    def render(self, W: int, H: int, w: int, h: int, cam, bg, fg, smooth: bool, wire: bool, target_fb: int):
+        """W×H framebuffer pixels (w×h logical). cam = (yaw, pitch, zoom, pan). target_fb = the framebuffer
+        to finish in (GtkGLArea's own one is bound when the render signal fires, and is not 0)."""
+        mvp, mv, nmat, k16 = gl_matrices(w, h, *cam)
+        ppu = k16 * (W / float(w))                            # framebuffer pixels per unit at distance 1
+        if not self.nvox:
+            _GL.glBindFramebuffer(_GL.GL_FRAMEBUFFER, target_fb)
+            _GL.glViewport(0, 0, W, H)
+            _GL.glClearColor(bg[0], bg[1], bg[2], 1.0)
+            _GL.glClear(_GL.GL_COLOR_BUFFER_BIT | _GL.GL_DEPTH_BUFFER_BIT)
+            self._draw_opaque(mvp, mv, nmat, ppu, smooth, wire, fg)
+            return
+        self._targets(W, H)
+        _GL.glViewport(0, 0, W, H)
+        _GL.glBindFramebuffer(_GL.GL_FRAMEBUFFER, self.fbo_a)
+        _GL.glClearColor(bg[0], bg[1], bg[2], 1.0)
+        _GL.glClear(_GL.GL_COLOR_BUFFER_BIT | _GL.GL_DEPTH_BUFFER_BIT)
+        self._draw_opaque(mvp, mv, nmat, ppu, smooth, wire, fg)
+        # densities in front of the opaque scene, summed per pixel
+        _GL.glBindFramebuffer(_GL.GL_FRAMEBUFFER, self.fbo_b)
+        _GL.glClearColor(0.0, 0.0, 0.0, 0.0)
+        _GL.glClear(_GL.GL_COLOR_BUFFER_BIT)
+        _GL.glEnable(_GL.GL_DEPTH_TEST)
+        _GL.glDepthMask(_GL.GL_FALSE)
+        _GL.glEnable(_GL.GL_BLEND)
+        _GL.glBlendFunc(_GL.GL_ONE, _GL.GL_ONE)
+        if not self.es:
+            _GL.glEnable(_GL.GL_PROGRAM_POINT_SIZE)
+        p = self.vox_prog
+        _GL.glUseProgram(p)
+        _GL.glUniformMatrix4fv(self._u(p, "mvp"), 1, _GL.GL_TRUE, mvp)
+        _GL.glUniform1f(self._u(p, "pxPerUnit"), ppu)
+        _GL.glUniform1f(self._u(p, "vsize"), self.vsize)
+        _GL.glBindVertexArray(self.vvao)
+        _GL.glDrawArrays(_GL.GL_POINTS, 0, self.nvox)
+        _GL.glDisable(_GL.GL_BLEND)
+        _GL.glDepthMask(_GL.GL_TRUE)
+        if self.k is None:
+            self.k = self._exposure(W, H)
+        # composite into the widget's framebuffer
+        _GL.glBindFramebuffer(_GL.GL_FRAMEBUFFER, target_fb)
+        _GL.glViewport(0, 0, W, H)
+        _GL.glDisable(_GL.GL_DEPTH_TEST)
+        p = self.comp_prog
+        _GL.glUseProgram(p)
+        _GL.glActiveTexture(_GL.GL_TEXTURE0)
+        _GL.glBindTexture(_GL.GL_TEXTURE_2D, self.tex_a)
+        _GL.glActiveTexture(_GL.GL_TEXTURE1)
+        _GL.glBindTexture(_GL.GL_TEXTURE_2D, self.tex_b)
+        _GL.glUniform1i(self._u(p, "opaqueTex"), 0)
+        _GL.glUniform1i(self._u(p, "accumTex"), 1)
+        _GL.glUniform1f(self._u(p, "k"), self.k)
+        _GL.glBindVertexArray(self.evao)
+        _GL.glDrawArrays(_GL.GL_TRIANGLES, 0, 3)
+        _GL.glBindVertexArray(0)
+        _GL.glBindTexture(_GL.GL_TEXTURE_2D, 0)
+        _GL.glActiveTexture(_GL.GL_TEXTURE0)
+        _GL.glBindTexture(_GL.GL_TEXTURE_2D, 0)
+        _GL.glUseProgram(0)
+
+    def _exposure(self, W: int, H: int) -> float:
+        """Same auto-exposure as the software renderer (97th percentile of the summed densities), measured once
+        per model from the first frame so orbiting doesn't pump the brightness."""
+        try:
+            _GL.glReadBuffer(_GL.GL_COLOR_ATTACHMENT0)
+            raw = _GL.glReadPixels(0, 0, W, H, _GL.GL_RED, _GL.GL_FLOAT)
+            acc = np.asarray(raw, dtype=np.float32).reshape(-1)
+            nz = acc[acc > 0]
+            ref = float(np.percentile(nz, 97)) if len(nz) else 1.0
+        except Exception:
+            ref = 8.0                                         # GLES drivers may refuse float readback
+        return 2.5 / max(ref, 1e-6)
 
 
 class GLModelView(ModelNav, Gtk.GLArea):
-    """Hardware-accelerated previewer: the mesh is uploaded to the GPU once (interleaved position+normal VBO,
-    uint32 index buffer) and every frame is a single glDrawElements, so a 5M-triangle mesh orbits at the
-    display's refresh rate. Same camera maths as the software path (yaw → pitch → distance 2.6, pan in
-    pixels), same shading (two-sided, Gouraud or flat via screen-space derivatives), same keys."""
+    """Hardware-accelerated previewer: geometry is uploaded to the GPU once and every frame is a few draw
+    calls, so a 5M-triangle mesh or a million-voxel volume orbits at the display's refresh rate. Same camera
+    maths as the software path (yaw → pitch → distance 2.6, pan in pixels), same shading, same keys.
+    Drawing lives in GLScene."""
 
     def __init__(self):
         super().__init__()
@@ -7311,13 +8803,12 @@ class GLModelView(ModelNav, Gtk.GLArea):
         self.set_auto_render(True)
         self.gl_flavour = ""
         self.connect("create-context", self._create_context)
-        self._prog = None
-        self._vao = self._vbo = self._ebo = None
-        self._count = 0
+        self.scene: Optional[GLScene] = None
         self._dirty = False
         self.gl_info = ""
         self.gl_error: Optional[str] = None
         self.on_error = None                  # callable(msg) set by the window: shown in the UI, triggers fallback
+        self.on_cache_failed = None           # callable(model, msg): particles/volumes failed, use software for them
         self.connect("realize", self._on_realize)
         self.connect("unrealize", self._on_unrealize)
         self.connect("render", self._on_render)
@@ -7359,13 +8850,8 @@ class GLModelView(ModelNav, Gtk.GLArea):
                 self.gl_info += " — " + _GL.glGetString(_GL.GL_RENDERER).decode(errors="replace")
             except Exception:
                 pass
-            hdr = _gl_header(ctx)
             self.gl_info += f" [{self.gl_flavour}]"
-            self._prog = _GLshaders.compileProgram(_GLshaders.compileShader(hdr + _GL_VERT, _GL.GL_VERTEX_SHADER),
-                                                   _GLshaders.compileShader(hdr + _GL_FRAG, _GL.GL_FRAGMENT_SHADER))
-            self._vao = _GL.glGenVertexArrays(1)
-            self._vbo = _GL.glGenBuffers(1)
-            self._ebo = _GL.glGenBuffers(1)
+            self.scene = GLScene(_gl_header(ctx))
             self._dirty = self.model is not None
             GL_STATUS[:] = [f"OpenGL OK: {self.gl_info}"]
         except Exception as ex:
@@ -7373,87 +8859,41 @@ class GLModelView(ModelNav, Gtk.GLArea):
 
     def _on_unrealize(self, w):
         self.make_current()
-        try:
-            if self._vao:
-                _GL.glDeleteVertexArrays(1, [self._vao])
-            if self._vbo:
-                _GL.glDeleteBuffers(1, [self._vbo])
-            if self._ebo:
-                _GL.glDeleteBuffers(1, [self._ebo])
-            if self._prog:
-                _GL.glDeleteProgram(self._prog)
-        except Exception:
-            pass
-        self._prog = self._vao = self._vbo = self._ebo = None
+        if self.scene:
+            self.scene.free()
+        self.scene = None
 
-    def set_model(self, model: Optional[dict]):
+    def set_model(self, model: Optional[dict], keep_view: bool = False):
+        """keep_view: next frame of a sequence — same camera, same smoke exposure (no brightness pumping)."""
         self.model = model
-        self._reset_view()
-        self._dirty = True
+        if not keep_view:
+            self._reset_view()
+        self._dirty = "keep" if keep_view else True
         self.queue_render()
 
     def queue_draw(self):             # ModelNav calls queue_draw(); GLArea wants queue_render()
         self.queue_render()
 
-    # ---- upload
-    def _upload(self):
+    def _cache_failed(self, ex):
+        """Particles / volumes need features this driver lacks: hand this model to the software renderer
+        (meshes keep using OpenGL)."""
         m = self.model
-        self._dirty = False
-        if not m or not len(m["faces"]):
-            self._count = 0
-            return
-        V = np.asarray(m["verts"], dtype=np.float32).reshape(-1, 3)
-        F = np.asarray(m["faces"], dtype=np.uint32).reshape(-1, 3)
-        VN = m.get("vnormals")
-        if VN is None or not len(VN):
-            VN = np.zeros_like(V)
-            VN[:, 2] = 1.0
-        data = np.ascontiguousarray(np.hstack((V, np.asarray(VN, dtype=np.float32).reshape(-1, 3))))
-        _GL.glBindVertexArray(self._vao)
-        _GL.glBindBuffer(_GL.GL_ARRAY_BUFFER, self._vbo)
-        _GL.glBufferData(_GL.GL_ARRAY_BUFFER, data.nbytes, data, _GL.GL_STATIC_DRAW)
-        _GL.glBindBuffer(_GL.GL_ELEMENT_ARRAY_BUFFER, self._ebo)
-        idx = np.ascontiguousarray(F)
-        _GL.glBufferData(_GL.GL_ELEMENT_ARRAY_BUFFER, idx.nbytes, idx, _GL.GL_STATIC_DRAW)
-        stride = 6 * 4
-        lp = _GL.glGetAttribLocation(self._prog, "pos")
-        ln = _GL.glGetAttribLocation(self._prog, "nrm")
-        _GL.glEnableVertexAttribArray(lp)
-        import ctypes
-        _GL.glVertexAttribPointer(lp, 3, _GL.GL_FLOAT, _GL.GL_FALSE, stride, ctypes.c_void_p(0))
-        _GL.glEnableVertexAttribArray(ln)
-        _GL.glVertexAttribPointer(ln, 3, _GL.GL_FLOAT, _GL.GL_FALSE, stride, ctypes.c_void_p(12))
-        _GL.glBindVertexArray(0)
-        self._count = int(idx.size)
-
-    # ---- matrices (row-major numpy, uploaded with transpose=True)
-    def _matrices(self, w: int, h: int):
-        cy_, sy_ = math.cos(self.yaw), math.sin(self.yaw)
-        cp, sp = math.cos(self.pitch), math.sin(self.pitch)
-        Ry = np.array([[cy_, 0, sy_, 0], [0, 1, 0, 0], [-sy_, 0, cy_, 0], [0, 0, 0, 1]], dtype=np.float64)
-        Rx = np.array([[1, 0, 0, 0], [0, cp, -sp, 0], [0, sp, cp, 0], [0, 0, 0, 1]], dtype=np.float64)
-        T = np.eye(4)
-        T[2, 3] = -2.6
-        mv = T @ Rx @ Ry
-        s = min(w, h) * 0.8 * self.zoom * 1.6
-        fx, fy = s / (w / 2), s / (h / 2)
-        near, far = 0.05, 20.0
-        P = np.array([[fx, 0, 0, 0], [0, fy, 0, 0],
-                      [0, 0, (far + near) / (near - far), 2 * far * near / (near - far)],
-                      [0, 0, -1, 0]], dtype=np.float64)
-        # pan in pixels → NDC offset after projection
-        Pan = np.eye(4)
-        Pan[0, 3] = self.pan[0] * 2.0 / w
-        Pan[1, 3] = -self.pan[1] * 2.0 / h
-        mvp = Pan @ P @ mv
-        return mvp.astype(np.float32), mv.astype(np.float32), (Rx @ Ry)[:3, :3].astype(np.float32)
+        msg = str(ex).replace("\n", " ")[:300]
+        print("kestrel: OpenGL can't draw this cache, using the software renderer —", msg, file=sys.stderr)
+        self.model = None
+        self._dirty = True
+        if self.on_cache_failed and m is not None:
+            GLib.idle_add(lambda: (self.on_cache_failed(m, msg), False)[1])
 
     # ---- render
     def _on_render(self, area, ctx):
         try:
             self._render()
         except Exception as ex:
-            self._fail("render", ex)
+            if self.model is not None and any(k in self.model for k in ("points", "vpts")):
+                self._cache_failed(ex)
+            else:
+                self._fail("render", ex)
         return True
 
     def _render(self):
@@ -7464,33 +8904,20 @@ class GLModelView(ModelNav, Gtk.GLArea):
             r, g, b = (bgc.red, bgc.green, bgc.blue) if ok else ((0.13,) * 3 if fg.red > 0.5 else (0.98,) * 3)
         except Exception:
             r, g, b = (0.13,) * 3
-        _GL.glClearColor(r * 0.96 + fg.red * 0.04, g * 0.96 + fg.green * 0.04, b * 0.96 + fg.blue * 0.04, 1.0)
-        _GL.glClear(_GL.GL_COLOR_BUFFER_BIT | _GL.GL_DEPTH_BUFFER_BIT)
-        if self.gl_error or not self._prog:
+        bg = (r * 0.96 + fg.red * 0.04, g * 0.96 + fg.green * 0.04, b * 0.96 + fg.blue * 0.04)
+        target = int(np.asarray(_GL.glGetIntegerv(_GL.GL_DRAW_FRAMEBUFFER_BINDING)).reshape(-1)[0])
+        if self.gl_error or not self.scene:
+            _GL.glClearColor(bg[0], bg[1], bg[2], 1.0)
+            _GL.glClear(_GL.GL_COLOR_BUFFER_BIT | _GL.GL_DEPTH_BUFFER_BIT)
             return
         if self._dirty:
-            self._upload()
-        if not self._count:
-            return
+            keep = self._dirty == "keep"
+            self._dirty = False
+            self.scene.upload(self.model, keep_exposure=keep)
         scale = self.get_scale_factor()
         w, h = max(1, self.get_allocated_width()), max(1, self.get_allocated_height())
-        _GL.glViewport(0, 0, w * scale, h * scale)
-        mvp, mv, nmat = self._matrices(w, h)
-        _GL.glEnable(_GL.GL_DEPTH_TEST)
-        _GL.glDisable(_GL.GL_CULL_FACE)
-        _GL.glUseProgram(self._prog)
-        _GL.glUniformMatrix4fv(_GL.glGetUniformLocation(self._prog, "mvp"), 1, _GL.GL_TRUE, mvp)
-        _GL.glUniformMatrix4fv(_GL.glGetUniformLocation(self._prog, "mv"), 1, _GL.GL_TRUE, mv)
-        _GL.glUniformMatrix3fv(_GL.glGetUniformLocation(self._prog, "nmat"), 1, _GL.GL_TRUE, nmat)
-        _GL.glUniform1i(_GL.glGetUniformLocation(self._prog, "smoothShade"), 1 if self.smooth else 0)
-        _GL.glUniform1i(_GL.glGetUniformLocation(self._prog, "wire"), 1 if self.wire else 0)
-        _GL.glUniform3f(_GL.glGetUniformLocation(self._prog, "wireColor"), fg.red, fg.green, fg.blue)
-        _GL.glPolygonMode(_GL.GL_FRONT_AND_BACK, _GL.GL_LINE if self.wire else _GL.GL_FILL)
-        _GL.glBindVertexArray(self._vao)
-        _GL.glDrawElements(_GL.GL_TRIANGLES, self._count, _GL.GL_UNSIGNED_INT, None)
-        _GL.glBindVertexArray(0)
-        _GL.glPolygonMode(_GL.GL_FRONT_AND_BACK, _GL.GL_FILL)
-        _GL.glUseProgram(0)
+        self.scene.render(w * scale, h * scale, w, h, (self.yaw, self.pitch, self.zoom, self.pan), bg,
+                          (fg.red, fg.green, fg.blue), self.smooth, self.wire, target)
 
 
 # --------------------------------------------------------------------------- video / audio playback (GStreamer)
@@ -8133,6 +9560,10 @@ def preview_tool_report() -> str:
     bl = _find_blender()
     L.append(f"  blender    {bl[0] if bl else '—'}")
     L.append(f"  assimp     {shutil.which('assimp') or '—'}")
+    hou = _find_houdini()
+    L.append(f"  hython     {hou['hython'] or '—'}" + (f"   (Houdini {hou['version']})" if hou["version"] else ""))
+    L.append(f"  gconvert   {hou['gconvert'] or '—'}")
+    L.append(f"  mayapy     {_find_mayapy() or '—'}")
     usd = shutil.which("usdcat")
     L.append(f"  USD        {usd or ('pxr (Python module)' if _has_py_module('pxr') else '—')}")
     L.append(f"  7-Zip      {sevenzip() or '—'}")
@@ -8225,6 +9656,22 @@ try:
         res = (first("wm.obj_import") or bpy.ops.import_scene.obj)(filepath=path)
     elif ext == "x3d":
         res = bpy.ops.import_scene.x3d(filepath=path)
+    elif ext == "vdb":
+        # OpenVDB volume: Blender imports it as a Volume object; a Volume-to-Mesh modifier turns the main grid
+        # into a surface (iso 0 for level sets, a low density threshold for fog) that the mesh export below handles
+        res = bpy.ops.object.volume_import(filepath=path)
+        for vo in [o for o in bpy.data.objects if o.type == "VOLUME"]:
+            vo.data.grids.load()
+            names = [g.name for g in vo.data.grids]
+            grid = next((n for n in ("density", "surface", "sdf") if n in names), names[0] if names else "density")
+            me = bpy.data.meshes.new("kestrel_v2m")
+            mo = bpy.data.objects.new("kestrel_v2m", me)
+            bpy.context.scene.collection.objects.link(mo)
+            md = mo.modifiers.new("v2m", "VOLUME_TO_MESH")
+            md.object = vo
+            md.grid_name = grid
+            md.threshold = 0.0 if grid in ("surface", "sdf") else 0.1
+            print("KESTREL vdb grid:", grid, names)
     else:
         res = "unsupported"
     print("KESTREL import:", res)
@@ -8241,7 +9688,7 @@ try:
         mw = ob.matrix_world
         for v in me.vertices:
             co = mw @ v.co
-            out.append("v %r %r %r" % (co.x, co.y, co.z))
+            out.append("v %r %r %r" % (co.x, co.z, -co.y))      # Blender Z-up -> Y-up (Maya/Houdini/OBJ convention)
         for pg in me.polygons:
             out.append("f " + " ".join(str(i + base + 1) for i in pg.vertices))
         base += len(me.vertices)
@@ -8459,6 +9906,15 @@ def optional_deps() -> List[dict]:
              cmd="sudo dnf install -y https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-9.noarch.rpm && sudo dnf install -y gstreamer1-plugins-ugly gstreamer1-libav"),
         dict(key="rv", name="OpenRV", gives="Open in RV (right-click, Ctrl+Shift+R)",
              found=find_rv(load_config().get("rv_path", "")), cmd="echo 'Download OpenRV from https://github.com/AcademySoftwareFoundation/OpenRV/releases and unpack it under /opt or ~/, then set the path in Preferences → Optional'"),
+        dict(key="houdini", name="Houdini (hython / gconvert)", gives=".bgeo / .bgeo.sc / .geo and .vdb previews: meshes, particles, volumes; also reads Alembic",
+             found=(_find_houdini()["hython"] or _find_houdini()["gconvert"]),
+             cmd="echo 'Install Houdini from https://www.sidefx.com/download/ (it installs under /opt/hfs*; Kestrel finds it there or via $HFS)'"),
+        dict(key="maya", name="Maya (mayapy)", gives="FBX, Alembic and USD previews when Blender isn't available",
+             found=_find_mayapy(),
+             cmd="echo 'Maya is installed by your studio / Autodesk installer under /usr/autodesk/maya*; Kestrel finds mayapy there or via $MAYA_LOCATION'"),
+        dict(key="openvdb", name="OpenVDB (Python)", gives=".vdb volume previews without Houdini",
+             found="importable" if (_has_py_module("pyopenvdb") or _has_py_module("openvdb")) else None,
+             cmd="sudo dnf install -y python3-openvdb || echo 'python3-openvdb is not packaged for this release; Houdini or Blender also preview VDBs'"),
         dict(key="7z", name="7-Zip (p7zip)", gives=".7z, .rar, .cab, .iso archives: preview, extract and create",
              found=sevenzip(), cmd="sudo dnf install -y p7zip p7zip-plugins"),
         dict(key="xdotool", name="xdotool", gives="fm-bench.py benchmark script only",
@@ -8491,6 +9947,5014 @@ def describe_alembic(path: str) -> Optional[str]:
             except (OSError, subprocess.TimeoutExpired):
                 pass
     return None
+
+
+# --------------------------------------------------------------------------- Houdini caches (.bgeo / .geo / .vdb) and the Maya bridge
+# Houdini geometry and VDB volumes are read through Houdini itself when it is installed (hython, then gconvert):
+# that is the only reader that handles every variant (blosc-compressed .bgeo.sc, packed primitives, every VDB
+# compression). Without Houdini: VDBs go through the optional `pyopenvdb` module or Blender (volume → mesh).
+# Maya (mayapy) is a fallback for the formats Blender normally imports, for studios that don't deploy Blender.
+
+HOUDINI_GEO_EXTS = (".bgeo.sc", ".geo.sc", ".bgeo.gz", ".geo.gz", ".bgeo.lzma", ".bgeo.bz2", ".bgeo", ".geo",
+                    ".bhclassic", ".hclassic", ".bpoly", ".poly")
+
+
+def houdini_kind(name: str) -> str:
+    """'geo' for Houdini geometry files, 'vdb' for OpenVDB, '' otherwise (handles compound extensions)."""
+    low = name.lower()
+    if low.endswith(".vdb"):
+        return "vdb"
+    return "geo" if low.endswith(HOUDINI_GEO_EXTS) else ""
+
+
+_HOUDINI_CACHE: Optional[dict] = None
+
+
+def _find_houdini() -> dict:
+    """{'hython': path|None, 'gconvert': path|None, 'version': str} — PATH, $HFS, then the newest /opt/hfs*."""
+    global _HOUDINI_CACHE
+    if _HOUDINI_CACHE is not None:
+        return _HOUDINI_CACHE
+    dirs = []
+    if os.environ.get("HFS"):
+        dirs.append(os.path.join(os.environ["HFS"], "bin"))
+
+    def ver_key(p):
+        m = re.search(r"hfs(\d+)\.(\d+)(?:\.(\d+))?", p)
+        return tuple(int(x or 0) for x in m.groups()) if m else (0,)
+    dirs += [os.path.join(d, "bin") for d in sorted(glob.glob("/opt/hfs*") + glob.glob(os.path.expanduser("~/hfs*")) +
+                                                     glob.glob("/opt/sidefx/hfs*"), key=ver_key, reverse=True)]
+    found = {"hython": shutil.which("hython"), "gconvert": shutil.which("gconvert"), "version": ""}
+    for d in dirs:
+        for tool in ("hython", "gconvert"):
+            p = os.path.join(d, tool)
+            if not found[tool] and os.access(p, os.X_OK):
+                found[tool] = p
+    src = found["hython"] or found["gconvert"] or ""
+    m = re.search(r"hfs(\d+\.\d+(?:\.\d+)?)", src)
+    found["version"] = m.group(1) if m else ""
+    _HOUDINI_CACHE = found
+    return found
+
+
+_HOU_SCRIPT = r'''
+import sys, json, math, traceback
+try:
+    import numpy as np
+    import hou
+    path, out, objout, maxpts, maxvox = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+    info = [["Houdini", hou.applicationVersionString()]]
+    node = hou.node("/obj").createNode("geo", "kestrel_preview")
+    for c in node.children():
+        c.destroy()
+    fsop = node.createNode("file")
+    fsop.parm("file").set(path)
+    unp = node.createNode("unpack")
+    unp.setFirstInput(fsop)
+    g = unp.geometry()
+    if fsop.errors():
+        raise RuntimeError("; ".join(fsop.errors()))
+    npts = int(g.intrinsicValue("pointcount"))
+    nprims = int(g.intrinsicValue("primitivecount"))
+    npoly = g.countPrimType(hou.primType.Polygon)
+    nvdb = g.countPrimType(hou.primType.VDB)
+    nvol = g.countPrimType(hou.primType.Volume)
+    info += [["Points", "{:,}".format(npts)], ["Primitives", "{:,}".format(nprims)]]
+    attrs = [a.name() for a in g.pointAttribs()][:14]
+    if attrs:
+        info.append(["Point attributes", ", ".join(attrs)])
+    arrays = {}
+    if npoly:
+        if npoly == nprims:
+            g.saveToFile(objout)
+        else:
+            gp = hou.Geometry()
+            gp.merge(g)
+            gp.deletePrims([p for p in gp.prims() if p.type() != hou.primType.Polygon])
+            gp.saveToFile(objout)
+        arrays["has_obj"] = np.array([1])
+    elif npts and not (nvdb or nvol):
+        P = np.frombuffer(g.pointFloatAttribValuesAsString("P"), dtype=np.float32).reshape(-1, 3)
+        step = max(1, int(math.ceil(len(P) / float(maxpts))))
+        arrays["P"] = P[::step]
+        if g.findPointAttrib("Cd") is not None:
+            cd = np.frombuffer(g.pointFloatAttribValuesAsString("Cd"), dtype=np.float32)
+            if cd.size == len(P) * 3:
+                arrays["Cd"] = cd.reshape(-1, 3)[::step]
+        if step > 1:
+            info.append(["Shown", "every {}th point".format(step)])
+    vols = []
+    vP, vD, vS, sP, sS = [], [], [], [], []
+    if nvdb or nvol:
+        per = max(20000, maxvox // max(1, nvdb + nvol))
+        namea = g.findPrimAttrib("name")
+        for i, prim in enumerate(g.iterPrims()):
+            if i > 200000:
+                break
+            t = prim.type()
+            if t not in (hou.primType.VDB, hou.primType.Volume):
+                continue
+            name = prim.attribValue("name") if namea is not None else "volume"
+            o = np.array(prim.indexToPos((0, 0, 0)))
+            ex = np.array(prim.indexToPos((1, 0, 0))) - o
+            ey = np.array(prim.indexToPos((0, 1, 0))) - o
+            ez = np.array(prim.indexToPos((0, 0, 1))) - o
+            vs = float(np.linalg.norm(ex))
+            idx, val, sdf, desc = [], [], False, ""
+            if t == hou.primType.VDB:
+                sdf = bool(prim.isSDF())
+                bb = prim.activeVoxelBoundingBox()
+                mn, mx = bb.minvec(), bb.maxvec()
+                x0, y0, z0 = int(mn[0]), int(mn[1]), int(mn[2])
+                x1, y1, z1 = int(mx[0]), int(mx[1]), int(mx[2])
+                nx, ny, nz = x1 - x0 + 1, y1 - y0 + 1, z1 - z0 + 1
+                act = int(prim.activeVoxelCount())
+                desc = "{} VDB{}, {:,} active voxels, voxel {:.3g}".format(name, " (SDF)" if sdf else "", act, vs)
+                if nx > 0 and ny > 0 and nz > 0:
+                    step = max(1, int(math.ceil((nx * ny * nz / float(per)) ** (1 / 3.0))))
+                    order = None
+                    for z in range(z0, z1 + 1, step):
+                        arr = np.array(prim.voxelRangeAsTuple(hou.BoundingBox(x0, y0, z, x1, y1, z)), dtype=np.float32)
+                        if arr.size != nx * ny:
+                            continue
+                        if order is None and nx > 1 and ny > 1:
+                            a1, ay1 = prim.voxel((x0 + 1, y0, z)), prim.voxel((x0, y0 + 1, z))
+                            if a1 != ay1:
+                                order = "x" if abs(arr[1] - a1) < 1e-9 else ("y" if abs(arr[1] - ay1) < 1e-9 else None)
+                        a = arr.reshape(ny, nx) if order != "y" else arr.reshape(nx, ny).T
+                        a = a[::step, ::step]
+                        m = (np.abs(a) < vs * step * 0.9) if sdf else (a > 1e-4)
+                        ys, xs = np.nonzero(m)
+                        if len(xs):
+                            idx.append(np.stack([x0 + xs * step, y0 + ys * step, np.full(len(xs), z)], 1))
+                            val.append(np.ones(len(xs), np.float32) if sdf else a[m])
+                    vs *= step
+            else:
+                rx, ry, rz = prim.resolution()
+                desc = "{} volume {}×{}×{}".format(name, rx, ry, rz)
+                if rx * ry * rz <= 96 * 1024 * 1024:
+                    a = np.array(prim.allVoxels(), dtype=np.float32).reshape(rz, ry, rx)
+                    step = max(1, int(math.ceil((rx * ry * rz / float(per)) ** (1 / 3.0))))
+                    a = a[::step, ::step, ::step]
+                    m = a > 1e-4
+                    zs, ys, xs = np.nonzero(m)
+                    if len(xs):
+                        idx.append(np.stack([xs * step, ys * step, zs * step], 1))
+                        val.append(a[m])
+                    vs *= step
+            vols.append(desc)
+            if idx:
+                I = np.concatenate(idx).astype(np.float64)
+                V = np.concatenate(val).astype(np.float32)
+                if not sdf and len(V):
+                    keep = V > V.max() * 0.01
+                    I, V = I[keep], V[keep]
+                W = o + I[:, :1] * ex + I[:, 1:2] * ey + I[:, 2:3] * ez
+                if sdf:
+                    sP.append(W.astype(np.float32))       # level set: its narrow band is drawn as a surface
+                    sS.append(vs)
+                else:
+                    vP.append(W.astype(np.float32))
+                    vD.append(V)
+                    vS.append(vs)
+    if sP:
+        S = np.concatenate(sP)
+        if len(S) > maxpts:
+            S = S[np.random.default_rng(0).choice(len(S), maxpts, replace=False)]
+        arrays["P"] = np.concatenate([arrays["P"], S]) if "P" in arrays else S
+        arrays["pS"] = np.array([max(sS)], np.float32)
+        arrays.pop("Cd", None)
+    if vols:
+        info.append(["Volumes", " | ".join(vols[:6]) + (" …" if len(vols) > 6 else "")])
+    if vP:
+        P = np.concatenate(vP)
+        D = np.concatenate(vD)
+        if len(P) > maxvox:
+            sel = np.random.default_rng(0).choice(len(P), maxvox, replace=False)
+            P, D = P[sel], D[sel]
+        arrays["vP"], arrays["vD"], arrays["vS"] = P, D, np.array([max(vS)], np.float32)
+    arrays["info"] = np.array([json.dumps(info)])
+    np.savez(out, **arrays)
+    print("KESTREL-OK")
+except Exception:
+    traceback.print_exc(file=sys.stdout)
+    print("KESTREL-FAIL")
+'''
+
+
+def load_via_houdini(path: str, max_points: int = 2_000_000, max_voxels: int = 1_500_000) -> Optional[dict]:
+    """hython: Houdini reads the file (any .bgeo/.geo variant, packed prims unpacked, VDB and native volumes) and
+    hands back polygons (as OBJ), particles and sampled volume voxels (as .npz). Needs numpy on our side."""
+    h = _find_houdini()
+    if not h["hython"]:
+        _vfx_err("Houdini: hython not found (PATH, $HFS or /opt/hfs*)")
+        return None
+    if np is None:
+        _vfx_err("Houdini caches need numpy (sudo dnf install python3-numpy)")
+        return None
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="kestrel-hou-")
+    script = os.path.join(tmp, "read.py")
+    out, objout = os.path.join(tmp, "out.npz"), os.path.join(tmp, "mesh.obj")
+    try:
+        with open(script, "w") as f:
+            f.write(_HOU_SCRIPT)
+        rc, so, se = _run_streaming([h["hython"], script, os.path.abspath(path), out, objout, str(max_points), str(max_voxels)],
+                                    timeout=200, verbose=BLENDER_VERBOSE)
+        if "KESTREL-OK" not in so or not os.path.exists(out):
+            tail = [l for l in so + se if l.strip() and ("rror" in l or "icense" in l or "timed out" in l)][-3:]
+            _vfx_err("Houdini (hython): " + (" | ".join(x[:200] for x in tail) or f"exit {rc}"))
+            return None
+        z = np.load(out, allow_pickle=False)
+        res = {k: z[k] for k in z.files}
+        res["info"] = [tuple(r) for r in json.loads(str(res["info"][0]))]
+        if "has_obj" in res and os.path.exists(objout):
+            with open(objout, "rb") as f:
+                res["V"], res["F"] = _read_obj_numpy(f.read())
+        res["source"] = "Houdini " + (h["version"] or "")
+        return res
+    except Exception as ex:
+        _vfx_err(f"Houdini: {ex}")
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def load_via_gconvert(path: str) -> Optional[dict]:
+    """Houdini's gconvert (no hython / no licence available): geometry → OBJ. Polygons and points only."""
+    h = _find_houdini()
+    if not h["gconvert"] or np is None:
+        return None
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="kestrel-gconv-")
+    out = os.path.join(tmp, "mesh.obj")
+    try:
+        rc, so, se = _run_streaming([h["gconvert"], os.path.abspath(path), out], timeout=120)
+        if not os.path.exists(out):
+            _vfx_err("gconvert: " + (" | ".join((so + se)[-2:]) or f"exit {rc}"))
+            return None
+        with open(out, "rb") as f:
+            V, F = _read_obj_numpy(f.read())
+        res = {"info": [("Points", f"{len(V):,}")], "source": "Houdini gconvert"}
+        if len(F):
+            res["V"], res["F"] = V, F
+        else:
+            res["P"] = V
+        return res
+    except Exception as ex:
+        _vfx_err(f"gconvert: {ex}")
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def load_vdb_openvdb(path: str, max_voxels: int = 1_500_000) -> Optional[dict]:
+    """Optional `pyopenvdb` / `openvdb` Python module: sample the first fog/SDF float grid."""
+    vdbmod = None
+    for name in ("pyopenvdb", "openvdb"):
+        try:
+            vdbmod = __import__(name)
+            break
+        except ImportError:
+            continue
+    if vdbmod is None or np is None:
+        return None
+    try:
+        grids, meta = vdbmod.readAll(path)
+        g = next((x for x in grids if "Float" in type(x).__name__ or "float" in getattr(x, "valueTypeName", "")), None)
+        if g is None:
+            _vfx_err("OpenVDB: no float grid")
+            return None
+        (i0, j0, k0), (i1, j1, k1) = g.evalActiveVoxelBoundingBox()
+        dims = (i1 - i0 + 1, j1 - j0 + 1, k1 - k0 + 1)
+        if dims[0] * dims[1] * dims[2] > 256 * 1024 * 1024:
+            _vfx_err("OpenVDB: grid too large for a dense preview")
+            return None
+        a = np.zeros(dims, dtype=np.float32)
+        g.copyToArray(a, ijk=(i0, j0, k0))
+        sdf = "LEVEL_SET" in str(getattr(g, "gridClass", "")).upper()
+        step = max(1, int(math.ceil((a.size / float(max_voxels)) ** (1 / 3.0))))
+        b = a[::step, ::step, ::step]
+        try:
+            vs = float(g.transform.voxelSize()[0])
+            org = np.array(g.transform.indexToWorld((0, 0, 0)), dtype=np.float64)
+        except Exception:
+            vs, org = 1.0, np.zeros(3)
+        m = (np.abs(b) < vs * step * 0.9) if sdf else (b > max(1e-4, float(b.max()) * 0.01))
+        ii, jj, kk = np.nonzero(m)
+        I = np.stack([i0 + ii * step, j0 + jj * step, k0 + kk * step], 1).astype(np.float64)
+        W = org + I * vs                      # axis-aligned transform assumed (the common case)
+        info = [("Volumes", f"{g.name or 'grid'} ({'SDF' if sdf else 'fog'}), {g.activeVoxelCount():,} active voxels")]
+        if sdf:
+            return {"P": W.astype(np.float32), "pS": np.array([vs * step], np.float32), "info": info, "source": "OpenVDB (Python)"}
+        D = b[m][:len(W)]
+        return {"vP": W.astype(np.float32), "vD": D.astype(np.float32), "vS": np.array([vs * step], np.float32),
+                "info": [("Volumes", f"{g.name or 'grid'} ({'SDF' if sdf else 'fog'}), {g.activeVoxelCount():,} active voxels")],
+                "source": "OpenVDB (Python)"}
+    except Exception as ex:
+        _vfx_err(f"OpenVDB: {ex}")
+        return None
+
+
+# ---- built-in OpenVDB reader: float grids (fog volumes and level sets) without Houdini or the OpenVDB library
+# Implements the parts of the .vdb format Houdini, EmberGen, Blender and Maya write for scalar grids: file
+# version 222+, Tree_float_5_4_3 (optionally _HalfFloat), zip / blosc / no compression, active-value
+# masks, linear transforms. Blosc is decoded by python-blosc or the C library when either is found
+# (Houdini ships one), otherwise by a small pure-Python LZ4 / BloscLZ decoder.
+
+VDB_MAX_VOXELS = 1_500_000
+
+
+def _lz4_block_decode(src: bytes, out_len: int) -> bytes:
+    """LZ4 block format (no frame)."""
+    dst = bytearray()
+    i, n = 0, len(src)
+    while i < n:
+        tok = src[i]
+        i += 1
+        lit = tok >> 4
+        if lit == 15:
+            while True:
+                b = src[i]
+                i += 1
+                lit += b
+                if b != 255:
+                    break
+        dst += src[i:i + lit]
+        i += lit
+        if i >= n:
+            break
+        off = src[i] | (src[i + 1] << 8)
+        i += 2
+        ml = tok & 15
+        if ml == 15:
+            while True:
+                b = src[i]
+                i += 1
+                ml += b
+                if b != 255:
+                    break
+        ml += 4
+        start = len(dst) - off
+        if off >= ml:
+            dst += dst[start:start + ml]
+        else:                                  # overlapping copy: repeat the period
+            chunk = dst[start:]
+            reps, rem = divmod(ml, off)
+            dst += chunk * reps + chunk[:rem]
+    if len(dst) != out_len:
+        raise ValueError(f"lz4: {len(dst)} bytes, expected {out_len}")
+    return bytes(dst)
+
+
+def _blosclz_decode(src: bytes, out_len: int) -> bytes:
+    """BloscLZ (FastLZ level 1 variant used by c-blosc 1.x)."""
+    dst = bytearray()
+    i, n = 0, len(src)
+    ctrl = src[i] & 31
+    i += 1
+    while True:
+        if ctrl >= 32:
+            ln = (ctrl >> 5) - 1
+            ofs = (ctrl & 31) << 8
+            if ln == 7 - 1:
+                while True:
+                    c = src[i]
+                    i += 1
+                    ln += c
+                    if c != 255:
+                        break
+            c = src[i]
+            i += 1
+            ln += 3
+            ofs += c
+            if c == 255 and ofs == (31 << 8) + 255:          # far distance
+                ofs = (src[i] << 8) + src[i + 1] + 8191
+                i += 2
+            start = len(dst) - ofs - 1
+            if ofs + 1 >= ln:
+                dst += dst[start:start + ln]
+            else:
+                chunk = dst[start:]
+                reps, rem = divmod(ln, ofs + 1)
+                dst += chunk * reps + chunk[:rem]
+        else:
+            ctrl += 1
+            dst += src[i:i + ctrl]
+            i += ctrl
+        if i >= n:
+            break
+        ctrl = src[i]
+        i += 1
+    if len(dst) != out_len:
+        raise ValueError(f"blosclz: {len(dst)} bytes, expected {out_len}")
+    return bytes(dst)
+
+
+_BLOSC_C = None
+_BLOSC_MODS = None
+_LZ4_C = None
+
+
+def _lz4_c():
+    """ctypes LZ4_decompress_safe from the system liblz4 (installed on practically every Linux: systemd needs
+    it), or False. ~50× faster than the pure-Python decoder."""
+    global _LZ4_C
+    if _LZ4_C is None:
+        _LZ4_C = False
+        import ctypes
+        import ctypes.util
+        for name in (ctypes.util.find_library("lz4"), "liblz4.so.1", "liblz4.so"):
+            if not name:
+                continue
+            try:
+                f = ctypes.CDLL(name).LZ4_decompress_safe
+                f.restype = ctypes.c_int
+                f.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+                _LZ4_C = (f, ctypes.create_string_buffer)
+                break
+            except (OSError, AttributeError):
+                continue
+    return _LZ4_C
+
+
+def _blosc_mods():
+    """(python-blosc module or None, lz4.block module or None), looked up once."""
+    global _BLOSC_MODS
+    if _BLOSC_MODS is None:
+        mods = []
+        for name in ("blosc", "lz4.block"):
+            try:
+                mods.append(__import__(name, fromlist=["x"]))
+            except Exception:
+                mods.append(None)
+        _BLOSC_MODS = tuple(mods)
+    return _BLOSC_MODS
+
+
+def _blosc_c():
+    """ctypes handle to a c-blosc library (system, Houdini's dsolib, Blender), or False."""
+    global _BLOSC_C
+    if _BLOSC_C is not None:
+        return _BLOSC_C
+    _BLOSC_C = False
+    import ctypes
+    import ctypes.util
+    cands = [ctypes.util.find_library("blosc")]
+    for pat in ("/opt/hfs*/dsolib/libblosc.so*", os.path.expandvars("$HFS/dsolib/libblosc.so*"),
+                "/usr/lib64/libblosc.so*", "/usr/local/lib*/libblosc.so*"):
+        cands += sorted(glob.glob(pat), reverse=True)
+    for c in cands:
+        if not c:
+            continue
+        try:
+            lib = ctypes.CDLL(c)
+            f = lib.blosc_decompress_ctx
+            f.restype = ctypes.c_int
+            f.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+            _BLOSC_C = (f, ctypes)
+            break
+        except (OSError, AttributeError):
+            continue
+    return _BLOSC_C
+
+
+def blosc_decompress(buf: bytes) -> bytes:
+    """Decode one Blosc-1 chunk (the format OpenVDB writes)."""
+    nbytes, blocksize, cbytes = struct.unpack_from("<III", buf, 4)
+    pyblosc, lz4b = _blosc_mods()
+    if pyblosc is not None:
+        return pyblosc.decompress(buf)
+    c = _blosc_c()
+    if c:
+        f, ctypes = c
+        out = ctypes.create_string_buffer(nbytes)
+        if f(buf, out, nbytes, 1) == nbytes:
+            return out.raw
+    flags, typesize = buf[2], buf[3]
+    if flags & 0x02:                                               # stored (memcpy) chunk
+        return bytes(buf[16:16 + nbytes])
+    lz4c = _lz4_c()
+    codec = flags >> 5
+    if flags & 0x04:
+        raise ValueError("blosc: bit-shuffle is not supported")
+    nblocks = (nbytes + blocksize - 1) // blocksize
+    bstarts = struct.unpack_from(f"<{nblocks}i", buf, 16)
+    out = bytearray()
+    for b in range(nblocks):
+        bsize = min(blocksize, nbytes - b * blocksize)
+        split = (not flags & 0x10) and typesize <= 16 and (bsize // typesize) >= 1 and (bsize % typesize == 0)
+        nsplits = typesize if split else 1
+        neblock = bsize // nsplits
+        pos = bstarts[b]
+        block = bytearray()
+        for _ in range(nsplits):
+            cb = struct.unpack_from("<i", buf, pos)[0]
+            pos += 4
+            if cb == 0:
+                block += bytes(neblock)
+            elif cb < 0:
+                block += bytes([(-cb) & 0xFF]) * neblock
+            elif cb == neblock:
+                block += buf[pos:pos + cb]
+            else:
+                data = bytes(buf[pos:pos + cb])
+                if codec == 1:
+                    if lz4b is not None:
+                        block += lz4b.decompress(data, uncompressed_size=neblock)
+                    elif lz4c:
+                        out_ = lz4c[1](neblock)
+                        if lz4c[0](data, out_, cb, neblock) != neblock:
+                            raise ValueError("lz4: corrupt block")
+                        block += out_.raw
+                    else:
+                        block += _lz4_block_decode(data, neblock)
+                elif codec == 0:
+                    block += _blosclz_decode(data, neblock)
+                elif codec == 3:
+                    block += zlib.decompress(data)
+                elif codec == 4:
+                    import zstandard
+                    block += zstandard.ZstdDecompressor().decompress(data, max_output_size=neblock)
+                else:
+                    raise ValueError(f"blosc: codec {codec} not supported")
+            pos += max(cb, 0)
+        if flags & 0x01 and typesize > 1:                          # undo byte shuffle
+            full = (bsize // typesize) * typesize
+            arr = np.frombuffer(bytes(block[:full]), dtype=np.uint8).reshape(typesize, -1).T.reshape(-1)
+            block = bytearray(arr.tobytes()) + block[full:]
+        out += block
+    return bytes(out)
+
+
+class _VdbStream:
+    def __init__(self, data: bytes, pos: int = 0):
+        self.d, self.p = data, pos
+
+    def read(self, n: int) -> bytes:
+        b = self.d[self.p:self.p + n]
+        if len(b) != n:
+            raise ValueError("unexpected end of VDB file")
+        self.p += n
+        return b
+
+    def u32(self):
+        return struct.unpack("<I", self.read(4))[0]
+
+    def i32(self):
+        return struct.unpack("<i", self.read(4))[0]
+
+    def i64(self):
+        return struct.unpack("<q", self.read(8))[0]
+
+    def string(self) -> str:
+        return self.read(self.u32()).decode("utf-8", "replace")
+
+    def meta(self) -> dict:
+        out = {}
+        for _ in range(self.u32()):
+            name, typ = self.string(), self.string()
+            raw = self.read(self.u32())
+            try:
+                if typ == "string":
+                    out[name] = raw.decode("utf-8", "replace")
+                elif typ == "bool":
+                    out[name] = bool(raw[0])
+                elif typ in ("int32", "int64", "float", "double") and len(raw) in (4, 8):
+                    out[name] = struct.unpack({"int32": "<i", "int64": "<q", "float": "<f", "double": "<d"}[typ], raw)[0]
+                elif typ == "vec3i":
+                    out[name] = struct.unpack("<3i", raw)
+                else:
+                    out[name] = raw
+            except Exception:
+                out[name] = raw
+        return out
+
+
+def _vdb_transform(s: _VdbStream):
+    """→ 4×4 row-vector matrix (world = [i j k 1] @ M)."""
+    typ = s.string()
+    d = lambda n: struct.unpack(f"<{n}d", s.read(8 * n))
+    M = np.eye(4)
+    if typ in ("ScaleMap", "UniformScaleMap"):
+        sc = d(3)
+        d(12)                                                # voxelSize, inverse, invScaleSqr, invTwiceScale
+        M[0, 0], M[1, 1], M[2, 2] = sc
+    elif typ == "TranslationMap":
+        M[3, :3] = d(3)
+    elif typ in ("ScaleTranslateMap", "UniformScaleTranslateMap"):
+        tr, sc = d(3), d(3)
+        d(12)
+        M[0, 0], M[1, 1], M[2, 2] = sc
+        M[3, :3] = tr
+    elif typ in ("AffineMap", "UnitaryMap"):
+        M = np.array(d(16)).reshape(4, 4)
+    else:
+        raise ValueError(f"transform {typ} not supported")
+    return M
+
+
+class _VdbFloatTree:
+    """Reads topology + buffers of a Tree_float_5_4_3 grid into flat arrays of active voxels."""
+
+    def __init__(self, s: _VdbStream, compression: int, half: bool):
+        self.s, self.comp, self.half = s, compression, half
+        self.vt = np.float16 if half else np.float32
+
+    def _data(self, count: int):
+        """readData: count values of the stored type, honouring the grid's compression."""
+        s, isz = self.s, (2 if self.half else 4)
+        if self.half and count < 1:                          # OpenVDB's HalfReader writes nothing for 0 values
+            return np.zeros(0, dtype=self.vt)
+        nbytes = count * isz
+        if self.comp & 0x5:                                  # zip or blosc: size-prefixed
+            n = s.i64()
+            if n <= 0:
+                raw = s.read(-n)
+            else:
+                blob = s.read(n)
+                raw = blosc_decompress(blob) if self.comp & 0x4 else zlib.decompress(blob)
+        else:
+            raw = s.read(nbytes)
+        return np.frombuffer(raw, dtype=self.vt, count=count)
+
+    def _compressed_values(self, count: int, mask_on: int):
+        """readCompressedValues → (values array, all_values_stored)."""
+        s = self.s
+        meta = s.read(1)[0]
+        if meta in (2, 4, 5):
+            s.read(4 if meta != 5 else 8)                    # inactive value(s), full precision
+        if meta in (3, 4, 5):
+            s.read(count // 8)                               # selection mask
+        if self.comp & 0x2 and meta != 6:
+            return self._data(mask_on), False
+        return self._data(count), True
+
+    @staticmethod
+    def _mask(raw: bytes):
+        return np.unpackbits(np.frombuffer(raw, dtype=np.uint8), bitorder="little").astype(bool)
+
+    def read(self):
+        s = self.s
+        if s.u32() != 1:
+            raise ValueError("multi-buffer trees are not supported")
+        self.background = struct.unpack("<f", s.read(4))[0]
+        ntiles, nchild = s.u32(), s.u32()
+        s.read(ntiles * (12 + 4 + 1))
+        # topology: depth-first, upper(32³) → lower(16³) → leaf masks
+        self.leaf_origins, self.leaf_tmask = [], []
+        tile_pts, tile_vals = [], []
+        lower_offsets = np.array([(n >> 8, (n >> 4) & 15, n & 15) for n in range(4096)], dtype=np.int32)
+        upper_offsets = None
+        # each root child (upper node) is read in full, recursively, before the next one
+        for _ in range(nchild):
+            org = np.array(struct.unpack("<3i", s.read(12)), dtype=np.int64)
+            cm, vm = self._mask(s.read(4096)), self._mask(s.read(4096))
+            self._compressed_values(32768, int(vm.sum()))    # upper tiles (128³ each) — ignored
+            if upper_offsets is None:
+                n = np.arange(32768)
+                upper_offsets = np.stack([n >> 10, (n >> 5) & 31, n & 31], 1)
+            for ci in np.nonzero(cm)[0]:
+                lorg = org + upper_offsets[ci] * 128
+                lcm, lvm = self._mask(s.read(512)), self._mask(s.read(512))
+                vals, allv = self._compressed_values(4096, int(lvm.sum()))
+                if lvm.any():                                 # active 8³ tiles
+                    tv = vals[lvm] if allv else vals
+                    tile_pts.append(lorg + lower_offsets[lvm] * 8)
+                    tile_vals.append(np.asarray(tv, dtype=np.float32))
+                for li in np.nonzero(lcm)[0]:
+                    self.leaf_origins.append(lorg + lower_offsets[li] * 8)
+                    s.read(64)                                # leaf topology mask (repeated with the buffers)
+        self.tile_pts = np.concatenate(tile_pts) if tile_pts else np.zeros((0, 3), np.int64)
+        self.tile_vals = np.concatenate(tile_vals) if tile_vals else np.zeros(0, np.float32)
+        return self
+
+    def read_leaves(self, stride: int = 1):
+        """Leaf buffers in topology order → (origins int32 L×3, masks uint8 L×64, active values float32 in
+        (leaf, bit) order). Every `stride`-th leaf is decoded; the rest are skipped without decompressing.
+        Hot loop: ~25k–500k leaves, so plain locals and offsets instead of stream objects."""
+        data, p = self.s.d, self.s.p
+        half, comp = self.half, self.comp
+        isz = 2 if half else 4
+        dt = np.float16 if half else np.float32
+        sized = bool(comp & 0x5)
+        maskc = bool(comp & 0x2)
+        q64 = struct.Struct("<q").unpack_from
+        zero64 = bytes(64)
+        dec = blosc_decompress if comp & 0x4 else zlib.decompress
+        masks, chunks, used = [], [], []
+        for idx in range(len(self.leaf_origins)):
+            m = data[p:p + 64]
+            meta = data[p + 64]
+            p += 65
+            if meta in (2, 4, 5):
+                p += 8 if meta == 5 else 4                    # inactive value(s): full precision even for half grids
+            if meta in (3, 4, 5):
+                p += 64                                       # selection mask
+            allv = (not maskc) or meta == 6
+            if half and not allv and m == zero64:
+                continue                                      # no active values: OpenVDB wrote nothing at all
+            if sized:
+                n = q64(data, p)[0]
+                p += 8
+                if idx % stride:
+                    p += abs(n)
+                    continue
+                if n <= 0:
+                    raw = data[p:p - n]
+                    p -= n
+                else:
+                    raw = dec(data[p:p + n])
+                    p += n
+            else:
+                cnt = 512 if allv else bin(int.from_bytes(m, "little")).count("1")
+                raw = data[p:p + cnt * isz]
+                p += cnt * isz
+                if idx % stride:
+                    continue
+            if allv:                                          # all 512 stored: keep the active ones
+                raw = np.frombuffer(raw, dt)[self._mask(m)].tobytes()
+            masks.append(m)
+            chunks.append(raw)
+            used.append(idx)
+        self.s.p = p
+        org = np.asarray(self.leaf_origins, dtype=np.int32).reshape(-1, 3)[np.asarray(used, dtype=np.int64)]
+        mb = np.frombuffer(b"".join(masks), dtype=np.uint8).reshape(-1, 64)
+        vals = np.frombuffer(b"".join(chunks), dtype=dt).astype(np.float32)
+        return org, mb, vals
+
+    def _skip_values(self, count: int, on: int):
+        s = self.s
+        meta = s.read(1)[0]
+        if meta in (2, 4, 5):
+            s.read(4 if meta != 5 else 8)
+        if meta in (3, 4, 5):
+            s.read(count // 8)
+        n = on if (self.comp & 0x2 and meta != 6) else count
+        if self.half and n < 1:
+            return
+        if self.comp & 0x5:
+            k = s.i64()
+            s.p += abs(k)
+        else:
+            s.p += n * (2 if self.half else 4)
+
+
+def read_vdb_grids(path: str):
+    """Header + grid descriptors of a .vdb: (data, [dict(name, type, pos, block, end)])."""
+    with open(path, "rb") as f:
+        data = f.read()                                       # caches are tens of MB; one read beats many seeks
+    s = _VdbStream(data)
+    if s.i64() != 0x56444220:
+        raise ValueError("not an OpenVDB file")
+    ver = s.u32()
+    if ver < 222:
+        raise ValueError(f"VDB file version {ver} is too old for the built-in reader")
+    s.u32(), s.u32()
+    has_offsets = s.read(1)[0]
+    s.read(36)
+    s.meta()
+    grids = []
+    for _ in range(s.i32()):
+        name, typ = s.string(), s.string()
+        s.string()                                            # instance parent
+        pos, block, end = s.i64(), s.i64(), s.i64()
+        grids.append({"name": name.split("\x1e")[0], "type": typ, "pos": pos, "block": block, "end": end})
+        if not has_offsets:
+            raise ValueError("VDB without grid offsets")
+        s.p = end
+    return data, grids
+
+
+def _vdb_pick_step(mb, max_voxels: int) -> int:
+    """Coarsening for a preview: the smallest of 1, 2, 4, 8 whose occupied cells (any active voxel among the
+    step³ it averages) fit in max_voxels, with 30 % slack so a sequence doesn't drop a whole level of detail
+    for one frame a little over. Leaf-aligned steps make coarsening a reshape, not a sort."""
+    occ = {1: 0, 2: 0, 4: 0, 8: 0}
+    for b0 in range(0, len(mb), 32768):
+        bits = np.unpackbits(mb[b0:b0 + 32768], axis=1, bitorder="little").astype(bool).reshape(-1, 8, 8, 8)
+        n = len(bits)
+        occ[1] += int(bits.sum())
+        for st in (2, 4, 8):
+            d = 8 // st
+            occ[st] += int(bits.reshape(n, d, st, d, st, d, st).any(axis=(2, 4, 6)).sum())
+    return next((st for st in (1, 2, 4) if occ[st] <= max_voxels * 1.3), 8)
+
+
+def _vdb_leaf_samples(org, mb, vals, step: int, keep):
+    """Leaves → sample centres (index space, float64 N×3) and values, averaging step³ cells inside each leaf.
+    keep(cell_values, active_bits) selects cells. Works in blocks of 32k leaves (64 MB) so memory stays flat."""
+    counts = np.unpackbits(mb, axis=1, bitorder="little").sum(1, dtype=np.int64) if len(mb) else np.zeros(0, np.int64)
+    starts = np.concatenate([np.zeros(1, np.int64), np.cumsum(counts)])
+    d = 8 // step
+    n_cells = d * d * d
+    cidx = np.arange(n_cells)
+    coff = np.stack([cidx // (d * d), (cidx // d) % d, cidx % d], 1).astype(np.float64) * step + (step - 1) / 2.0
+    out_c, out_v = [], []
+    for b0 in range(0, len(mb), 32768):
+        b1 = min(len(mb), b0 + 32768)
+        bits = np.unpackbits(mb[b0:b1], axis=1, bitorder="little").astype(bool)
+        dense = np.zeros(bits.shape, np.float32)
+        dense[bits] = vals[starts[b0]:starts[b1]]
+        n = b1 - b0
+        if step > 1:
+            cv = dense.reshape(n, d, step, d, step, d, step).mean(axis=(2, 4, 6)).reshape(n, n_cells)
+            cb = bits.reshape(n, d, step, d, step, d, step).any(axis=(2, 4, 6)).reshape(n, n_cells)
+        else:
+            cv, cb = dense, bits
+        li, ci = np.nonzero(keep(cv, cb) & cb)
+        out_c.append(org[b0 + li].astype(np.float64) + coff[ci])
+        out_v.append(cv[li, ci])
+    if not out_c:
+        return np.zeros((0, 3)), np.zeros(0, np.float32)
+    return np.concatenate(out_c), np.concatenate(out_v).astype(np.float32)
+
+
+def load_vdb_native(path: str, max_voxels: int = VDB_MAX_VOXELS, step: Optional[int] = None) -> Optional[dict]:
+    """Built-in reader: the density grid (or the first float grid) as smoke voxels, a level set as surface points.
+    step: coarsening factor to use (a sequence keeps the first frame's, so detail doesn't flicker)."""
+    if np is None:
+        return None
+    t0 = time.monotonic()
+    try:
+        data, grids = read_vdb_grids(path)
+        floats = [g for g in grids if g["type"].startswith("Tree_float_5_4_3")]
+        if not floats:
+            _vfx_err("VDB: no float grid the built-in reader understands (" + ", ".join(g["type"] for g in grids) + ")")
+            return None
+        others = ", ".join(g["name"] for g in grids)
+        metas = []
+        for g in floats:
+            s = _VdbStream(data, g["pos"])
+            g["comp"] = s.u32()
+            g["meta"] = s.meta()
+            g["tf_pos"] = s.p
+            metas.append(g)
+        cls = lambda g: str(g["meta"].get("class", "")).lower()
+        pick = (next((g for g in floats if g["name"].lower() == "density"), None)
+                or next((g for g in floats if cls(g) != "level set"), None) or floats[0])
+        sdf = cls(pick) == "level set"
+        s = _VdbStream(data, pick["tf_pos"])
+        M = _vdb_transform(s)
+        tree = _VdbFloatTree(s, pick["comp"], pick["type"].endswith("_HalfFloat")).read()
+        if s.p != pick["block"]:
+            raise ValueError(f"topology ended at {s.p}, expected {pick['block']}")
+        nleaves = len(tree.leaf_origins)
+        est = int(pick["meta"].get("file_voxel_count", nleaves * 300))
+        stride = 1
+        blosc_slow = bool(pick["comp"] & 0x4) and not _blosc_c() and not _lz4_c() and not any(_blosc_mods())
+        if blosc_slow and nleaves > 250_000:                   # pure-Python LZ4 (~10 µs a leaf): cap the decode time
+            stride = int(math.ceil(nleaves / 250_000))
+        org, mb, vals = tree.read_leaves(stride)
+        if s.p != pick["end"]:
+            raise ValueError(f"leaf data ended at {s.p}, expected {pick['end']}")
+        if len(tree.tile_vals):                              # active 8³ tiles are leaf-sized blocks of one value
+            org = np.concatenate([org, tree.tile_pts.astype(np.int32)])
+            mb = np.concatenate([mb, np.full((len(tree.tile_vals), 64), 255, np.uint8)])
+            vals = np.concatenate([vals, np.repeat(tree.tile_vals.astype(np.float32), 512)])
+        vs = float(np.linalg.norm(M[0, :3]))
+        # EmberGen and Blender write Z-up volumes; Kestrel's viewer (like Houdini and Maya) is Y-up
+        tags = " ".join(f"{k} {v}" for g in metas for k, v in g["meta"].items() if not isinstance(v, bytes)).lower()
+        zup = "embergen" in tags or "blender" in tags
+        if zup:
+            M = M @ np.array([[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]], dtype=np.float64)
+        info = [("Volumes", f"{pick['name']} ({'SDF' if sdf else 'fog'}), {est:,} active voxels"
+                 + (f"; grids: {others}" if len(grids) > 1 else ""))]
+        if sdf:
+            centre, _ = _vdb_leaf_samples(org, mb, vals, 1, lambda d, bits: bits & (np.abs(d) < vs * 0.87))
+            step = max(1, int(math.ceil((len(centre) / 2_000_000) ** 0.5)))
+            centre = centre[::step]
+            P = np.c_[centre, np.ones(len(centre))] @ M
+            return {"P": P[:, :3].astype(np.float32), "pS": np.array([vs * math.sqrt(step)], np.float32), "info": info,
+                    "source": "built-in VDB reader"}
+        thr = 0.004 * (float(vals.max()) if len(vals) else 0.0)   # faint haze: invisible, but widens the framing
+        step_fixed = int(step or 0)
+        if step_fixed:
+            step = 1 if step_fixed < 2 else 2 if step_fixed < 4 else 4 if step_fixed < 8 else 8
+        else:
+            step = _vdb_pick_step(mb, max_voxels)
+        # a cell is kept when its average holds at least one voxel's worth of visible density
+        centre, val = _vdb_leaf_samples(org, mb, vals, step, lambda d, bits: d > thr / step ** 3)
+        P = np.c_[centre, np.ones(len(centre))] @ M
+        if stride > 1:
+            info.append(("Note", f"every {stride}th block read (install lz4-libs or python3-blosc for full detail)"))
+        bench(f"vdb native: {pick['name']} {len(val):,} samples, {nleaves:,} leaves, stride {stride}, "
+              f"{time.monotonic() - t0:.2f}s")
+        return {"vP": P[:, :3].astype(np.float32), "vD": val.astype(np.float32), "vS": np.array([vs * step], np.float32),
+                "vStep": step, "info": info, "source": "built-in VDB reader"}
+    except Exception as ex:
+        _vfx_err(f"VDB reader: {ex}")
+        return None
+
+
+# ---- Maya (mayapy) — fallback for FBX / Alembic / USD / OBJ when Blender isn't available
+_MAYA_CACHE: Optional[str] = None
+
+
+def _find_mayapy() -> Optional[str]:
+    global _MAYA_CACHE
+    if _MAYA_CACHE is not None:
+        return _MAYA_CACHE or None
+    c = [shutil.which("mayapy")]
+    if os.environ.get("MAYA_LOCATION"):
+        c.append(os.path.join(os.environ["MAYA_LOCATION"], "bin", "mayapy"))
+    c += sorted(glob.glob("/usr/autodesk/maya*/bin/mayapy") + glob.glob("/opt/autodesk/maya*/bin/mayapy"), reverse=True)
+    _MAYA_CACHE = next((p for p in c if p and os.access(p, os.X_OK)), "")
+    return _MAYA_CACHE or None
+
+
+_MAYA_SCRIPT = r'''
+import sys, struct, array, traceback
+try:
+    path, out = sys.argv[1], sys.argv[2]
+    import maya.standalone
+    maya.standalone.initialize(name="python")
+    import maya.cmds as cmds
+    import maya.api.OpenMaya as om
+    for plug in ("fbxmaya", "AbcImport", "mayaUsdPlugin", "objExport"):
+        try:
+            cmds.loadPlugin(plug, quiet=True)
+        except Exception:
+            pass
+    ext = path.lower().rsplit(".", 1)[-1]
+    if ext == "abc":
+        cmds.AbcImport(path, mode="import")
+    elif ext == "fbx":
+        cmds.file(path, i=True, type="FBX", ignoreVersion=True)
+    elif ext in ("usd", "usda", "usdc", "usdz"):
+        cmds.file(path, i=True, type="USD Import", ignoreVersion=True)
+    else:
+        cmds.file(path, i=True, ignoreVersion=True)
+    V, F, base = array.array("f"), array.array("i"), 0
+    it = om.MItDag(om.MItDag.kDepthFirst, om.MFn.kMesh)
+    while not it.isDone():
+        dp = it.getPath()
+        if not om.MFnDagNode(dp).isIntermediateObject:
+            fn = om.MFnMesh(dp)
+            pts = fn.getPoints(om.MSpace.kWorld)
+            for p in pts:
+                V.extend((p.x, p.y, p.z))
+            counts, ids = fn.getTriangles()
+            F.extend([i + base for i in ids])
+            base += len(pts)
+        it.next()
+    with open(out, "wb") as f:
+        f.write(b"KSTM" + struct.pack("<QQ", len(V) // 3, len(F) // 3))
+        f.write(V.tobytes())
+        f.write(F.tobytes())
+    print("KESTREL-OK")
+except Exception:
+    traceback.print_exc(file=sys.stdout)
+    print("KESTREL-FAIL")
+'''
+
+
+def load_via_maya(path: str) -> Optional[Tuple[list, list, str]]:
+    """mayapy standalone import → triangles. Slow to start (Maya boots and checks out a licence), so it's the
+    last resort after Blender and assimp."""
+    mp = _find_mayapy()
+    if not mp:
+        _vfx_err("Maya: mayapy not found (PATH, $MAYA_LOCATION or /usr/autodesk/maya*)")
+        return None
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="kestrel-maya-")
+    script, out = os.path.join(tmp, "read.py"), os.path.join(tmp, "mesh.bin")
+    try:
+        with open(script, "w") as f:
+            f.write(_MAYA_SCRIPT)
+        rc, so, se = _run_streaming([mp, script, os.path.abspath(path), out], timeout=200, verbose=BLENDER_VERBOSE)
+        if "KESTREL-OK" not in so or not os.path.exists(out):
+            tail = [l for l in so + se if l.strip() and ("rror" in l or "icense" in l or "timed out" in l)][-3:]
+            _vfx_err("Maya: " + (" | ".join(x[:200] for x in tail) or f"exit {rc}"))
+            return None
+        with open(out, "rb") as f:
+            head = f.read(20)
+            if head[:4] != b"KSTM":
+                return None
+            nv, nf = struct.unpack("<QQ", head[4:20])
+            if np is not None:
+                V = np.frombuffer(f.read(nv * 12), dtype=np.float32).reshape(-1, 3)
+                F = np.frombuffer(f.read(nf * 12), dtype=np.int32).reshape(-1, 3)
+            else:
+                import array
+                va, fa = array.array("f"), array.array("i")
+                va.frombytes(f.read(nv * 12))
+                fa.frombytes(f.read(nf * 12))
+                V = [tuple(va[i:i + 3]) for i in range(0, len(va), 3)]
+                F = [tuple(fa[i:i + 3]) for i in range(0, len(fa), 3)]
+        return (V, F, "Maya") if len(V) else None
+    except Exception as ex:
+        _vfx_err(f"Maya: {ex}")
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def load_via_houdini_mesh(path: str) -> Optional[Tuple[list, list, str]]:
+    """Houdini as a mesh importer for Alembic (File SOP reads .abc; packed prims are unpacked)."""
+    r = load_via_houdini(path)
+    if r and "F" in r and len(r["F"]):
+        return r["V"], r["F"], r["source"]
+    return None
+
+import io  # noqa: E402  (scene breakdowns: in-memory decompressed .blend)
+
+
+# =========================================================================== scene breakdowns (p3e)
+# What's inside a scene file, read without opening the application: Unreal (.umap / .uasset / .uproject),
+# Unity (.unity / .prefab / .mat / .unitypackage), Maya (.ma / .mb) and Blender (.blend). Each reader returns
+#   {"kind": str, "info": [(key, value)], "tree": [node], "notes": [str]}
+# where node = [label, detail, [children], path, exists] — shown as an expandable tree in the preview pane.
+# References carry the file's full path and whether it exists on this machine (None: not a local file).
+
+def _bn(label: str, detail: str = "", children: Optional[list] = None, path: str = "", exists=None) -> list:
+    return [label, detail, children or [], path, exists]
+
+
+def _bn_file(label: str, detail: str, path: str) -> list:
+    """A referenced file: path shown in its own column, flagged when it doesn't exist."""
+    ok = None
+    if path and (os.path.isabs(path) or path.startswith("~")):
+        try:
+            ok = os.path.exists(os.path.expanduser(path))
+        except (OSError, ValueError):
+            ok = None
+    return _bn(label, detail, None, path, ok)
+
+
+def _refs_summary(nodes: list) -> Tuple[int, int]:
+    """(files, missing) over a reference tree."""
+    n = miss = 0
+    for x in nodes:
+        if x[3]:
+            n += 1
+            miss += x[4] is False
+        a, b = _refs_summary(x[2])
+        n += a
+        miss += b
+    return n, miss
+
+
+def _bn_counts(counter: dict, limit: int = 60, fmt=None) -> list:
+    """Counter → nodes 'Name   ×N', biggest first."""
+    items = sorted(counter.items(), key=lambda kv: (-kv[1], str(kv[0]).lower()))
+    out = [_bn(fmt(k) if fmt else str(k), f"×{v:,}") for k, v in items[:limit]]
+    if len(items) > limit:
+        out.append(_bn(f"… {len(items) - limit:,} more", ""))
+    return out
+
+
+def _bn_capped(nodes: list, limit: int, what: str = "more") -> list:
+    if len(nodes) <= limit:
+        return nodes
+    return nodes[:limit] + [_bn(f"… {len(nodes) - limit:,} {what}", "")]
+
+
+# --------------------------------------------------------------------------- Unreal Engine packages
+UE_TAG = 0x9E2A83C1
+_UE_PKG_FILTER_EDITOR_ONLY = 0x80000000
+
+
+class UEPackage:
+    """Header of an Unreal package (.uasset / .umap): summary, name table, import and export maps.
+    Covers UE 4.0 – 5.4+ (legacy file versions -2 … -9). Export data is not deserialised, except for a
+    best-effort scan of actor labels and outliner folders (editor-only tagged properties)."""
+
+    def __init__(self, path: str, data: Optional[bytes] = None):
+        if data is None:
+            with open(path, "rb") as f:
+                data = f.read()
+        self.path, self.d = path, data
+        self.p = 0
+        self._summary()
+        self._names()
+        self._imports()
+        self._exports()
+
+    # ---- primitives
+    def _i32(self):
+        v = struct.unpack_from("<i", self.d, self.p)[0]
+        self.p += 4
+        return v
+
+    def _u32(self):
+        v = struct.unpack_from("<I", self.d, self.p)[0]
+        self.p += 4
+        return v
+
+    def _i64(self):
+        v = struct.unpack_from("<q", self.d, self.p)[0]
+        self.p += 8
+        return v
+
+    def _fstring(self) -> str:
+        n = self._i32()
+        if n == 0:
+            return ""
+        if n < 0:
+            n = -n
+            if n > 1 << 20:
+                raise ValueError("bad FString")
+            s = self.d[self.p:self.p + 2 * n].decode("utf-16-le", "replace")
+            self.p += 2 * n
+        else:
+            if n > 1 << 20:
+                raise ValueError("bad FString")
+            s = self.d[self.p:self.p + n].decode("latin-1")
+            self.p += n
+        return s.rstrip("\x00")
+
+    def _engine_version(self) -> str:
+        major, minor, patch = struct.unpack_from("<HHH", self.d, self.p)
+        self.p += 6
+        cl = self._u32()
+        branch = self._fstring()
+        if major == 0 and minor == 0:
+            return ""
+        return f"{major}.{minor}.{patch}" + (f" ({branch})" if branch else "") + (f" CL {cl}" if cl else "")
+
+    # ---- summary
+    def _summary(self):
+        if self._u32() != UE_TAG:
+            raise ValueError("not an Unreal package")
+        self.legacy = self._i32()
+        if self.legacy >= 0 or self.legacy < -9:
+            raise ValueError(f"unsupported package version {self.legacy}")
+        if self.legacy != -4:
+            self._i32()                                       # LegacyUE3Version
+        self.ue4 = self._i32()
+        self.ue5 = self._i32() if self.legacy <= -8 else 0
+        self._i32()                                           # licensee version
+        if self.ue5 >= 1016:                                  # PACKAGE_SAVED_HASH (UE 5.4+): hash + header size
+            self.p += 20                                      # come before the custom versions
+            self._i32()
+        if self.legacy <= -2:
+            n = self._i32()
+            if not 0 <= n < 10000:
+                raise ValueError("bad custom version count")
+            if self.legacy == -2:
+                self.p += 8 * n
+            elif self.legacy >= -5 + 1:                       # -3, -4: guid + version + friendly name
+                for _ in range(n):
+                    self.p += 20
+                    self._fstring()
+            else:
+                self.p += 20 * n
+        if self.ue5 < 1016:
+            self._i32()                                       # TotalHeaderSize
+        self.folder = self._fstring()                         # PackageName (UE5) / FolderName
+        self.flags = self._u32()
+        editor = not (self.flags & _UE_PKG_FILTER_EDITOR_ONLY)
+        self.name_count, self.name_offset = self._i32(), self._i32()
+        if self.ue5 >= 1008:                                  # ADD_SOFTOBJECTPATH_LIST
+            self._i32(), self._i32()
+        if editor and self.ue4 >= 516:                        # ADDED_PACKAGE_SUMMARY_LOCALIZATION_ID
+            self._fstring()
+        if self.ue4 >= 459:                                   # SERIALIZE_TEXT_IN_PACKAGES
+            self._i32(), self._i32()
+        self.export_count, self.export_offset = self._i32(), self._i32()
+        self.import_count, self.import_offset = self._i32(), self._i32()
+        self.depends_offset = self._i32()
+        if self.ue4 >= 384:                                   # ADD_STRING_ASSET_REFERENCES_MAP
+            self._i32(), self._i32()
+        if self.ue4 >= 510:                                   # ADDED_SEARCHABLE_NAMES
+            self._i32()
+        self.thumb_offset = self._i32()                       # ThumbnailTableOffset
+        if self.ue5 < 1016:
+            self.p += 16                                      # Guid
+        if editor and self.ue4 >= 518:                        # ADDED_PACKAGE_OWNER
+            self.p += 16
+            if self.ue4 < 520:
+                self.p += 16
+        self.engine = ""
+        gen_end = self._find_generations(self.p)
+        if gen_end is not None:
+            self.p = gen_end
+            try:
+                if self.ue4 >= 336:                           # ENGINE_VERSION_OBJECT
+                    self.engine = self._engine_version()
+                    if self.ue4 >= 444:
+                        compat = self._engine_version()
+                        if not self.engine:
+                            self.engine = compat
+                else:
+                    cl = self._i32()
+                    self.engine = f"CL {cl}" if cl else ""
+            except Exception:
+                self.engine = ""
+        for nm, v in (("names", self.name_count), ("imports", self.import_count), ("exports", self.export_count)):
+            if not 0 <= v < 10_000_000:
+                raise ValueError(f"bad {nm} count")
+
+    def _find_generations(self, guess: int) -> Optional[int]:
+        """End of the generations table, which precedes the saved-by engine version. Its last entry repeats
+        the package's export and name counts, so it can be found even when newer engine versions add summary
+        fields this reader doesn't know about: try the computed position, then scan nearby."""
+        d = self.d
+        want = (self.export_count, self.name_count)
+        for q in [guess] + list(range(max(0, guess - 64), min(len(d) - 12, guess + 512))):
+            if q + 4 > len(d):
+                continue
+            c = struct.unpack_from("<i", d, q)[0]
+            if 1 <= c <= 64 and q + 4 + 8 * c <= len(d):
+                if struct.unpack_from("<ii", d, q + 4 + 8 * (c - 1)) == want:
+                    return q + 4 + 8 * c
+        return None
+
+    # ---- tables
+    def _names(self):
+        self.p = self.name_offset
+        hashes = self.ue4 >= 504                              # NAME_HASHES_SERIALIZED
+        names = []
+        for _ in range(self.name_count):
+            names.append(self._fstring())
+            if hashes:
+                self.p += 4
+        self.names = names
+
+    def name(self, idx: int, num: int = 0) -> str:
+        if not 0 <= idx < len(self.names):
+            return f"?{idx}"
+        s = self.names[idx]
+        return f"{s}_{num - 1}" if num > 0 else s
+
+    def _fname(self) -> str:
+        i, n = struct.unpack_from("<ii", self.d, self.p)
+        self.p += 8
+        return self.name(i, n)
+
+    def _imports(self):
+        self.p = self.import_offset
+        editor = not (self.flags & _UE_PKG_FILTER_EDITOR_ONLY)
+        imps = []
+        for _ in range(self.import_count):
+            cpkg, cname = self._fname(), self._fname()
+            outer = self._i32()
+            oname = self._fname()
+            if self.ue4 >= 520 and editor:                    # NON_OUTER_PACKAGE_IMPORT
+                self.p += 8
+            if self.ue5 >= 1003:                              # OPTIONAL_RESOURCES
+                self.p += 4
+            imps.append((cpkg, cname, outer, oname))
+        self.imports = imps
+
+    def _export_stride(self) -> int:
+        s = 4 + 4 + (4 if self.ue4 >= 508 else 0) + 4 + 8 + 4
+        s += 16 if self.ue4 >= 511 else 8                     # 64-bit serial size / offset
+        s += 12                                               # forced export, not for client / server
+        if self.ue5 < 1005:
+            s += 16                                           # package guid
+        if self.ue5 >= 1006:
+            s += 4                                            # is inherited instance
+        s += 4                                                # package flags
+        if self.ue4 >= 365:
+            s += 4
+        if self.ue4 >= 485:
+            s += 4                                            # bIsAsset
+        if self.ue5 >= 1003:
+            s += 4
+        if self.ue4 >= 507:
+            s += 20                                           # preload dependencies
+        if self.ue5 >= 1010:
+            s += 16                                           # script serialization offsets
+        return s
+
+    def _exports(self):
+        self.p = self.export_offset
+        stride = self._export_stride()
+        exps = []
+        for i in range(self.export_count):
+            base = self.export_offset + i * stride
+            self.p = base
+            cls = self._i32()
+            sup = self._i32()
+            if self.ue4 >= 508:
+                self._i32()                                   # template
+            outer = self._i32()
+            oname = self._fname()
+            self._u32()                                       # object flags
+            if self.ue4 >= 511:
+                size, off = self._i64(), self._i64()
+            else:
+                size, off = self._i32(), self._i32()
+            is_asset = False
+            if self.ue4 >= 485:
+                q = base + stride - (20 if self.ue4 >= 507 else 0) - (16 if self.ue5 >= 1010 else 0) \
+                    - (4 if self.ue5 >= 1003 else 0) - 4
+                is_asset = struct.unpack_from("<i", self.d, q)[0] == 1
+            exps.append((cls, outer, oname, size, off, is_asset, sup))
+        # sanity: indices in range (a wrong stride shows up immediately)
+        ni, ne = len(self.imports), len(exps)
+        bad = sum(1 for c, o, *_ in exps if not (-ni <= c <= ne and -ni <= o <= ne))
+        if exps and bad > len(exps) // 10:
+            raise ValueError("export map not understood")
+        self.exports = exps
+
+    def thumbnails(self) -> list:
+        """Editor thumbnails stored in the package: [(class, object path, image bytes, is_jpeg, w, h)].
+        PNG in UE4, PNG or JPEG in UE5 (a negative height marks JPEG)."""
+        out = []
+        off = getattr(self, "thumb_offset", 0)
+        if not off or off + 4 > len(self.d):
+            return out
+        try:
+            self.p = off
+            n = self._i32()
+            if not 0 < n < 10000:
+                return out
+            entries = []
+            for _ in range(n):
+                cls = self._fstring()
+                obj = self._fstring()
+                entries.append((cls, obj, self._i32()))
+            for cls, obj, foff in entries:
+                if not 0 < foff < len(self.d) - 12:
+                    continue
+                w, h, size = struct.unpack_from("<iii", self.d, foff)
+                if w <= 0 or size <= 0 or foff + 12 + size > len(self.d):
+                    continue
+                out.append((cls, obj, self.d[foff + 12:foff + 12 + size], h < 0, w, abs(h)))
+        except (struct.error, ValueError):
+            pass
+        return out
+
+    # ---- object helpers
+    def obj_name(self, ref: int) -> str:
+        if ref < 0 and -ref - 1 < len(self.imports):
+            return self.imports[-ref - 1][3]
+        if ref > 0 and ref - 1 < len(self.exports):
+            return self.exports[ref - 1][2]
+        return ""
+
+    def class_of(self, ex) -> str:
+        return self.obj_name(ex[0]) or "Object"
+
+    def import_package(self, i: int) -> str:
+        """Outermost package of an import (e.g. /Game/Meshes/SM_Chair)."""
+        seen = 0
+        while 0 <= i < len(self.imports) and seen < 64:
+            outer = self.imports[i][2]
+            if outer >= 0:
+                return self.imports[i][3]
+            i = -outer - 1
+            seen += 1
+        return ""
+
+    def referenced_assets(self) -> Dict[str, str]:
+        """{'/Game/Path/Asset': 'StaticMesh', …} for imports of objects inside /Game (and plugin) packages."""
+        out = {}
+        for i, (cpkg, cname, outer, oname) in enumerate(self.imports):
+            if cname == "Package" or outer >= 0:
+                continue
+            pkg = self.import_package(i)
+            if pkg.startswith("/Script/") or pkg.startswith("/Engine/Transient") or not pkg.startswith("/"):
+                continue
+            if self.imports[-outer - 1][1] == "Package":     # direct child of the package: the asset itself
+                out.setdefault(pkg, cname)
+        return out
+
+    def property_value_near(self, start: int, end: int, prop: str, kind: str):
+        """Best-effort read of one tagged property inside export data: finds the FName of `prop` and returns
+        the FString (kind='str') or FName (kind='name') value that follows within a few dozen bytes."""
+        try:
+            idx = self.names.index(prop)
+        except ValueError:
+            return None
+        pat = struct.pack("<ii", idx, 0)
+        j = self.d.find(pat, start, end)
+        if j < 0:
+            return None
+        k = j + 8
+        lim = min(end, k + 64)
+        if kind == "str":
+            while k + 4 < lim:
+                n = struct.unpack_from("<i", self.d, k)[0]
+                if 1 < n < 512 and k + 4 + n <= end and self.d[k + 4 + n - 1] == 0:
+                    raw = self.d[k + 4:k + 4 + n - 1]
+                    if raw and all(32 <= c < 127 or c >= 160 for c in raw):
+                        return raw.decode("latin-1")
+                elif -512 < n < -1 and k + 4 - 2 * n <= end:
+                    try:
+                        s = self.d[k + 4:k + 4 - 2 * n].decode("utf-16-le").rstrip("\x00")
+                        if s and s.isprintable():
+                            return s
+                    except UnicodeDecodeError:
+                        pass
+                k += 1
+            return None
+        skip = {"NameProperty", "None", prop}
+        while k + 8 <= lim:
+            ni, nn = struct.unpack_from("<ii", self.d, k)
+            if 0 <= ni < len(self.names) and 0 <= nn < 1000 and self.names[ni] not in skip and k - j >= 16:
+                v = self.name(ni, nn)
+                if v and "/" not in v[:1]:
+                    return v
+            k += 1
+        return None
+
+
+_UE_ACTOR_HINTS = ("Actor", "Light", "Volume", "Camera", "Character", "Pawn", "Fog", "Atmosphere", "Landscape",
+                   "Sky", "Cloud", "Brush", "Emitter", "Decal", "Note", "PlayerStart", "Reflection", "Sound")
+
+
+def _ue_content_root(path: str) -> Optional[str]:
+    d = os.path.dirname(os.path.abspath(path))
+    for _ in range(40):
+        if os.path.basename(d) == "Content":
+            return d
+        nd = os.path.dirname(d)
+        if nd == d:
+            return None
+        d = nd
+    return None
+
+
+def _ue_external_actors(map_path: str, limit_files: int = 4000, limit_s: float = 6.0):
+    """World Partition / one-file-per-actor: actors live in Content/__ExternalActors__/<map path>/…"""
+    root = _ue_content_root(map_path)
+    if not root:
+        return None
+    rel = os.path.splitext(os.path.relpath(map_path, root))[0]
+    folder = os.path.join(root, "__ExternalActors__", rel)
+    if not os.path.isdir(folder):
+        return None
+    files = []
+    for dp, dn, fn in os.walk(folder):
+        files += [os.path.join(dp, f) for f in fn if f.endswith(".uasset")]
+    t0 = time.monotonic()
+    counts: Dict[str, int] = {}
+    actors = []
+    read = 0
+    for f in files[:limit_files]:
+        if time.monotonic() - t0 > limit_s:
+            break
+        try:
+            pk = UEPackage(f)
+        except Exception:
+            continue
+        read += 1
+        for ex in pk.exports:
+            if ex[1] == 0 or pk.obj_name(ex[1]) == "PersistentLevel":
+                cls = pk.class_of(ex)
+                if cls in ("Level", "Package", "MetaData", "World"):
+                    continue
+                if ex[1] != 0 or any(h in cls for h in _UE_ACTOR_HINTS) or cls.endswith("_C"):
+                    counts[cls] = counts.get(cls, 0) + 1
+                    lab = pk.property_value_near(ex[4], ex[4] + ex[3], "ActorLabel", "str") if ex[3] < 1 << 20 else None
+                    fold = pk.property_value_near(ex[4], ex[4] + ex[3], "FolderPath", "name") if ex[3] < 1 << 20 else None
+                    actors.append((lab or ex[2], cls, fold))
+                    break
+    return {"files": len(files), "read": read, "counts": counts, "actors": actors}
+
+
+def _ue_outliner(actors: list, limit: int = 1500) -> list:
+    """[(label, class, folder)] → folder tree like the World Outliner."""
+    root: dict = {}
+    for lab, cls, fold in actors[:limit]:
+        node = root
+        for part in [p for p in (fold or "").split("/") if p and p != "None"]:
+            node = node.setdefault(("folder", part), {})
+        node.setdefault(("actor", f"{lab}\x00{cls}"), {})
+
+    def build(d):
+        out = []
+        for (kind, key), sub in sorted(d.items(), key=lambda kv: (kv[0][0] != "folder", kv[0][1].lower())):
+            if kind == "folder":
+                out.append(_bn(key, "folder", build(sub)))
+            else:
+                lab, cls = key.split("\x00")
+                out.append(_bn(lab, _ue_class_label(cls)))
+        return out
+    nodes = build(root)
+    if len(actors) > limit:
+        nodes.append(_bn(f"… {len(actors) - limit:,} more actors", ""))
+    return nodes
+
+
+def _ue_class_label(cls: str) -> str:
+    return f"{cls[:-2]} (Blueprint)" if cls.endswith("_C") else cls
+
+
+def _ue_package_file(pkg: str, content: Optional[str]) -> str:
+    """/Game/Maps/Foo → <project>/Content/Maps/Foo.umap|.uasset; plugin mounts → Plugins/**/<Name>/Content."""
+    if not content or not pkg.startswith("/"):
+        return ""
+    parts = pkg.strip("/").split("/", 1)
+    if len(parts) < 2:
+        return ""
+    mount, rest = parts
+    if mount == "Game":
+        base = content
+    elif mount in ("Engine", "Script", "Temp", "Memory"):
+        return ""
+    else:
+        base = _ue_plugin_content(os.path.dirname(content), mount)
+        if not base:
+            return ""
+    stem = os.path.join(base, rest)
+    for ext in (".uasset", ".umap"):
+        if os.path.exists(stem + ext):
+            return stem + ext
+    return stem + ".uasset"
+
+
+_UE_PLUGINS: Dict[str, Dict[str, str]] = {}
+
+
+def _ue_plugin_content(project: str, mount: str) -> str:
+    cache = _UE_PLUGINS.get(project)
+    if cache is None:
+        cache = {}
+        plug = os.path.join(project, "Plugins")
+        for dp, dn, fn in os.walk(plug):
+            for f in fn:
+                if f.endswith(".uplugin"):
+                    cache[os.path.splitext(f)[0]] = os.path.join(dp, "Content")
+            if dp.count(os.sep) - plug.count(os.sep) > 4:
+                dn[:] = []
+        _UE_PLUGINS[project] = cache
+    return cache.get(mount, "")
+
+
+def _ue_assets_tree(assets: Dict[str, str], content: Optional[str], limit: int = 400) -> list:
+    by_type: Dict[str, list] = {}
+    for p, t in assets.items():
+        by_type.setdefault(t, []).append(p)
+    out = []
+    for t, ps in sorted(by_type.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        ps.sort(key=str.lower)
+        items = []
+        for p in ps:
+            f = _ue_package_file(p, content)
+            items.append(_bn_file(os.path.basename(p), p, f) if f else
+                         _bn(os.path.basename(p), p + ("  · engine content" if p.startswith("/Engine/") else "")))
+        out.append(_bn(t, f"×{len(ps):,}", _bn_capped(items, limit)))
+    return out
+
+
+def breakdown_unreal(path: str) -> dict:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".uproject":
+        return _breakdown_uproject(path)
+    pk = UEPackage(path)
+    info = [("Engine", pk.engine or f"UE{'5' if pk.ue5 else '4'} package version {pk.ue5 or pk.ue4}")]
+    if pk.flags & _UE_PKG_FILTER_EDITOR_ONLY:
+        info.append(("Cooked", "yes (editor data stripped)"))
+    tree, notes = [], []
+    level_idx = next((i + 1 for i, ex in enumerate(pk.exports) if pk.class_of(ex) == "Level"), 0)
+    assets = pk.referenced_assets()
+    if ext == ".umap" or level_idx:
+        kind = "Unreal level"
+        actors, counts = [], {}
+        for ex in pk.exports:
+            if level_idx and ex[1] == level_idx:
+                cls = pk.class_of(ex)
+                if cls in ("Model", "BrushComponent", "Polys", "LevelScriptBlueprint", "NavigationSystemV1"):
+                    continue
+                if cls.endswith("Component") or cls in ("Function", "Package"):
+                    continue
+                counts[cls] = counts.get(cls, 0) + 1
+                lab = fold = None
+                if ex[3] < 1 << 20:
+                    lab = pk.property_value_near(ex[4], ex[4] + ex[3], "ActorLabel", "str")
+                    fold = pk.property_value_near(ex[4], ex[4] + ex[3], "FolderPath", "name")
+                actors.append((lab or ex[2], cls, fold))
+        wp = "WorldPartition" in pk.names
+        ext_act = _ue_external_actors(path)
+        if ext_act and ext_act["files"]:
+            for k, v in ext_act["counts"].items():
+                counts[k] = counts.get(k, 0) + v
+            actors += ext_act["actors"]
+            info.append(("World Partition", f"{ext_act['files']:,} external actor files"))
+            if ext_act["read"] < ext_act["files"]:
+                notes.append(f"Read {ext_act['read']:,} of {ext_act['files']:,} external actor files (time limit).")
+        elif wp:
+            info.append(("World Partition", "yes"))
+        info.append(("Actors", f"{sum(counts.values()):,}"))
+        tree.append(_bn("Outliner", f"{len(actors):,} actors", _ue_outliner(actors)))
+        tree.append(_bn("Actors by class", f"{len(counts):,} classes", _bn_counts(counts, fmt=_ue_class_label)))
+    else:
+        main = next((ex for ex in pk.exports if ex[5]), None) or \
+            next((ex for ex in pk.exports if ex[1] == 0), None)
+        cls = pk.class_of(main) if main else "?"
+        kind = f"Unreal {cls}"
+        info.append(("Asset class", cls))
+        if cls in ("Blueprint", "WidgetBlueprint", "AnimBlueprint"):
+            gen = next((i + 1 for i, ex in enumerate(pk.exports) if ex[2].endswith("_C") and ex[1] == 0), 0)
+            funcs = sorted({ex[2] for ex in pk.exports if pk.class_of(ex) == "Function" and ex[1] == gen
+                            and not ex[2].startswith(("ExecuteUbergraph", "bpv__", "Default__"))}, key=str.lower)
+            comps = {}
+            for ex in pk.exports:
+                c = pk.class_of(ex)
+                if c.endswith("Component") and "Default__" not in ex[2]:
+                    comps[c] = comps.get(c, 0) + 1
+            parent = pk.obj_name(pk.exports[gen - 1][6]) if gen else ""
+            if parent:
+                info.append(("Parent class", parent))
+            info.append(("Functions", f"{len(funcs):,}"))
+            tree.append(_bn("Functions & events", f"{len(funcs):,}", [_bn(f) for f in funcs]))
+            if comps:
+                tree.append(_bn("Components", f"{sum(comps.values()):,}", _bn_counts(comps)))
+        objs: Dict[str, int] = {}
+        for ex in pk.exports:
+            c = pk.class_of(ex)
+            objs[c] = objs.get(c, 0) + 1
+        tree.append(_bn("Objects in this package", f"{len(pk.exports):,}", _bn_counts(objs)))
+    content = _ue_content_root(path)
+    refs = _ue_assets_tree(assets, content)
+    own = (pk.folder or "").rstrip("/")
+    # Soft references: /Game paths in the name table that aren't hard imports. FNames keep a trailing _N as a
+    # separate number, so the bare string of a numbered hard import (SM_Frame for SM_Frame_1) is skipped.
+    hard = {imp[3] for imp in pk.imports if imp[1] == "Package"}
+    numbered = {re.sub(r"_\d+$", "", h) for h in hard if re.search(r"_\d+$", h)}
+    soft = sorted({n for n in pk.names if n.startswith("/Game/") and n != own and not n.startswith(own + ".")
+                   and n.split(".")[0] not in hard and n.split(".")[0] not in numbered}, key=str.lower)
+    if soft:
+        items = []
+        for n in soft:
+            pkgp = n.split(".")[0].split(":")[0]
+            f = _ue_package_file(pkgp, content)
+            items.append(_bn_file(os.path.basename(pkgp), n, f) if f else _bn(os.path.basename(pkgp), n))
+        refs.append(_bn("Soft references", f"×{len(soft):,}", _bn_capped(items, 400)))
+    nref, nmiss = _refs_summary(refs)
+    tree.append(_bn("References", f"{len(assets) + len(soft):,} assets" + (f" · {nmiss} missing" if nmiss else ""), refs))
+    if nmiss:
+        info.append(("Missing references", f"{nmiss:,}"))
+    scripts = sorted({imp[3] for imp in pk.imports if imp[1] == "Package" and imp[3].startswith("/Script/")})
+    if scripts:
+        tree.append(_bn("Engine & plugin modules", f"{len(scripts):,}", [_bn(s[len('/Script/'):], "") for s in scripts]))
+    info.append(("Package", f"{len(pk.names):,} names · {len(pk.imports):,} imports · {len(pk.exports):,} exports"))
+    images = []
+    for cls, obj, data, is_jpeg, w, h in pk.thumbnails()[:1]:
+        img = decode_image_bytes(data)
+        if img is not None:
+            images.append((f"Editor thumbnail ({cls})", img))
+    return {"kind": kind, "info": info, "tree": tree, "notes": notes, "images": images}
+
+
+def _breakdown_uproject(path: str) -> dict:
+    with open(path, "rb") as f:
+        j = json.loads(f.read().decode("utf-8-sig"))
+    info = [("Engine", str(j.get("EngineAssociation") or "source build / unknown"))]
+    if j.get("Category"):
+        info.append(("Category", j["Category"]))
+    if j.get("Description"):
+        info.append(("Description", j["Description"]))
+    tree = []
+    mods = j.get("Modules") or []
+    if mods:
+        tree.append(_bn("C++ modules", f"{len(mods)}", [_bn(m.get("Name", "?"), f"{m.get('Type', '')} · {m.get('LoadingPhase', 'Default')}") for m in mods]))
+    plugs = j.get("Plugins") or []
+    if plugs:
+        on = [p for p in plugs if p.get("Enabled", True)]
+        off = [p for p in plugs if not p.get("Enabled", True)]
+        tree.append(_bn("Plugins enabled", f"{len(on)}", [_bn(p.get("Name", "?")) for p in sorted(on, key=lambda p: p.get("Name", "").lower())]))
+        if off:
+            tree.append(_bn("Plugins disabled", f"{len(off)}", [_bn(p.get("Name", "?")) for p in off]))
+    if j.get("TargetPlatforms"):
+        tree.append(_bn("Target platforms", "", [_bn(t) for t in j["TargetPlatforms"]]))
+    content = os.path.join(os.path.dirname(path), "Content")
+    if os.path.isdir(content):
+        maps, n_assets, t0 = [], 0, time.monotonic()
+        for dp, dn, fn in os.walk(content):
+            dn[:] = [d for d in dn if d not in ("__ExternalActors__", "__ExternalObjects__", "Collections", "Developers")]
+            for f in fn:
+                if f.endswith(".umap"):
+                    maps.append(os.path.relpath(os.path.join(dp, f), content))
+                elif f.endswith(".uasset"):
+                    n_assets += 1
+            if time.monotonic() - t0 > 3:
+                break
+        info.append(("Content", f"{len(maps):,} maps · {n_assets:,} assets"))
+        tree.append(_bn("Maps", f"{len(maps):,}", _bn_capped([_bn(os.path.basename(m), os.path.dirname(m)) for m in sorted(maps, key=str.lower)], 300)))
+    return {"kind": "Unreal project", "info": info, "tree": tree, "notes": []}
+
+
+# --------------------------------------------------------------------------- Unity (text-serialised YAML)
+UNITY_CLASSES = {
+    1: "GameObject", 4: "Transform", 8: "Behaviour", 12: "ParticleAnimator", 20: "Camera", 21: "Material",
+    23: "MeshRenderer", 25: "Renderer", 33: "MeshFilter", 43: "Mesh", 48: "Shader", 50: "Rigidbody2D",
+    54: "Rigidbody", 56: "Collider", 58: "CircleCollider2D", 59: "HingeJoint", 60: "PolygonCollider2D",
+    61: "BoxCollider2D", 64: "MeshCollider", 65: "BoxCollider", 68: "EdgeCollider2D", 70: "CapsuleCollider2D",
+    81: "AudioListener", 82: "AudioSource", 95: "Animator", 96: "TrailRenderer", 102: "TextMesh",
+    104: "RenderSettings", 108: "Light", 111: "Animation", 114: "MonoBehaviour", 119: "Projector",
+    120: "LineRenderer", 135: "SphereCollider", 136: "CapsuleCollider", 137: "SkinnedMeshRenderer",
+    143: "CharacterController", 146: "WheelCollider", 153: "ConfigurableJoint", 154: "TerrainCollider",
+    157: "LightmapSettings", 164: "AudioReverbFilter", 192: "OcclusionArea", 193: "Tree", 195: "NavMeshAgent",
+    196: "NavMeshSettings", 198: "ParticleSystem", 199: "ParticleSystemRenderer", 205: "LODGroup",
+    208: "NavMeshObstacle", 212: "SpriteRenderer", 215: "ReflectionProbe", 218: "Terrain", 220: "LightProbeGroup",
+    222: "CanvasRenderer", 223: "Canvas", 224: "RectTransform", 225: "CanvasGroup", 226: "BillboardRenderer",
+    258: "LightProbes", 290: "AssetBundleManifest", 310: "UnityConnectSettings", 320: "PlayableDirector",
+    328: "VideoPlayer", 330: "SpriteMask", 331: "SpriteShapeRenderer", 483693784: "TilemapRenderer",
+    1001: "PrefabInstance", 1660057539: "SceneRoots", 1839735485: "Tilemap", 29: "OcclusionCullingSettings",
+    19719996: "TilemapCollider2D", 156049354: "Grid", 1953259897: "TerrainLayer", 2083052967: "VisualEffect",
+    73398921: "VFXRenderer", 310525001: "VisualEffectAsset", 850595691: "LightingSettings",
+}
+_UNITY_SKIP_COMPONENTS = ("Transform", "RectTransform")
+_UNITY_BUILTIN_GUIDS = {"0000000000000000e000000000000000": "Unity built-in extra resources",
+                        "0000000000000000f000000000000000": "Unity default resources",
+                        "0000000000000000d000000000000000": "Unity built-in resources"}
+_RE_FILEID = re.compile(r"fileID: (-?\d+)")
+_RE_GUID = re.compile(r"guid: ([0-9a-f]{32})")
+_RE_REF = re.compile(r"\b(\w+): \{fileID: (-?\d+)(?:, guid: ([0-9a-f]{32}))?")
+
+
+def unity_project_root(path: str) -> Optional[str]:
+    d = os.path.dirname(os.path.abspath(path))
+    for _ in range(40):
+        if os.path.isdir(os.path.join(d, "Assets")) and os.path.isdir(os.path.join(d, "ProjectSettings")):
+            return d
+        nd = os.path.dirname(d)
+        if nd == d:
+            return None
+        d = nd
+    return None
+
+
+def unity_version(root: Optional[str]) -> str:
+    if not root:
+        return ""
+    try:
+        with open(os.path.join(root, "ProjectSettings", "ProjectVersion.txt")) as f:
+            for line in f:
+                if line.startswith("m_EditorVersion:"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+_UNITY_GUIDS: Dict[str, Tuple[float, Dict[str, str], bool]] = {}
+
+
+def unity_guid_index(root: str, limit_s: float = 8.0) -> Tuple[Dict[str, str], bool]:
+    """{guid: path relative to the project} from every .meta in Assets/, Packages/ and the package cache.
+    Cached per project for a minute (the worker process lives on, so browsing a project stays fast).
+    Returns (index, complete)."""
+    hit = _UNITY_GUIDS.get(root)
+    if hit and time.monotonic() - hit[0] < 60:
+        return hit[1], hit[2]
+    idx: Dict[str, str] = {}
+    t0 = time.monotonic()
+    complete = True
+    for top in ("Assets", "Packages", os.path.join("Library", "PackageCache")):
+        base = os.path.join(root, top)
+        if not os.path.isdir(base):
+            continue
+        for dp, dn, fn in os.walk(base):
+            for f in fn:
+                if not f.endswith(".meta"):
+                    continue
+                try:
+                    with open(os.path.join(dp, f), "rb") as fh:
+                        head = fh.read(160)
+                except OSError:
+                    continue
+                m = re.search(rb"guid: ([0-9a-f]{32})", head)
+                if m:
+                    idx[m.group(1).decode()] = os.path.relpath(os.path.join(dp, f[:-5]), root)
+            if time.monotonic() - t0 > limit_s:
+                complete = False
+                break
+        if not complete:
+            break
+    _UNITY_GUIDS[root] = (time.monotonic(), idx, complete)
+    return idx, complete
+
+
+def _unity_docs(path: str):
+    """Yield (class_id, file_id, stripped, type_name, lines) for each YAML document. Flow mappings that wrap
+    onto continuation lines are joined back into one line."""
+    cid = fid = None
+    stripped = False
+    lines: list = []
+    tname = ""
+    pending = ""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            line = raw.rstrip("\n")
+            if pending:
+                pending += " " + line.strip()
+                if pending.count("{") <= pending.count("}"):
+                    lines.append(pending)
+                    pending = ""
+                continue
+            if line.startswith("--- !u!"):
+                if cid is not None:
+                    yield cid, fid, stripped, tname, lines
+                head = line[7:].split()
+                try:
+                    cid = int(head[0])
+                    fid = int(head[1].lstrip("&")) if len(head) > 1 else 0
+                except (ValueError, IndexError):
+                    cid, fid = -1, 0
+                stripped = "stripped" in head
+                lines, tname = [], ""
+                continue
+            if cid is None:
+                continue
+            if not tname and line and not line.startswith(" "):
+                tname = line.rstrip(":")
+                continue
+            if "{" in line and line.count("{") > line.count("}"):
+                pending = line
+                continue
+            lines.append(line)
+    if cid is not None:
+        yield cid, fid, stripped, tname, lines
+
+
+def _unity_top(lines: list) -> Tuple[Dict[str, str], Dict[str, list]]:
+    """Indent-2 keys of a document: scalars/flow values, and block lists of their '- ' items."""
+    top: Dict[str, str] = {}
+    lists: Dict[str, list] = {}
+    cur = None
+    for line in lines:
+        if line.startswith("  - ") and cur is not None:
+            lists.setdefault(cur, []).append(line[4:])
+            continue
+        if line.startswith("  ") and not line.startswith("   ") and ":" in line:
+            k, _, v = line[2:].partition(":")
+            v = v.strip()
+            top[k] = v
+            cur = k if not v else None
+        elif not line.startswith("    "):
+            cur = None
+    return top, lists
+
+
+def _fid(v: str) -> int:
+    m = _RE_FILEID.search(v or "")
+    return int(m.group(1)) if m else 0
+
+
+def _guid(v: str) -> str:
+    m = _RE_GUID.search(v or "")
+    return m.group(1) if m else ""
+
+
+def breakdown_unity(path: str) -> dict:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".unitypackage":
+        return _breakdown_unitypackage(path)
+    with open(path, "rb") as f:
+        head = f.read(64)
+    root = unity_project_root(path)
+    ver = unity_version(root)
+    info = [("Unity", ver or "unknown (no ProjectSettings found above this file)")]
+    if not head.startswith(b"%YAML"):
+        return {"kind": "Unity asset (binary)", "info": info, "tree": [],
+                "notes": ["This file is binary-serialised. Set Project Settings → Editor → Asset Serialization "
+                          "to Force Text for a breakdown."]}
+    guids, complete = unity_guid_index(root) if root else ({}, False)
+
+    def asset(g: str) -> str:
+        if g in _UNITY_BUILTIN_GUIDS:
+            return _UNITY_BUILTIN_GUIDS[g]
+        return guids.get(g, "")
+
+    gos, xforms, prefabs, comps = {}, {}, {}, {}
+    order: list = []
+    roots_order: list = []
+    refs: Dict[str, Dict[str, int]] = {}          # guid -> {field: count}
+    settings: Dict[str, str] = {}
+    big = os.path.getsize(path) > 300 << 20
+    class_counts: Dict[str, int] = {}
+    for cid, fid, stripped, tname, lines in _unity_docs(path):
+        cname = UNITY_CLASSES.get(cid, tname or f"Class {cid}")
+        class_counts[cname] = class_counts.get(cname, 0) + 1
+        if big:
+            continue
+        for line in lines:
+            if "fileID" not in line:                           # inline mesh / terrain data: long hex runs
+                continue
+            for m in _RE_REF.finditer(line):
+                if m.group(3) and m.group(1) not in ("target", "m_CorrespondingSourceObject", "m_PrefabAsset"):
+                    fld = refs.setdefault(m.group(3), {})
+                    fld[m.group(1)] = fld.get(m.group(1), 0) + 1
+            if line.startswith("  - {fileID") and "guid:" in line:          # list items (m_Materials …)
+                g = _guid(line)
+                if g:
+                    fld = refs.setdefault(g, {})
+                    fld["list"] = fld.get("list", 0) + 1
+        top, lists = _unity_top(lines)
+        if cid == 1:
+            comp_ids = [_fid(x) for x in lists.get("m_Component", [])]
+            gos[fid] = {"name": top.get("m_Name", ""), "active": top.get("m_IsActive", "1") != "0", "comps": comp_ids}
+        elif cid in (4, 224):
+            xforms[fid] = {"go": _fid(top.get("m_GameObject", "")), "father": _fid(top.get("m_Father", "")),
+                           "children": [_fid(x) for x in lists.get("m_Children", [])],
+                           "order": int(top.get("m_RootOrder", "0") or 0) if top.get("m_RootOrder", "").lstrip("-").isdigit() else 0,
+                           "stripped": stripped, "prefab": _fid(top.get("m_PrefabInstance", "") or top.get("m_PrefabInternal", ""))}
+            order.append(fid)
+        elif cid == 1001:
+            text = "\n".join(lines)
+            parent = re.search(r"m_TransformParent: \{fileID: (-?\d+)", text)
+            src = re.search(r"m_(?:SourcePrefab|ParentPrefab): \{fileID: -?\d+, guid: ([0-9a-f]{32})", text)
+            nm = re.search(r"propertyPath: m_Name\s*\n\s*value: (.*)", text)
+            act = re.search(r"propertyPath: m_IsActive\s*\n\s*value: (\d)", text)
+            prefabs[fid] = {"parent": int(parent.group(1)) if parent else 0, "src": src.group(1) if src else "",
+                            "name": (nm.group(1).strip() if nm else ""), "active": not (act and act.group(1) == "0")}
+        elif cid == 1660057539:
+            roots_order = [_fid(x) for x in lists.get("m_Roots", [])]
+        elif cid == 104:
+            settings["Skybox"] = asset(_guid(top.get("m_SkyboxMaterial", ""))) or ("none" if _fid(top.get("m_SkyboxMaterial", "")) == 0 else "built-in")
+            settings["Fog"] = "on" if top.get("m_Fog") == "1" else "off"
+            settings["Ambient"] = {"0": "skybox", "1": "gradient", "3": "colour", "4": "custom"}.get(top.get("m_AmbientMode", ""), top.get("m_AmbientMode", ""))
+        elif cid == 157:
+            lda = asset(_guid(top.get("m_LightingDataAsset", "")))
+            settings["Baked lighting"] = lda or "not baked"
+            ls = asset(_guid(top.get("m_LightingSettings", "")))
+            if ls:
+                settings["Lighting settings"] = ls
+        elif cid not in (29, 196):
+            go = _fid(top.get("m_GameObject", ""))
+            if go:
+                label = cname
+                if cid == 114:
+                    g = _guid(top.get("m_Script", ""))
+                    sp = asset(g)
+                    label = ("Built-in script" if sp.startswith("Unity ") else os.path.splitext(os.path.basename(sp))[0]) if sp \
+                        else (f"Script {g[:8]}…" if g else "MonoBehaviour")
+                elif cid == 108:
+                    t = top.get("m_Type", "")
+                    label = "Light (" + {"0": "Spot", "1": "Directional", "2": "Point", "3": "Area", "4": "Disc"}.get(t, t) + ")"
+                comps[fid] = (go, label, top.get("m_Enabled", "1") != "0")
+
+    # ---- hierarchy
+    kids: Dict[int, list] = {}
+    for p_id, p in prefabs.items():
+        kids.setdefault(p["parent"], []).append(("prefab", p_id))
+    for t_id, t in xforms.items():
+        if not t["stripped"] and t["father"] not in xforms and t["father"] != 0:
+            kids.setdefault(t["father"], []).append(("xform", t_id))
+    prefab_root_xf = {t["prefab"]: t_id for t_id, t in xforms.items() if t["stripped"] and t["prefab"]}
+    comp_by_go: Dict[int, list] = {}
+    for c_id, (go, label, en) in comps.items():
+        comp_by_go.setdefault(go, []).append(label + ("" if en else " (off)"))
+    n_nodes = [0]
+    LIMIT = 4000
+
+    def prefab_node(p_id):
+        p = prefabs[p_id]
+        sp = asset(p["src"])
+        name = p["name"] or (os.path.splitext(os.path.basename(sp))[0] if sp else "Prefab")
+        n_nodes[0] += 1
+        sub = []
+        xt = prefab_root_xf.get(p_id)
+        for kind, k in kids.get(xt, []) if xt else []:
+            sub.append(node(kind, k))
+        for t_id, t in xforms.items():
+            if xt and t["father"] == xt and not t["stripped"]:
+                sub.append(xform_node(t_id))
+        return _bn(name + ("" if p["active"] else "  (inactive)"), "prefab · " + (sp or (f"missing prefab {p['src'][:8]}…" if p["src"] else "")), sub)
+
+    def xform_node(t_id):
+        t = xforms[t_id]
+        if t["stripped"] and t["prefab"] in prefabs:
+            return prefab_node(t["prefab"])
+        g = gos.get(t["go"], {})
+        n_nodes[0] += 1
+        detail = ", ".join(comp_by_go.get(t["go"], []))
+        if g and not g.get("active", True):
+            detail = ("inactive · " + detail) if detail else "inactive"
+        sub = []
+        if n_nodes[0] < LIMIT:
+            for c in t["children"]:
+                if c in xforms:
+                    sub.append(xform_node(c))
+            for kind, k in kids.get(t_id, []):
+                if kind == "prefab":
+                    sub.append(prefab_node(k))
+        return _bn(g.get("name", "") or "(unnamed)", detail, sub)
+
+    def node(kind, k):
+        return prefab_node(k) if kind == "prefab" else xform_node(k)
+
+    root_items = []
+    if roots_order:
+        for r in roots_order:
+            if r in xforms:
+                root_items.append(xform_node(r))
+            elif r in prefabs:
+                root_items.append(prefab_node(r))
+    else:
+        rts = [t_id for t_id in order if xforms[t_id]["father"] == 0 and not xforms[t_id]["stripped"]]
+        rts.sort(key=lambda t_id: xforms[t_id]["order"])
+        root_items = [xform_node(t) for t in rts] + [prefab_node(p) for p, v in prefabs.items() if v["parent"] == 0]
+
+    # ---- summary
+    kind = {".unity": "Unity scene", ".prefab": "Unity prefab", ".mat": "Unity material"}.get(ext, "Unity asset")
+    tree, notes = [], []
+    n_lights = sum(1 for _, l, _ in comps.values() if l.startswith("Light ("))
+    n_cams = sum(1 for _, l, _ in comps.values() if l == "Camera")
+    if gos or prefabs:
+        info += [("GameObjects", f"{len(gos):,}"), ("Prefab instances", f"{len(prefabs):,}")]
+        if n_lights or n_cams:
+            info.append(("Lights / cameras", f"{n_lights} / {n_cams}"))
+        tree.append(_bn("Hierarchy", f"{len(root_items):,} roots", root_items))
+        cc: Dict[str, int] = {}
+        for _, l, _ in comps.values():
+            cc[l] = cc.get(l, 0) + 1
+        tree.append(_bn("Components", f"{sum(cc.values()):,}", _bn_counts(cc)))
+        pc: Dict[str, int] = {}
+        for p in prefabs.values():
+            k = asset(p["src"]) or (f"missing ({p['src'][:8]}…)" if p["src"] else "?")
+            pc[k] = pc.get(k, 0) + 1
+        if pc:
+            tree.append(_bn("Prefabs used", f"{len(pc):,}", _bn_counts(pc)))
+    else:
+        tree.append(_bn("Objects", f"{sum(class_counts.values()):,}", _bn_counts(class_counts)))
+    if settings:
+        tree.append(_bn("Lighting & environment", "", [_bn(k, v) for k, v in settings.items()]))
+    tree.append(_unity_refs_tree(refs, asset, root))
+    if root and not complete:
+        notes.append("The project is large: only part of it was indexed, some references may show as unresolved.")
+    if not root:
+        notes.append("No Unity project found above this file, so referenced assets can't be resolved to paths.")
+    if big:
+        notes.append("Very large file: object counts only.")
+    return {"kind": kind, "info": info, "tree": tree, "notes": notes}
+
+
+_UNITY_REF_GROUPS = (("Scripts", (".cs",)), ("Prefabs", (".prefab",)), ("Materials", (".mat",)),
+                     ("Meshes & models", (".fbx", ".obj", ".blend", ".dae", ".3ds", ".max", ".ma", ".mb", ".asset", ".mesh")),
+                     ("Textures", (".png", ".jpg", ".jpeg", ".tga", ".psd", ".exr", ".hdr", ".tif", ".tiff", ".bmp", ".gif", ".renderTexture")),
+                     ("Shaders", (".shader", ".shadergraph", ".compute", ".hlsl", ".cginc")),
+                     ("Audio", (".wav", ".mp3", ".ogg", ".aif", ".aiff", ".flac")),
+                     ("Animation", (".anim", ".controller", ".overrideController", ".playable", ".mask")),
+                     ("Scenes", (".unity",)), ("Video", (".mp4", ".mov", ".webm")))
+
+
+def _unity_refs_tree(refs: Dict[str, Dict[str, int]], asset, root: Optional[str]) -> list:
+    groups: Dict[str, list] = {}
+    missing = []
+    for g, fields in refs.items():
+        p = asset(g)
+        n = sum(fields.values())
+        if not p:
+            missing.append(_bn(f"GUID {g}", f"×{n} · not found in the project ({', '.join(sorted(fields))})"))
+            continue
+        ext = os.path.splitext(p)[1].lower()
+        grp = next((name for name, exts in _UNITY_REF_GROUPS if ext in exts), "Built-in" if p.startswith("Unity ") else "Other")
+        if p.startswith("Unity "):
+            groups.setdefault(grp, []).append(_bn(p, f"×{n}"))
+        else:
+            groups.setdefault(grp, []).append(_bn_file(os.path.basename(p), f"×{n}", os.path.join(root, p) if root else p))
+    out = []
+    order = [n for n, _ in _UNITY_REF_GROUPS] + ["Other", "Built-in"]
+    for name in order:
+        if name in groups:
+            items = sorted(groups[name], key=lambda x: x[0].lower())
+            out.append(_bn(name, f"{len(items):,}", _bn_capped(items, 500)))
+    if missing:
+        out.append(_bn("Unresolved (missing or in an unindexed package)", f"{len(missing):,}", _bn_capped(missing, 300)))
+    total = sum(len(v) for v in groups.values()) + len(missing)
+    _, nmiss = _refs_summary(out)
+    nmiss += len(missing)
+    return _bn("References", f"{total:,} assets" + (f" · {nmiss} missing" if nmiss else ""), out)
+
+
+def _breakdown_unitypackage(path: str) -> dict:
+    import tarfile
+    names: Dict[str, str] = {}
+    sizes: Dict[str, int] = {}
+    with tarfile.open(path, "r:gz") as tf:
+        for m in tf:
+            parts = m.name.lstrip("./").split("/")
+            if len(parts) != 2:
+                continue
+            g, leaf = parts
+            if leaf == "pathname":
+                f = tf.extractfile(m)
+                if f:
+                    names[g] = f.read(4096).decode("utf-8", "replace").splitlines()[0].strip()
+            elif leaf == "asset":
+                sizes[g] = m.size
+    tree_d: dict = {}
+    for g, p in names.items():
+        node = tree_d
+        parts = p.split("/")
+        for part in parts[:-1]:
+            node = node.setdefault(part + "/", {})
+        node[parts[-1]] = sizes.get(g, -1)
+
+    def build(d):
+        out = []
+        for k in sorted(d, key=lambda k: (not k.endswith("/"), k.lower())):
+            v = d[k]
+            if isinstance(v, dict):
+                out.append(_bn(k.rstrip("/"), "folder", build(v)))
+            else:
+                out.append(_bn(k, fmt_size(v) if v >= 0 else "folder"))
+        return out
+    total = sum(s for s in sizes.values())
+    return {"kind": "Unity package", "info": [("Assets", f"{len(sizes):,}"), ("Unpacked size", fmt_size(total))],
+            "tree": [_bn("Contents", f"{len(names):,} entries", build(tree_d))], "notes": []}
+
+
+# --------------------------------------------------------------------------- Maya (.ma ASCII and .mb binary)
+# Node types whose attributes hold file paths: (attribute short names, label for the References section).
+_MAYA_PATH_ATTRS = {
+    "file": ((".ftn", ".fileTextureName"), "Textures"),
+    "psdFileTex": ((".ftn", ".fileTextureName"), "Textures"),
+    "aiImage": ((".filename", ".fn"), "Textures"),
+    "PxrTexture": ((".filename",), "Textures"), "PxrMultiTexture": ((".filename0", ".filename"), "Textures"),
+    "PxrNormalMap": ((".filename",), "Textures"), "PxrBump": ((".filename",), "Textures"),
+    "PxrPtexture": ((".filename",), "Textures"), "PxrDomeLight": ((".lightColorMap",), "Textures"),
+    "RedshiftNormalMap": ((".tex0",), "Textures"), "RedshiftDomeLight": ((".tex0",), "Textures"),
+    "VRayBitmap": ((".fn", ".file"), "Textures"),
+    "imagePlane": ((".imn", ".imageName"), "Image planes"),
+    "aiStandIn": ((".dso",), "Arnold stand-ins"), "aiVolume": ((".filename", ".fn"), "Volumes / caches"),
+    "RedshiftVolumeShape": ((".fileName",), "Volumes / caches"), "RedshiftProxyMesh": ((".fileName",), "Arnold stand-ins"),
+    "AlembicNode": ((".fn", ".abc_File"), "Alembic caches"),
+    "gpuCache": ((".cfn", ".cacheFileName"), "GPU caches"),
+    "mayaUsdProxyShape": ((".fp", ".filePath"), "USD"), "pxrUsdProxyShape": ((".fp", ".filePath"), "USD"),
+    "pxrUsdReferenceAssembly": ((".fp", ".filePath"), "USD"),
+    "audio": ((".f", ".filename"), "Audio"),
+    "cacheFile": ((".cp", ".cachePath"), "Volumes / caches"),
+    "VRayMesh": ((".fn", ".fileName"), "Arnold stand-ins"), "VRayVolumeGrid": ((".if", ".inFile"), "Volumes / caches"),
+    "xgmPalette": ((".xfn", ".xgFileName"), "XGen"), "xgmSplineDescription": ((".cacheFileName",), "XGen"),
+    "bifrostGraphShape": ((".cacheFileName",), "Volumes / caches"),
+    "RenderManArchive": ((".filename",), "Arnold stand-ins"),
+}
+_MAYA_PATH_EXTS = (".exr", ".tx", ".tex", ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".tga", ".hdr", ".psd", ".bmp",
+                   ".abc", ".vdb", ".usd", ".usda", ".usdc", ".usdz", ".ass", ".ass.gz", ".bgeo", ".bgeo.sc",
+                   ".ma", ".mb", ".fbx", ".obj", ".rs", ".vrmesh", ".rib", ".wav", ".aif", ".aiff", ".mov", ".mp4",
+                   ".mcx", ".mcc", ".xml", ".ptx", ".ies", ".ocio", ".lut", ".cube", ".xgen", ".ptex")
+_MAYA_LIGHTS = ("directionalLight", "pointLight", "spotLight", "areaLight", "ambientLight", "volumeLight",
+                "aiAreaLight", "aiSkyDomeLight", "aiMeshLight", "aiPhotometricLight", "aiLightPortal",
+                "PxrRectLight", "PxrDomeLight", "PxrDiskLight", "PxrDistantLight", "PxrSphereLight", "PxrCylinderLight",
+                "PxrMeshLight", "PxrEnvDayLight", "RedshiftPhysicalLight", "RedshiftDomeLight", "RedshiftIESLight",
+                "RedshiftPortalLight", "RedshiftSunLight", "VRayLightRectShape", "VRayLightDomeShape", "VRayLightSphereShape")
+_MAYA_MATERIAL_HINTS = ("lambert", "blinn", "phong", "phongE", "anisotropic", "surfaceShader", "standardSurface",
+                        "openPBRSurface", "aiStandardSurface", "aiStandardHair", "aiFlat", "aiToon", "aiLambert",
+                        "aiShadowMatte", "aiMixShader", "aiCarPaint", "aiStandardVolume", "PxrSurface", "PxrDisney",
+                        "PxrDisneyBsdf", "PxrLayerSurface", "PxrMarschnerHair", "PxrVolume", "PxrConstant",
+                        "RedshiftMaterial", "RedshiftStandardMaterial", "RedshiftSprite", "VRayMtl", "usdPreviewSurface",
+                        "StingrayPBS", "rampShader", "layeredShader", "useBackground", "hairPhysicalShader")
+_MAYA_DEFAULT_CAMS = {"persp", "top", "front", "side", "bottom", "back", "left"}
+# 4-character node type tags of Maya binary files (built-in types; plugin nodes use numeric ids)
+_MAYA_TYPE_TAGS = {"XFRM": "transform", "DMSH": "mesh", "DCAM": "camera", "SPTL": "spotLight", "RLLK": "lightLinker",
+                   "DPLM": "displayLayerManager", "DSPL": "displayLayer", "RNLM": "renderLayerManager",
+                   "RNDL": "renderLayer", "PCUB": "polyCube", "RBLN": "blinn", "SHAD": "shadingEngine",
+                   "DMTI": "materialInfo", "SCRP": "script", "JONT": "joint", "RLAM": "lambert", "RPHO": "phong",
+                   "DIRL": "directionalLight", "PNTL": "pointLight", "ARLT": "areaLight", "AMBL": "ambientLight",
+                   "RTFT": "file", "PL2T": "place2dTexture", "GRPI": "groupId", "GRPP": "groupParts",
+                   "NCRV": "nurbsCurve", "NSRF": "nurbsSurface", "LCTR": "locator", "REFN": "reference",
+                   "OBJS": "objectSet", "SKCL": "skinCluster", "BLND": "blendShape", "TWEK": "tweak",
+                   "DGPS": "dagPose", "ANCL": "animCurveTL", "ANCA": "animCurveTA", "ANCU": "animCurveTU",
+                   "PSPH": "polySphere", "PPLN": "polyPlane", "PCYL": "polyCylinder", "IPLN": "imagePlane",
+                   "AUDI": "audio", "CNST": "constraint", "PACN": "parentConstraint", "UNIT": "unitConversion",
+                   "SHDE": "shadingEngine", "BPCE": "bump2d", "RMPT": "ramp", "CNOS": "nodeGraphEditorInfo",
+                   "JOIN": "joint", "GPID": "groupId", "OBST": "objectSet"}
+
+
+def _maya_workspace(path: str) -> Optional[str]:
+    d = os.path.dirname(os.path.abspath(path))
+    for _ in range(12):
+        if os.path.exists(os.path.join(d, "workspace.mel")):
+            return d
+        nd = os.path.dirname(d)
+        if nd == d:
+            break
+        d = nd
+    return None
+
+
+def resolve_scene_path(p: str, scene: str, roots=()) -> Tuple[str, Optional[bool]]:
+    """A path written in a scene → (absolute path, exists?). Expands ~ and $VARS, tries the scene's folder,
+    the project/workspace roots and Windows drive letters as given; UDIM / frame tokens
+    (<UDIM>, <UVTILE>, %04d, ####, $F4, <f>) are checked with a glob."""
+    raw = p.strip().strip('"')
+    if not raw:
+        return raw, None
+    q = os.path.expanduser(os.path.expandvars(raw.replace("\\", "/")))
+    cands = [q] if os.path.isabs(q) else [os.path.join(r, q) for r in (os.path.dirname(scene),) + tuple(roots) if r]
+    if re.match(r"^[A-Za-z]:/", q):
+        cands = [q]                                            # a Windows path: can't exist here, report it as is
+    tok = re.compile(r"<UDIM>|<udim>|<UVTILE>|<uvtile>|<f\d?>|%0?\d*d|#+|\$F\d?|<frame>|_MAPID_|\*", re.I)
+    for c in cands:
+        if tok.search(c):
+            pat = tok.sub("*", c)
+            try:
+                if glob.glob(pat):
+                    return c, True
+            except Exception:
+                pass
+        elif os.path.exists(c):
+            return c, True
+    # Written on another machine or OS (C:/proj/..., /mnt/other/...): look for the same file name next to the
+    # scene and in the project's usual folders before calling it missing.
+    base = os.path.basename(q)
+    if base and not tok.search(base):
+        for r in (os.path.dirname(scene),) + tuple(roots):
+            for sub in ("", "scenes", "sourceimages", "images", "textures", "tex", "cache", "data", "assets", "renderData/images"):
+                c = os.path.join(r, sub, base)
+                if r and os.path.exists(c):
+                    return c, True
+    unknown = re.match(r"^[A-Za-z]:/", q) or re.search(r"<(MAYA_RESOURCES|[A-Z_]+_ROOT)>|\$\{?[A-Z_]+", q)
+    return (cands[0] if cands else q), (None if unknown else False)
+
+
+def _ref_nodes(found: Dict[str, Dict[str, list]], scene: str, roots=()) -> Tuple[list, int, int]:
+    """{group: {path: [owner names]}} → reference tree, files, missing."""
+    out, total, miss = [], 0, 0
+    for grp in sorted(found, key=lambda g: (g != "Scene references", g)):
+        items = []
+        for raw, owners in sorted(found[grp].items(), key=lambda kv: kv[0].lower()):
+            full, ok = resolve_scene_path(raw, scene, roots)
+            total += 1
+            miss += ok is False
+            owner = ", ".join(sorted(set(owners))[:3]) + (f" +{len(set(owners)) - 3}" if len(set(owners)) > 3 else "")
+            node = _bn(os.path.basename(raw.replace("\\", "/")) or raw, owner, None, full, ok)
+            if full != raw and not os.path.isabs(raw):
+                node[1] = (owner + " · " if owner else "") + f"as written: {raw}"
+            items.append(node)
+        out.append(_bn(grp, f"{len(items):,}" + (f" · {sum(1 for i in items if i[4] is False)} missing" if any(i[4] is False for i in items) else ""),
+                       _bn_capped(items, 800)))
+    return out, total, miss
+
+
+class _MayaScene:
+    def __init__(self):
+        self.nodes: list = []                  # (type, name, parent)
+        self.info: Dict[str, str] = {}
+        self.requires: Dict[str, str] = {}
+        self.units: Dict[str, str] = {}
+        self.refs: list = []                   # (path, namespace, refnode, deferred)
+        self.found: Dict[str, Dict[str, list]] = {}
+        self.render: Dict[str, str] = {}
+        self.version = ""
+        self.attrs: Dict[str, Dict[str, str]] = {}   # shader nodes: attribute → value text
+        self.conns: list = []                         # (src "node.attr", dst "node.attr")
+        self.types: Dict[str, str] = {}
+
+    def add_path(self, group: str, path: str, owner: str):
+        if path and len(path) < 4096:
+            self.found.setdefault(group, {}).setdefault(path, []).append(owner)
+
+
+_RE_MEL_STR = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+
+def _mel_flags(stmt: str) -> Tuple[Dict[str, str], list]:
+    """Split a MEL command into -flag values and positional (quoted) arguments."""
+    toks = re.findall(r'"(?:[^"\\]|\\.)*"|\S+', stmt)
+    flags, pos = {}, []
+    i = 1
+    while i < len(toks):
+        t = toks[i]
+        if t.startswith("-") and not t[1:2].isdigit():
+            if i + 1 < len(toks) and not toks[i + 1].startswith("-"):
+                flags[t] = toks[i + 1].strip('"')
+                i += 2
+                continue
+            flags[t] = ""
+        else:
+            pos.append(t.strip('"'))
+        i += 1
+    return flags, pos
+
+
+def _parse_maya_ascii(path: str) -> _MayaScene:
+    sc = _MayaScene()
+    cur_type = cur_name = ""
+    selected = ""
+    stmt = ""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        first = f.readline()
+        m = re.match(r"//Maya ASCII (\S+) scene", first)
+        sc.version = m.group(1) if m else ""
+        for line in f:
+            if stmt:
+                stmt += " " + line.strip()
+                if not stmt.rstrip().endswith(";"):
+                    continue
+            else:
+                c0 = line[:1]
+                if c0 == "\t":
+                    s = line.lstrip()
+                    if not s.startswith("setAttr") or ('-type "string"' not in s and cur_type not in _MAYA_SHADER_TYPES):
+                        continue
+                elif c0 not in ("c", "f", "r", "s", "p"):
+                    continue
+                stmt = line.strip()
+                if not stmt.endswith(";"):
+                    continue
+            s, stmt = stmt.rstrip().rstrip(";").rstrip(), ""
+            if s.startswith("createNode "):
+                fl, pos = _mel_flags(s)
+                cur_type = pos[0] if pos else "?"
+                cur_name = fl.get("-n", "")
+                selected = ""
+                sc.nodes.append((cur_type, cur_name, fl.get("-p", "")))
+                sc.types[cur_name] = cur_type
+            elif s.startswith("connectAttr "):
+                strs = _RE_MEL_STR.findall(s)
+                if len(strs) >= 2:
+                    sc.conns.append((strs[0], strs[1]))
+            elif s.startswith("setAttr ") and cur_type in _MAYA_SHADER_TYPES and not selected:
+                mm = re.match(r'setAttr\s+(?:-\w+\s+\S+\s+)*"(\.[^"]+)"\s*(?:-type\s+"\w+"\s*)?(.*)$', s)
+                if mm:
+                    sc.attrs.setdefault(cur_name, {})[mm.group(1)] = mm.group(2).strip()
+                strs = _RE_MEL_STR.findall(s)
+                if len(strs) >= 3 and _MAYA_PATH_ATTRS.get(cur_type) and strs[0] in _MAYA_PATH_ATTRS[cur_type][0]:
+                    sc.add_path(_MAYA_PATH_ATTRS[cur_type][1], strs[-1], cur_name)
+            elif s.startswith("setAttr "):
+                strs = _RE_MEL_STR.findall(s)
+                if len(strs) < 3:
+                    continue
+                attr, value = strs[0], strs[-1].replace('\\"', '"')
+                owner_t = selected or cur_type
+                owner = selected or cur_name
+                if owner_t == "defaultRenderGlobals" and attr in (".ren", ".currentRenderer"):
+                    sc.render["Renderer"] = value
+                elif owner_t == "sceneConfigurationScriptNode" or (cur_name == "sceneConfigurationScriptNode" and attr == ".b"):
+                    pm = re.search(r"playbackOptions\s+-min\s+(\S+)\s+-max\s+(\S+)", value)
+                    if pm:
+                        sc.render["Playback range"] = f"{pm.group(1)} – {pm.group(2)}"
+                    continue
+                spec = _MAYA_PATH_ATTRS.get(owner_t)
+                if spec and attr in spec[0]:
+                    sc.add_path(spec[1], value, owner)
+                elif owner_t not in ("camera", "script") and ("/" in value or "\\" in value):
+                    low = value.lower()
+                    if low.endswith(_MAYA_PATH_EXTS) and "\n" not in value and len(value) < 1024:
+                        sc.add_path("Other files", value, f"{owner}{attr}")
+            elif s.startswith("file "):
+                fl, pos = _mel_flags(s)
+                if ("-r" in fl or "-rdi" in fl) and pos:
+                    sc.refs.append((pos[-1], fl.get("-ns", ""), fl.get("-rfn", ""), fl.get("-dr", "") == "1",
+                                    fl.get("-rdi", "") if "-rdi" in fl else "", fl.get("-typ", "")))
+            elif s.startswith("requires "):
+                strs = _RE_MEL_STR.findall(s)
+                if s.startswith("requires maya"):
+                    sc.version = sc.version or (strs[0] if strs else "")
+                elif len(strs) >= 2:
+                    sc.requires[strs[0]] = strs[1]
+            elif s.startswith("fileInfo "):
+                strs = _RE_MEL_STR.findall(s)
+                if len(strs) >= 2:
+                    sc.info[strs[0]] = strs[1]
+            elif s.startswith("currentUnit "):
+                fl, _ = _mel_flags(s)
+                sc.units = {"Linear": fl.get("-l", ""), "Angular": fl.get("-a", ""), "Time": fl.get("-t", "")}
+            elif s.startswith("select "):
+                fl, pos = _mel_flags(s)
+                if pos:
+                    selected = pos[0].lstrip(":")
+                    cur_type = ""
+                    cur_name = selected
+    return sc
+
+
+def _iff_chunks(d: bytes, p: int, end: int, w: int):
+    """Yield (depth-first) ('group', form, start, end) and ('chunk', tag, data) for Maya IFF."""
+    hdr = 8 if w == 4 else 16
+    stack = [(p, end)]
+    while stack:
+        p, end = stack.pop()
+        while p + hdr <= end:
+            tag = d[p:p + 4]
+            size = struct.unpack_from(">I", d, p + 4)[0] if w == 4 else struct.unpack_from(">Q", d, p + 8)[0]
+            data = p + hdr
+            if size > len(d) - data:
+                return
+            if tag[:3] in (b"FOR", b"LIS", b"CAT"):
+                yield ("group", d[data:data + 4], data + 4, data + size)
+                stack.append((data + size + ((-size) % 4 if w == 4 else 0), end))
+                p, end = data + 4, data + size
+                continue
+            yield ("chunk", tag, d[data:data + size])
+            p = data + size + ((-size) % w)
+
+
+def _parse_maya_binary(path: str) -> _MayaScene:
+    with open(path, "rb") as f:
+        d = f.read()
+    w = 8 if d[:4] == b"FOR8" else 4
+    sc = _MayaScene()
+    cur_type = cur_name = ""
+    selected = ""
+    known: set = set()
+    for kind, tag, *rest in _iff_chunks(d, 0, len(d), w):
+        if kind == "group":
+            selected = ""
+            cur_type = _MAYA_TYPE_TAGS.get(tag.decode("latin-1"), "") if tag.isascii() and tag.decode("latin-1").isprintable() else ""
+            if not cur_type:
+                cur_type = tag.decode("latin-1") if all(32 < c < 127 for c in tag) else f"0x{tag.hex()}"
+            cur_name = ""
+            continue
+        data = rest[0]
+        t = tag.decode("latin-1")
+        if t == "CREA":
+            flag = data[0] if data else 0
+            parts = data[1:].split(b"\0")
+            cur_name = parts[0].decode("utf-8", "replace") if parts else ""
+            parent = ""
+            # The second string is the parent when it names a node already written (Maya writes parents
+            # first); the flag bits that say so differ between FOR4 and FOR8 files.
+            if len(parts) > 1 and parts[1] and all(32 <= c < 127 for c in parts[1]):
+                cand = parts[1].decode("ascii")
+                if cand.split("|")[-1] in known:
+                    parent = cand
+            known.add(cur_name)
+            sc.nodes.append((cur_type, cur_name, parent))
+            sc.types[cur_name] = cur_type
+        elif t == "SLCT":
+            selected = data.split(b"\0")[0].decode("latin-1").lstrip(":")
+            cur_type, cur_name = "", selected
+        elif t == "STR ":
+            nul = data.find(b"\0")
+            if nul < 0:
+                continue
+            attr = "." + data[:nul].decode("latin-1")
+            value = data[nul + 2:].split(b"\0")[0].decode("utf-8", "replace")
+            owner_t = selected or cur_type
+            owner = selected or cur_name
+            if owner_t == "defaultRenderGlobals" and attr in (".ren", ".currentRenderer"):
+                sc.render["Renderer"] = value
+            elif cur_name == "sceneConfigurationScriptNode" and attr == ".b":
+                pm = re.search(r"playbackOptions\s+-min\s+(\S+)\s+-max\s+(\S+)", value)
+                if pm:
+                    sc.render["Playback range"] = f"{pm.group(1)} – {pm.group(2)}"
+            else:
+                spec = _MAYA_PATH_ATTRS.get(owner_t)
+                if spec and attr in spec[0]:
+                    sc.add_path(spec[1], value, owner)
+                elif owner_t not in ("camera", "script") and ("/" in value or "\\" in value) \
+                        and value.lower().endswith(_MAYA_PATH_EXTS) and len(value) < 1024:
+                    sc.add_path("Other files", value, f"{owner}{attr}")
+        elif t in ("FLT3", "DBL3", "DBLE", "FLT2", "FLTE", "DBL2") and cur_name and not selected:
+            nul = data.find(b"\0")
+            if 0 < nul < 64:
+                attr = "." + data[:nul].decode("latin-1")
+                body = data[nul + 2:]
+                fmt = ">" + ("f" if t.startswith("FLT") else "d")
+                n = len(body) // (4 if t.startswith("FLT") else 8)
+                if 0 < n <= 4:
+                    vals = struct.unpack(fmt + fmt[1] * (n - 1), body[:n * (4 if t.startswith("FLT") else 8)])
+                    sc.attrs.setdefault(cur_name, {})[attr] = " ".join(f"{v:g}" for v in vals)
+        elif t == "CWFL":
+            parts = data[1:].split(b"\0")
+            if len(parts) >= 2:
+                sc.conns.append((parts[0].decode("latin-1"), parts[1].decode("latin-1")))
+        elif t == "FINF":
+            parts = data.split(b"\0")
+            if len(parts) >= 2:
+                sc.info[parts[0].decode("latin-1")] = parts[1].decode("utf-8", "replace")
+        elif t == "PLUG":
+            parts = data.split(b"\0")
+            if len(parts) >= 2 and parts[0]:
+                sc.requires[parts[0].decode("latin-1")] = parts[1].decode("latin-1")
+        elif t == "VERS" and not sc.version:
+            sc.version = data.decode("latin-1").strip("\0")
+        elif t in ("LUNI", "AUNI", "TUNI"):
+            sc.units[{"LUNI": "Linear", "AUNI": "Angular", "TUNI": "Time"}[t]] = data.decode("latin-1").strip("\0")
+        elif t in ("FREF", "RREF", "FRDI"):
+            strs = [x.decode("utf-8", "replace") for x in data.split(b"\0") if x]
+            pth = next((x for x in strs if re.search(r"\.(ma|mb|abc|usd[ac]?|fbx)$", x, re.I) or "/" in x), "")
+            ns = next((x for x in strs if x != pth and not x.endswith("RN") and "/" not in x and len(x) < 128), "")
+            rfn = next((x for x in strs if x.endswith("RN")), "")
+            if pth:
+                sc.refs.append((pth, ns, rfn, False, "", ""))
+    return sc
+
+
+_MAYA_SHADER_TYPES = set(_MAYA_MATERIAL_HINTS) | {"PxrSurface", "PxrDisneyBsdf", "RedshiftMaterial", "RedshiftStandardMaterial",
+                                                 "VRayMtl", "usdPreviewSurface", "pxrUsdPreviewSurface", "standardSurface",
+                                                 "openPBRSurface"}
+_MAYA_ALIASES = {
+    "base_color": (".bc", ".baseColor", ".base_color", ".c", ".color", ".dc", ".diffuseColor", ".diffuse_color"),
+    "base_weight": (".b", ".base", ".baseWeight", ".base_weight", ".diffuseGain"),
+    "metallic": (".m", ".metalness", ".metallic", ".baseMetalness", ".base_metalness", ".refl_metalness", ".mtl"),
+    "roughness": (".sr", ".specularRoughness", ".specular_roughness", ".roughness", ".refl_roughness", ".rgh"),
+    "specular": (".s", ".specular"),
+    "coat": (".coat", ".coatWeight", ".coat_weight", ".clearcoat", ".cc"),
+    "coat_roughness": (".coatRoughness", ".coat_roughness", ".clearcoatRoughness", ".ccr"),
+    "_em_w": (".e", ".emission", ".emissionWeight", ".emission_weight"),
+    "_em_c": (".ec", ".emissionColor", ".emission_color", ".emissiveColor", ".ic", ".incandescence", ".glowColor", ".emitColor"),
+    "_opacity3": (".o", ".opacity", ".opc"),
+    "_transparency": (".it", ".transparency"),
+    "transmission": (".t", ".transmission", ".transmissionWeight", ".transmission_weight"),
+    "normal": (".n", ".normalCamera", ".geometryNormal", ".normal"),
+    "_gloss": (".reflectionGlossiness",),
+    "_cosine_power": (".cp", ".cosinePower"),
+    "_eccentricity": (".eccentricity",),
+}
+_MAYA_DEFAULTS = {"lambert": {"base_color": (0.5, 0.5, 0.5), "roughness": 0.9, "specular": 0.0},
+                  "blinn": {"base_color": (0.5, 0.5, 0.5), "roughness": 0.35},
+                  "phong": {"base_color": (0.5, 0.5, 0.5), "roughness": 0.3},
+                  "standardSurface": {"base_color": (0.8, 0.8, 0.8), "roughness": 0.2},
+                  "aiStandardSurface": {"base_color": (0.8, 0.8, 0.8), "roughness": 0.2},
+                  "openPBRSurface": {"base_color": (0.8, 0.8, 0.8), "roughness": 0.3},
+                  "usdPreviewSurface": {"base_color": (0.18, 0.18, 0.18), "roughness": 0.5},
+                  "pxrUsdPreviewSurface": {"base_color": (0.18, 0.18, 0.18), "roughness": 0.5}}
+
+
+def maya_materials(sc: "_MayaScene", path: str, roots=()) -> list:
+    """Shader nodes → material dicts: values from setAttr, textures from file nodes connected upstream."""
+    src_of: Dict[str, list] = {}                                  # dst node → [(dst attr, src node)]
+    for src, dst in sc.conns:
+        sn, _, sa = src.partition(".")
+        dn, _, da = dst.partition(".")
+        src_of.setdefault(dn.lstrip(":"), []).append(("." + da, sn.lstrip(":")))
+    files: Dict[str, str] = {}
+    for grp, paths in sc.found.items():
+        for p, owners in paths.items():
+            for o in owners:
+                files.setdefault(o, p)
+    shaders = [n for t, n, p in sc.nodes if t in _MAYA_SHADER_TYPES and n not in ("lambert1", "standardSurface1", "particleCloud1", "shaderGlow1")]
+    # binary files: plug-in shader types are numeric — anything feeding a shading engine is a material
+    for src, dst in sc.conns:
+        sn, _, sa = src.partition(".")
+        dn, _, da = dst.partition(".")
+        if da in ("ss", "surfaceShader") and sc.types.get(dn, "") in ("shadingEngine", "SHAD", "") and sn not in shaders:
+            shaders.append(sn)
+
+    def upstream_files(node, depth=0, seen=None):
+        seen = set() if seen is None else seen
+        if depth > 8 or node in seen:
+            return []
+        seen.add(node)
+        out = [files[node]] if node in files else []
+        for _a, s in src_of.get(node, []):
+            out += upstream_files(s, depth + 1, seen)
+        return out
+    want = {"normal": r"norm|nrm|_n\.|bump", "roughness": r"rough|gloss", "metallic": r"metal",
+            "base_color": r"col|albedo|diff|base", "_em_c": r"emis|emit|incan|glow", "_opacity3": r"opac|alpha|mask"}
+    out = []
+    for name in shaders:
+        typ = sc.types.get(name, "?")
+        a = sc.attrs.get(name, {})
+        fam = "lambert" if typ in ("lambert", "surfaceShader", "useBackground", "rampShader", "layeredShader") else \
+            "blinn" if typ in ("blinn", "anisotropic") else "phong" if typ.startswith("phong") else typ
+        m = dict(_MAYA_DEFAULTS.get(fam, {"base_color": (0.8, 0.8, 0.8), "roughness": 0.4}))
+        m["name"] = name
+        rows = []
+        em_w, em_c = None, None
+        conn = {da: s for da, s in src_of.get(name, [])}
+        for key, aliases in _MAYA_ALIASES.items():
+            if fam == "blinn" and key == "_em_c":
+                aliases = (".ic", ".incandescence")
+            if fam == "blinn" and key == "_eccentricity":
+                aliases = (".ec", ".eccentricity")
+            hit = next((al for al in aliases if al in conn), None)
+            if hit:
+                fs = upstream_files(conn[hit])
+                pat = want.get(key)
+                pick = next((f for f in fs if pat and re.search(pat, os.path.basename(f).lower())), fs[0] if fs and key != "normal" else None)
+                full, ok = resolve_scene_path(pick, path, roots) if pick else ("", None)
+                rows.append(_bn(hit.lstrip("."), f"← {conn[hit]}", None, full, ok))
+                tk = {"base_color": "base_color_tex", "metallic": "metallic_tex", "roughness": "roughness_tex",
+                      "normal": "normal_tex", "_em_c": "emission_tex", "_opacity3": "opacity_tex"}.get(key)
+                if pick and tk:
+                    m[tk] = full
+                    if key == "base_color":
+                        m["base_color"] = (1.0, 1.0, 1.0)
+                continue
+            hit = next((al for al in aliases if al in a), None)
+            if not hit:
+                continue
+            raw = a[hit]
+            vals = _floats(raw)
+            if not vals:
+                continue
+            rows.append(_bn(hit.lstrip("."), " ".join(f"{v:.3g}" for v in vals[:4])))
+            if key in ("base_color",):
+                m[key] = _col3(vals) or m.get(key)
+            elif key == "_em_c":
+                em_c = _col3(vals)
+            elif key == "_em_w":
+                em_w = vals[0]
+            elif key == "_opacity3":
+                m["opacity"] = sum(vals[:3]) / max(1, len(vals[:3]))
+            elif key == "_transparency":
+                m["opacity"] = 1 - sum(vals[:3]) / max(1, len(vals[:3]))
+            elif key == "_gloss":
+                m["roughness"] = 1 - vals[0]
+            elif key == "_cosine_power":
+                m["roughness"] = math.sqrt(2.0 / (vals[0] + 2.0))
+            elif key == "_eccentricity":
+                m["roughness"] = min(1.0, vals[0] * 1.2)
+            elif key != "normal":
+                m[key] = vals[0]
+        if em_c and any(em_c):
+            w = 1.0 if em_w is None else em_w
+            if fam in ("standardSurface", "aiStandardSurface") and em_w is None:
+                w = 0.0                                          # emission weight defaults to 0 there
+            if w > 0:
+                m["emission"] = tuple(c * w for c in em_c)
+        m["_type"] = typ
+        m["_rows"] = rows
+        out.append(m)
+    return out
+
+
+def breakdown_maya(path: str) -> dict:
+    with open(path, "rb") as f:
+        head = f.read(16)
+    if head[:4] in (b"FOR4", b"FOR8"):
+        sc = _parse_maya_binary(path)
+        kind = "Maya binary scene"
+    else:
+        sc = _parse_maya_ascii(path)
+        kind = "Maya ASCII scene"
+    ws = _maya_workspace(path)
+    roots = tuple(r for r in (ws, os.environ.get("MAYA_PROJECT", "")) if r)
+    info = [("Maya", sc.info.get("product") or (f"Maya {sc.version}" if sc.version else "unknown"))]
+    if sc.info.get("cutIdentifier"):
+        info.append(("Build", sc.info["cutIdentifier"]))
+    if sc.units:
+        info.append(("Units", " · ".join(v for v in (sc.units.get("Linear"), sc.units.get("Angular"), sc.units.get("Time")) if v)))
+    for k, v in sc.render.items():
+        info.append((k, v))
+    if ws:
+        info.append(("Project", ws))
+    types: Dict[str, int] = {}
+    for t, n, p in sc.nodes:
+        types[t] = types.get(t, 0) + 1
+    # outliner: DAG nodes (anything with a parent, plus transforms / joints at the root)
+    by_name: Dict[str, dict] = {}
+    roots_l: list = []
+    shapes: Dict[str, list] = {}
+    dag_types = {"transform", "joint", "ikHandle", "locator", "lodGroup", "place3dTexture", "assemblyReference",
+                 "aiStandIn", "gpuCache", "mayaUsdProxyShape", "camera"}
+    for t, n, p in sc.nodes:
+        if not n:
+            continue
+        short = n.split("|")[-1]
+        is_xform = t in ("transform", "joint", "lodGroup", "ikHandle", "dagContainer", "aimConstraint",
+                         "parentConstraint", "pointConstraint", "orientConstraint", "scaleConstraint")
+        if p and not is_xform:
+            shapes.setdefault(p.split("|")[-1], []).append(t)
+            continue
+        if not is_xform and not p:
+            continue
+        rec = {"name": short, "type": t, "kids": []}
+        if p and p.split("|")[-1] in by_name:
+            by_name[p.split("|")[-1]]["kids"].append(rec)
+        else:
+            roots_l.append(rec)
+        by_name[short] = rec
+    n_out = [0]
+
+    def build(rec):
+        n_out[0] += 1
+        sh = shapes.get(rec["name"], [])
+        detail = ", ".join(sorted(set(sh))) if sh else ("" if rec["type"] == "transform" else rec["type"])
+        kids = [build(k) for k in rec["kids"]] if n_out[0] < 6000 else [_bn("…", "")]
+        return _bn(rec["name"], detail, kids)
+    outl = [build(r) for r in roots_l if r["name"] not in _MAYA_DEFAULT_CAMS]
+    cams = sum(1 for t, n, p in sc.nodes if t == "camera" and n.replace("Shape", "") not in _MAYA_DEFAULT_CAMS)
+    lights = sum(1 for t, n, p in sc.nodes if t in _MAYA_LIGHTS)
+    meshes = types.get("mesh", 0)
+    info.append(("Contents", f"{meshes:,} meshes · {lights} lights · {cams} cameras · {len(sc.refs and {r[0] for r in sc.refs}):,} references"))
+    tree = [_bn("Outliner", f"{len(outl):,} top-level", outl)]
+    # references (scene files) first
+    found = dict(sc.found)
+    seen = set()
+    refs_tree = []
+    for pth, ns, rfn, deferred, rdi, typ in sc.refs:
+        key = (pth, ns)
+        if key in seen:
+            continue
+        seen.add(key)
+        full, ok = resolve_scene_path(pth, path, roots)
+        det = ("unloaded · " if deferred else "") + (rfn or "")
+        if ok and os.path.normpath(full) != os.path.normpath(os.path.expanduser(pth)):
+            det += f" · found here; written as {pth}"
+        refs_tree.append(_bn(ns or os.path.basename(pth), det, None, full, ok))
+    other, nfiles, nmiss = _ref_nodes(found, path, roots)
+    nmiss += sum(1 for r in refs_tree if r[4] is False)
+    ref_children = ([_bn("Scene references", f"{len(refs_tree)}", refs_tree)] if refs_tree else []) + other
+    tree.append(_bn("References", f"{nfiles + len(refs_tree):,} files" + (f" · {nmiss} missing" if nmiss else ""), ref_children))
+    if nmiss:
+        info.append(("Missing files", f"{nmiss:,}"))
+    try:
+        materials = sorted(maya_materials(sc, path, roots), key=lambda m: m["name"].lower())
+    except Exception:
+        materials = []
+    if materials:
+        mnodes = []
+        for i, m in enumerate(materials):
+            rows = m.pop("_rows", [])
+            mnodes.append(_bn(m["name"], m.pop("_type", ""), rows, f"material:{i}", None))
+        tree.append(_bn("Materials", f"{len(materials):,}", _bn_capped(mnodes, 400)))
+    lt = [(n, t) for t, n, p in sc.nodes if t in _MAYA_LIGHTS]
+    if lt or cams:
+        tree.append(_bn("Lights & cameras", f"{len(lt)} lights · {cams} cameras",
+                        [_bn(n, t) for n, t in lt] + [_bn(n, "camera") for t, n, p in sc.nodes if t == "camera" and n.replace("Shape", "") not in _MAYA_DEFAULT_CAMS]))
+    anim = sum(c for t, c in types.items() if t.startswith("animCurve"))
+    layers = [n for t, n, p in sc.nodes if t in ("renderLayer", "renderSetupLayer") and n != "defaultRenderLayer"]
+    misc = []
+    if anim:
+        misc.append(_bn("Animation curves", f"{anim:,}"))
+    if layers:
+        misc.append(_bn("Render layers", f"{len(layers)}", [_bn(n) for n in layers]))
+    if misc:
+        tree.append(_bn("Animation & render layers", "", misc))
+    if sc.requires:
+        tree.append(_bn("Plug-ins required", f"{len(sc.requires)}", [_bn(k, v) for k, v in sorted(sc.requires.items(), key=lambda kv: kv[0].lower())]))
+    tree.append(_bn("Node types", f"{len(sc.nodes):,} nodes", _bn_counts(types)))
+    if sc.info:
+        tree.append(_bn("File info", "", [_bn(k, v.replace("\\n", " ").strip()) for k, v in sc.info.items()]))
+    return {"kind": kind, "info": info, "tree": tree, "notes": [], "materials": materials}
+
+
+# --------------------------------------------------------------------------- Blender (.blend)
+# The file is a list of blocks (old memory address + struct type) and ends with "DNA1", the schema of every
+# struct in that Blender version, so field offsets are looked up by name rather than hard-coded: files from
+# 2.7x to 5.x read with the same code. gzip (old) and zstd (3.0+) compressed files are supported.
+_BLEND_ID_CODES = {"OB": "Objects", "ME": "Meshes", "MA": "Materials", "TE": "Textures", "IM": "Images",
+                   "LA": "Lights", "CA": "Cameras", "WO": "Worlds", "SC": "Scenes", "GR": "Collections",
+                   "AC": "Actions", "NT": "Node groups", "LI": "Libraries", "AR": "Armatures", "CU": "Curves",
+                   "CV": "Curves (hair)", "PT": "Point clouds", "VO": "Volumes", "MB": "Metaballs", "LT": "Lattices",
+                   "SO": "Sounds", "MC": "Movie clips", "VF": "Fonts", "TX": "Texts", "CF": "Cache files",
+                   "PA": "Particle settings", "BR": "Brushes", "GD": "Grease pencil (legacy)", "GP": "Grease pencil",
+                   "LP": "Light probes", "SP": "Speakers", "KE": "Shape keys", "WS": "Workspaces", "LS": "Line styles",
+                   "PL": "Palettes", "PC": "Paint curves", "MS": "Masks", "WM": "Window managers", "SN": "Screens",
+                   "SR": "Screens", "CN": "Camera tracks", "ID": "Linked placeholders"}
+_BLEND_OB_TYPES = {0: "Empty", 1: "Mesh", 2: "Curve", 3: "Surface", 4: "Text", 5: "Metaball", 10: "Light",
+                   11: "Camera", 12: "Speaker", 13: "Light probe", 22: "Lattice", 25: "Armature",
+                   26: "Grease pencil", 27: "Hair curves", 28: "Point cloud", 29: "Volume", 30: "Grease pencil"}
+_BLEND_KEEP_ID = {"OB", "SC", "GR", "LI", "IM", "ME", "CA", "LA", "MA", "SO", "MC", "VF", "CF", "VO", "WO", "TX", "NT"}
+
+
+def _blend_open(path: str):
+    """→ (file-like with .read(n)) over the decompressed .blend, plus a description of the compression."""
+    f = open(path, "rb")
+    head = f.read(4)
+    f.seek(0)
+    if head[:2] == b"\x1f\x8b":
+        import gzip
+        return gzip.GzipFile(fileobj=f), "gzip"
+    if head == b"\x28\xb5\x2f\xfd":
+        f.close()
+        return io.BytesIO(_zstd_decompress_file(path)), "zstd"
+    return f, ""
+
+
+def _zstd_decompress_file(path: str, cap: int = 4 << 30) -> bytes:
+    try:
+        import zstandard                                             # python3-zstandard, if installed
+        with open(path, "rb") as f:
+            return zstandard.ZstdDecompressor().stream_reader(f).read()
+    except ImportError:
+        pass
+    import ctypes
+    import ctypes.util
+    name = ctypes.util.find_library("zstd") or "libzstd.so.1"
+    try:
+        z = ctypes.CDLL(name)
+    except OSError:
+        z = None
+    if z is None:
+        out = subprocess.run(["zstd", "-dc", path], capture_output=True, timeout=120)
+        if out.returncode != 0:
+            raise ValueError("zstd-compressed .blend: install zstd")
+        return out.stdout
+
+    class Buf(ctypes.Structure):
+        _fields_ = [("ptr", ctypes.c_void_p), ("size", ctypes.c_size_t), ("pos", ctypes.c_size_t)]
+    z.ZSTD_createDStream.restype = ctypes.c_void_p
+    z.ZSTD_decompressStream.restype = ctypes.c_size_t
+    z.ZSTD_decompressStream.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf), ctypes.POINTER(Buf)]
+    z.ZSTD_isError.argtypes = [ctypes.c_size_t]
+    z.ZSTD_freeDStream.argtypes = [ctypes.c_void_p]
+    ds = z.ZSTD_createDStream()
+    z.ZSTD_initDStream(ctypes.c_void_p(ds))
+    with open(path, "rb") as f:
+        src = f.read()
+    sbuf = ctypes.create_string_buffer(src, len(src))
+    inb = Buf(ctypes.cast(sbuf, ctypes.c_void_p), len(src), 0)
+    chunk = 1 << 22
+    obuf = ctypes.create_string_buffer(chunk)
+    parts, total = [], 0
+    try:
+        while inb.pos < inb.size:
+            outb = Buf(ctypes.cast(obuf, ctypes.c_void_p), chunk, 0)
+            r = z.ZSTD_decompressStream(ctypes.c_void_p(ds), ctypes.byref(outb), ctypes.byref(inb))
+            if z.ZSTD_isError(r):
+                raise ValueError("corrupt zstd data")
+            parts.append(obuf.raw[:outb.pos])
+            total += outb.pos
+            if total > cap:
+                raise ValueError("decompressed .blend is too large to preview")
+            if r == 0 and inb.pos >= inb.size:
+                break
+        # drain any buffered output
+        while True:
+            outb = Buf(ctypes.cast(obuf, ctypes.c_void_p), chunk, 0)
+            r = z.ZSTD_decompressStream(ctypes.c_void_p(ds), ctypes.byref(outb), ctypes.byref(inb))
+            if outb.pos == 0 or z.ZSTD_isError(r):
+                break
+            parts.append(obuf.raw[:outb.pos])
+    finally:
+        z.ZSTD_freeDStream(ctypes.c_void_p(ds))
+    return b"".join(parts)
+
+
+class BlendFile:
+    """Blocks + SDNA of a .blend. Keeps ID blocks of interest and small DATA blocks (list links)."""
+
+    def __init__(self, path: str):
+        self.path = path
+        f, self.compression = _blend_open(path)
+        self._mem = f.getvalue() if isinstance(f, io.BytesIO) else None   # zstd: keep for later block reads
+        self.skipped: Dict[int, Tuple[int, int]] = {}
+        self.thumb = None
+        try:
+            self._read(f)
+        finally:
+            f.close()
+
+    def _read(self, f):
+        head = f.read(12)
+        if head[:7] != b"BLENDER":
+            raise ValueError("not a .blend file")
+        if head[7:9] == b"17":                                    # Blender 5.0+ header: BLENDER17-01v0500
+            rest = f.read(5)
+            self.ptr, self.le = 8, True
+            self.version = (head[11:12] + rest).decode("latin-1")[-4:]
+            self.new_format = True
+        else:
+            self.ptr = 8 if head[7:8] == b"-" else 4
+            self.le = head[8:9] == b"v"
+            self.version = head[9:12].decode("latin-1")
+            self.new_format = False
+        e = "<" if self.le else ">"
+        P = "Q" if self.ptr == 8 else "I"
+        self.e, self.P = e, P
+        hsz = 32 if self.new_format else (16 + self.ptr)
+        self.blocks = []                      # (code, sdna, old, data or None, nr)
+        self.by_old: Dict[int, int] = {}
+        self.counts: Dict[str, int] = {}
+        self.linked: Dict[str, int] = {}
+        dna = None
+        while True:
+            h = f.read(hsz)
+            if len(h) < hsz:
+                break
+            if self.new_format:
+                code = h[:4]
+                sdna, old, ln, nr = struct.unpack(e + "iQqq", h[4:32])
+            else:
+                code = h[:4]
+                ln, old, sdna, nr = struct.unpack(e + "i" + P + "ii", h[4:hsz])
+            if code == b"ENDB":
+                break
+            c2 = code[:2].decode("latin-1") if code[2:4] == b"\0\0" else ""
+            # ID blocks we report on, the schema, and small DATA blocks (list links, embedded collections);
+            # geometry and pixel data are skipped without being read
+            keep = (code == b"DNA1") or (c2 in _BLEND_KEEP_ID) or (code == b"DATA" and ln <= 4096)
+            if code == b"TEST":                                   # file browser thumbnail
+                self.thumb = f.read(ln)
+                continue
+            if keep:
+                data = f.read(ln)
+            else:
+                data = None
+                try:
+                    self.skipped[old] = (f.tell(), ln)
+                except (OSError, AttributeError):
+                    pass
+                f.seek(ln, 1)
+            if c2:
+                self.counts[c2] = self.counts.get(c2, 0) + 1
+            if code == b"DNA1":
+                dna = data
+                continue
+            self.by_old[old] = len(self.blocks)
+            self.blocks.append((code, sdna, old, data, nr, c2))
+        if dna is None:
+            raise ValueError("no DNA1 block")
+        self._dna(dna)
+
+    def _dna(self, d: bytes):
+        e = self.e
+        p = 4                                                    # SDNA
+        assert d[p:p + 4] == b"NAME"
+        n = struct.unpack_from(e + "i", d, p + 4)[0]
+        p += 8
+        names = []
+        for _ in range(n):
+            q = d.index(b"\0", p)
+            names.append(d[p:q].decode("latin-1"))
+            p = q + 1
+        p = (p + 3) & ~3
+        assert d[p:p + 4] == b"TYPE"
+        n = struct.unpack_from(e + "i", d, p + 4)[0]
+        p += 8
+        types = []
+        for _ in range(n):
+            q = d.index(b"\0", p)
+            types.append(d[p:q].decode("latin-1"))
+            p = q + 1
+        p = (p + 3) & ~3
+        assert d[p:p + 4] == b"TLEN"
+        p += 4
+        tlen = list(struct.unpack_from(e + f"{len(types)}h", d, p))
+        p += 2 * len(types)
+        p = (p + 3) & ~3
+        assert d[p:p + 4] == b"STRC"
+        n = struct.unpack_from(e + "i", d, p + 4)[0]
+        p += 8
+        self.structs: Dict[str, Dict[str, Tuple[int, str, str]]] = {}
+        self.struct_names: list = []
+        for _ in range(n):
+            t, nf = struct.unpack_from(e + "hh", d, p)
+            p += 4
+            fields = {}
+            off = 0
+            for _ in range(nf):
+                ft, fn = struct.unpack_from(e + "hh", d, p)
+                p += 4
+                nm = names[fn]
+                size = self._field_size(nm, tlen[ft])
+                key = re.sub(r"\[.*", "", nm.lstrip("*")).strip("()*")
+                fields[key] = (off, types[ft], nm)
+                off += size
+            self.structs[types[t]] = fields
+            self.struct_names.append(types[t])
+        self.tlen = dict(zip(types, tlen))
+
+    def _field_size(self, name: str, tsize: int) -> int:
+        mult = 1
+        for m in re.findall(r"\[(\d+)\]", name):
+            mult *= int(m)
+        if name.startswith("*") or name.startswith("(*"):
+            return self.ptr * mult
+        return tsize * mult
+
+    # ---- field access
+    def read_data(self, old: int) -> Optional[bytes]:
+        """Data of any block by its old address, re-reading big blocks that were skipped on the first pass."""
+        b = self.block(old)
+        if b is not None and b[3] is not None:
+            return b[3]
+        pos = self.skipped.get(old)
+        if pos is None:
+            return None
+        if self._mem is not None:
+            return self._mem[pos[0]:pos[0] + pos[1]]
+        f, _ = _blend_open(self.path)
+        try:
+            f.seek(pos[0])
+            return f.read(pos[1])
+        finally:
+            f.close()
+
+    def field(self, struct_name: str, data: bytes, path: str, kind: str = "auto", index: int = 0):
+        """Value of a (possibly nested 'r.engine') field of struct_name inside data, or None. index picks an
+        element of an array field (w[2], rect[2], value[4] …)."""
+        off = 0
+        st = struct_name
+        parts = path.split(".")
+        for i, part in enumerate(parts):
+            f = self.structs.get(st, {}).get(part)
+            if f is None:
+                return None
+            o, ftype, raw = f
+            off += o
+            if i < len(parts) - 1:
+                st = ftype
+                continue
+            if off >= len(data):
+                return None
+            if raw.startswith("*") or raw.startswith("(*"):
+                off += index * self.ptr
+                if off + self.ptr > len(data):
+                    return None
+                return struct.unpack_from(self.e + self.P, data, off)[0]
+            if ftype == "char" and "[" in raw:
+                n = int(re.findall(r"\[(\d+)\]", raw)[0])
+                s = data[off:off + n].split(b"\0")[0]
+                return s.decode("utf-8", "replace")
+            fmt = {"short": "h", "ushort": "H", "int": "i", "uint": "I", "float": "f", "char": "b", "uchar": "B",
+                   "int64_t": "q", "uint64_t": "Q", "double": "d", "int8_t": "b", "uint8_t": "B", "int16_t": "h",
+                   "int32_t": "i", "uint32_t": "I"}.get(ftype)
+            if not fmt:
+                return None
+            off += index * struct.calcsize(fmt)
+            if off + struct.calcsize(fmt) > len(data):
+                return None
+            return struct.unpack_from(self.e + fmt, data, off)[0]
+        return None
+
+    def sname(self, sdna: int) -> str:
+        return self.struct_names[sdna] if 0 <= sdna < len(self.struct_names) else ""
+
+    def block(self, old: int):
+        i = self.by_old.get(old)
+        return self.blocks[i] if i is not None else None
+
+    def id_name(self, code_block) -> str:
+        code, sdna, old, data, nr, c2 = code_block
+        st = self.sname(sdna)
+        n = self.field(st, data, "id.name") if data else None
+        return (n or "")[2:]
+
+    def id_lib(self, b) -> int:
+        st = self.sname(b[1])
+        return self.field(st, b[3], "id.lib") or 0
+
+    def listbase(self, first: int, limit: int = 200000):
+        """Blocks of a ListBase starting at its 'first' pointer (following 'next')."""
+        seen = 0
+        while first and seen < limit:
+            b = self.block(first)
+            if b is None or b[3] is None:
+                return
+            yield b
+            seen += 1
+            first = struct.unpack_from(self.e + self.P, b[3], 0)[0]     # Link.next is the first field
+
+
+def _blend_rgba_image(data: bytes, w: int, h: int) -> Optional["RawImage"]:
+    """Bottom-up RGBA (Blender previews, the file thumbnail) → RawImage over a neutral backdrop."""
+    if not data or w <= 0 or h <= 0 or len(data) < w * h * 4 or np is None:
+        return None
+    a = np.frombuffer(data[:w * h * 4], np.uint8).reshape(h, w, 4)[::-1].astype(np.float32) / 255.0
+    bg = np.array([0.16, 0.16, 0.17], np.float32)
+    rgb = a[..., :3] * a[..., 3:4] + bg * (1 - a[..., 3:4])
+    return RawImage(w, h, (np.clip(rgb, 0, 1) * 255 + 0.5).astype(np.uint8).tobytes())
+
+
+def blend_thumbnail(bf: "BlendFile") -> Optional["RawImage"]:
+    t = bf.thumb
+    if not t or len(t) < 8:
+        return None
+    w, h = struct.unpack_from(bf.e + "ii", t, 0)
+    return _blend_rgba_image(t[8:], w, h) if 0 < w <= 4096 and 0 < h <= 4096 else None
+
+
+def blend_id_preview(bf: "BlendFile", idb) -> Optional["RawImage"]:
+    """The preview render Blender stored with an ID (material balls, object / world previews)."""
+    st = bf.sname(idb[1])
+    pp = bf.field(st, idb[3], "id.preview") or bf.field(st, idb[3], "preview")
+    pb = bf.block(pp) if pp else None
+    if pb is None or pb[3] is None:
+        return None
+    ps = bf.sname(pb[1]) or "PreviewImage"
+    for i in (1, 0):                                             # 1 = large preview, 0 = icon
+        w, h = bf.field(ps, pb[3], "w", index=i), bf.field(ps, pb[3], "h", index=i)
+        rp = bf.field(ps, pb[3], "rect", index=i)
+        if w and h and rp:
+            img = _blend_rgba_image(bf.read_data(rp) or b"", w, h)
+            if img is not None:
+                return img
+    return None
+
+
+_PRINCIPLED_IN = {"Base Color": "base_color", "Metallic": "metallic", "Roughness": "roughness", "Alpha": "opacity",
+                  "Normal": "normal", "Coat Weight": "coat", "Clearcoat": "coat", "Coat Roughness": "coat_roughness",
+                  "Clearcoat Roughness": "coat_roughness", "Emission Color": "_em_c", "Emission": "_em_c",
+                  "Emission Strength": "_em_w", "Transmission Weight": "transmission", "Transmission": "transmission",
+                  "Specular IOR Level": "specular_lvl", "Specular": "specular_lvl"}
+
+
+def blend_materials(bf: "BlendFile", blend_path: str) -> list:
+    """Every material: Principled BSDF values and image textures (followed through links, normal-map nodes
+    and simple colour nodes), else the viewport display colour; plus Blender's own stored preview render."""
+    out = []
+    for mb in [b for b in bf.blocks if b[5] == "MA" and b[3] is not None]:
+        st = bf.sname(mb[1])
+        name = bf.id_name(mb)
+        m = {"name": name}
+        r, g, b_ = bf.field(st, mb[3], "r"), bf.field(st, mb[3], "g"), bf.field(st, mb[3], "b")
+        if r is not None:
+            m["base_color"] = (r, g, b_)
+        for fld, key in (("metallic", "metallic"), ("roughness", "roughness")):
+            v = bf.field(st, mb[3], fld)
+            if v is not None:
+                m[key] = v
+        rows = []
+        ntp = bf.field(st, mb[3], "nodetree")
+        nt = bf.block(ntp) if ntp else None
+        if nt is not None and nt[3] is not None and bf.field(st, mb[3], "use_nodes") != 0:
+            ns = bf.sname(nt[1])
+            nodes = {}
+            first = bf.field(ns, nt[3], "nodes.first")
+            for nb in bf.listbase(first or 0):
+                nodes[nb[2]] = nb
+            links = {}
+            first = bf.field(ns, nt[3], "links.first")
+            for lb in bf.listbase(first or 0):
+                ls = bf.sname(lb[1])
+                links[bf.field(ls, lb[3], "tosock")] = (bf.field(ls, lb[3], "fromnode"), bf.field(ls, lb[3], "fromsock"))
+
+            def idname(nb):
+                return bf.field(bf.sname(nb[1]), nb[3], "idname") or ""
+
+            def sockets(nb, which="inputs"):
+                res = []
+                fp = bf.field(bf.sname(nb[1]), nb[3], which + ".first")
+                for sb in bf.listbase(fp or 0):
+                    ss = bf.sname(sb[1])
+                    res.append((bf.field(ss, sb[3], "identifier") or bf.field(ss, sb[3], "name") or "",
+                                bf.field(ss, sb[3], "name") or "", sb, bf.field(ss, sb[3], "default_value")))
+                return res
+
+            def image_of(nb, depth=0):
+                if nb is None or depth > 6:
+                    return None
+                if idname(nb) in ("ShaderNodeTexImage", "ShaderNodeTexEnvironment"):
+                    ip = bf.field(bf.sname(nb[1]), nb[3], "id")
+                    ib = bf.block(ip) if ip else None
+                    if ib is not None and ib[3] is not None:
+                        ist = bf.sname(ib[1])
+                        raw = bf.field(ist, ib[3], "filepath") or bf.field(ist, ib[3], "name") or ""
+                        if raw:
+                            return _blend_path(raw, blend_path)[0]
+                    return None
+                for ident, nm, sb, dv in sockets(nb):
+                    src = links.get(sb[2])
+                    if src:
+                        hit = image_of(nodes.get(src[0]), depth + 1)
+                        if hit:
+                            return hit
+                return None
+            pr = next((nb for nb in nodes.values() if idname(nb) == "ShaderNodeBsdfPrincipled"), None)
+            if pr is not None:
+                em_c, em_w = None, None
+                for ident, nm, sb, dv in sockets(pr):
+                    key = _PRINCIPLED_IN.get(nm) or _PRINCIPLED_IN.get(ident)
+                    if not key:
+                        continue
+                    src = links.get(sb[2])
+                    if src:
+                        img = image_of(nodes.get(src[0]))
+                        rows.append(_bn(nm, "← " + (idname(nodes.get(src[0])) if nodes.get(src[0]) else "?").replace("ShaderNode", ""),
+                                        None, img or "", (os.path.exists(img) if img else None)))
+                        if img:
+                            tk = {"base_color": "base_color_tex", "metallic": "metallic_tex", "roughness": "roughness_tex",
+                                  "normal": "normal_tex", "_em_c": "emission_tex", "opacity": "opacity_tex"}.get(key)
+                            if tk:
+                                m[tk] = img
+                                if key == "base_color":
+                                    m["base_color"] = (1.0, 1.0, 1.0)
+                        continue
+                    dvb = bf.block(dv) if dv else None
+                    if dvb is None or dvb[3] is None:
+                        continue
+                    vs = bf.sname(dvb[1])
+                    if vs.endswith("RGBA"):
+                        val = tuple(bf.field(vs, dvb[3], "value", index=i) or 0.0 for i in range(3))
+                        rows.append(_bn(nm, ", ".join(f"{c:.3g}" for c in val)))
+                    elif vs.endswith("Float"):
+                        val = bf.field(vs, dvb[3], "value")
+                        rows.append(_bn(nm, f"{val:.3g}" if val is not None else ""))
+                    else:
+                        continue
+                    if key == "_em_c":
+                        em_c = val
+                    elif key == "_em_w":
+                        em_w = val
+                    elif key == "specular_lvl":
+                        m["specular"] = (val or 0.5) * 2
+                    elif key == "base_color":
+                        m["base_color"] = val
+                    elif key != "normal" and isinstance(val, float):
+                        m[key] = val
+                if em_c and (em_w or 0) > 0:
+                    m["emission"] = tuple(c * em_w for c in em_c)
+        m["_rows"] = rows
+        m["_preview"] = blend_id_preview(bf, mb)
+        out.append(m)
+    return out
+
+
+def _blend_path(raw: str, blend: str) -> Tuple[str, Optional[bool]]:
+    if raw.startswith("//"):
+        raw = os.path.join(os.path.dirname(blend), raw[2:])
+    return resolve_scene_path(raw, blend)
+
+
+def breakdown_blend(path: str) -> dict:
+    bf = BlendFile(path)
+    v = bf.version.lstrip("0")
+    ver = (f"{v[0]}.{int(v[1:])}" if len(v) == 3 else f"{v[:-2]}.{int(v[-2:])}") if v.isdigit() else bf.version
+    info = [("Saved with", f"Blender {ver}")]
+    if bf.compression:
+        info.append(("Compression", bf.compression))
+    ids = {}
+    for b in bf.blocks:
+        if b[5] and b[3] is not None:
+            ids.setdefault(b[5], []).append(b)
+    libs = {b[2]: b for b in ids.get("LI", [])}
+
+    def lib_of(b) -> str:
+        lp = bf.id_lib(b)
+        if lp and lp in libs:
+            lb = libs[lp]
+            st = bf.sname(lb[1])
+            return bf.field(st, lb[3], "filepath") or bf.field(st, lb[3], "name") or "library"
+        return ""
+    # objects
+    obs = {}
+    for b in ids.get("OB", []):
+        st = bf.sname(b[1])
+        t = bf.field(st, b[3], "type")
+        data_ptr = bf.field(st, b[3], "data") or 0
+        db = bf.block(data_ptr)
+        obs[b[2]] = {"name": bf.id_name(b), "type": _BLEND_OB_TYPES.get(t, f"type {t}"),
+                     "parent": bf.field(st, b[3], "parent") or 0,
+                     "data": bf.id_name(db) if db and db[5] else "", "lib": lib_of(b)}
+    kids: Dict[int, list] = {}
+    for o_ptr, o in obs.items():
+        if o["parent"] in obs:
+            kids.setdefault(o["parent"], []).append(o_ptr)
+    n_nodes = [0]
+
+    def ob_node(o_ptr, depth=0):
+        o = obs[o_ptr]
+        n_nodes[0] += 1
+        det = o["type"] + (f" · {o['data']}" if o["data"] and o["data"] != o["name"] else "")
+        if o["lib"]:
+            det += f" · linked from {os.path.basename(o['lib'])}"
+        sub = [ob_node(k, depth + 1) for k in sorted(kids.get(o_ptr, []), key=lambda k: obs[k]["name"].lower())] \
+            if depth < 64 and n_nodes[0] < 6000 else []
+        return _bn(o["name"], det, sub)
+    # collections
+    cols = {b[2]: b for b in ids.get("GR", [])}
+    tree, notes = [], []
+    scenes = ids.get("SC", [])
+
+    def col_node(cb, label=None, depth=0):
+        st = bf.sname(cb[1])
+        name = label or bf.id_name(cb)
+        children, obj_nodes = [], []
+        first = bf.field(st, cb[3], "children.first")
+        if first:
+            for link in bf.listbase(first):
+                cp = bf.field(bf.sname(link[1]), link[3], "collection")
+                if cp in cols and depth < 32:
+                    children.append(col_node(cols[cp], depth=depth + 1))
+        first = bf.field(st, cb[3], "gobject.first")
+        members = []
+        if first:
+            for link in bf.listbase(first):
+                op = bf.field(bf.sname(link[1]), link[3], "ob")
+                if op in obs:
+                    members.append(op)
+        mset = set(members)
+        for op in sorted(members, key=lambda k: obs[k]["name"].lower()):
+            if obs[op]["parent"] not in mset:
+                obj_nodes.append(ob_node(op))
+        lib = lib_of(cb) if cb[5] else ""
+        return _bn(name, (f"{len(members):,} objects" if members else "") + (f" · linked from {os.path.basename(lib)}" if lib else ""),
+                   children + obj_nodes)
+    scene_nodes = []
+    render = {}
+    for sb in scenes:
+        st = bf.sname(sb[1])
+        sname = bf.id_name(sb)
+        eng = bf.field(st, sb[3], "r.engine") or ""
+        sf, ef = bf.field(st, sb[3], "r.sfra"), bf.field(st, sb[3], "r.efra")
+        fps = bf.field(st, sb[3], "r.frs_sec")
+        fpsb = bf.field(st, sb[3], "r.frs_sec_base") or 1.0
+        rx, ry = bf.field(st, sb[3], "r.xsch"), bf.field(st, sb[3], "r.ysch")
+        pct = bf.field(st, sb[3], "r.size")
+        cam = bf.block(bf.field(st, sb[3], "camera") or 0)
+        world = bf.block(bf.field(st, sb[3], "world") or 0)
+        rows = []
+        if eng:
+            rows.append(_bn("Render engine", {"BLENDER_EEVEE": "EEVEE (legacy)", "BLENDER_EEVEE_NEXT": "EEVEE",
+                                              "CYCLES": "Cycles", "BLENDER_WORKBENCH": "Workbench"}.get(eng, eng)))
+        if sf is not None:
+            rows.append(_bn("Frame range", f"{sf} – {ef}" + (f" @ {fps / fpsb:.3g} fps" if fps else "")))
+        if rx:
+            rows.append(_bn("Resolution", f"{rx} × {ry}" + (f" ({pct}%)" if pct and pct != 100 else "")))
+        if cam:
+            rows.append(_bn("Camera", bf.id_name(cam)))
+        if world:
+            rows.append(_bn("World", bf.id_name(world)))
+        if not render:
+            render = {r[0]: r[1] for r in rows}
+        mc_ptr = bf.field(st, sb[3], "master_collection")
+        if mc_ptr and bf.block(mc_ptr) and bf.block(mc_ptr)[3]:
+            content = col_node(bf.block(mc_ptr), label="Scene Collection")[2]
+        else:                                                     # 2.7x: scene.base list
+            content = []
+            first = bf.field(st, sb[3], "base.first")
+            if first:
+                members = []
+                for link in bf.listbase(first):
+                    op = bf.field(bf.sname(link[1]), link[3], "object")
+                    if op in obs:
+                        members.append(op)
+                mset = set(members)
+                content = [ob_node(op) for op in sorted(members, key=lambda k: obs[k]["name"].lower()) if obs[op]["parent"] not in mset]
+        scene_nodes.append(_bn(sname, f"{eng and render.get('Render engine', '')}".strip(" ·"), [_bn("Settings", "", rows)] + content))
+    for k in ("Render engine", "Frame range", "Resolution"):
+        if k in render:
+            info.append((k, render[k]))
+    # mesh totals
+    faces = 0
+    for b in ids.get("ME", []):
+        st = bf.sname(b[1])
+        for fld in ("faces_num", "totpoly", "totface"):
+            vv = bf.field(st, b[3], fld)
+            if vv:
+                faces += vv
+                break
+    if faces:
+        info.append(("Faces", f"{faces:,} in {len(ids.get('ME', [])):,} meshes"))
+    info.append(("Objects", f"{len(obs):,}"))
+    tree.append(_bn("Scenes", f"{len(scene_nodes)}", scene_nodes))
+    # references
+    found: Dict[str, list] = {}
+
+    def add(group, raw, owner, extra=""):
+        if raw:
+            found.setdefault(group, []).append((raw, owner, extra))
+    for b in ids.get("LI", []):
+        st = bf.sname(b[1])
+        add("Linked libraries", bf.field(st, b[3], "filepath") or bf.field(st, b[3], "name") or "", bf.id_name(b))
+    for b in ids.get("IM", []):
+        st = bf.sname(b[1])
+        src = bf.field(st, b[3], "source")
+        if src in (4, 5):                                         # generated / viewer
+            continue
+        packed = bool(bf.field(st, b[3], "packedfile"))
+        if bf.field(st, b[3], "packedfiles.first"):
+            packed = True
+        raw = bf.field(st, b[3], "filepath") or bf.field(st, b[3], "name") or ""
+        add("Images", raw, bf.id_name(b), "packed in .blend" if packed else ("UDIM tiles" if src == 6 else ("sequence" if src == 2 else ("movie" if src == 3 else ""))))
+    for code, grp, fld in (("SO", "Sounds", "filepath"), ("MC", "Movie clips", "filepath"), ("VF", "Fonts", "filepath"),
+                           ("CF", "Caches (Alembic / USD)", "filepath"), ("VO", "Volumes (VDB)", "filepath"),
+                           ("TX", "Texts", "filepath")):
+        for b in ids.get(code, []):
+            st = bf.sname(b[1])
+            raw = bf.field(st, b[3], fld) or bf.field(st, b[3], "name") or ""
+            if code == "VF" and raw == "<builtin>":
+                continue
+            packed = bool(bf.field(st, b[3], "packedfile"))
+            add(grp, raw, bf.id_name(b), "packed in .blend" if packed else "")
+    ref_groups, nfiles, nmiss = [], 0, 0
+    for grp, items in found.items():
+        nodes = []
+        for raw, owner, extra in sorted(items, key=lambda x: x[0].lower()):
+            if extra == "packed in .blend":
+                nodes.append(_bn(os.path.basename(raw.replace("\\", "/")) or owner, f"{owner} · packed in .blend", None, raw, None))
+                nfiles += 1
+                continue
+            full, ok = _blend_path(raw, path)
+            if extra == "UDIM tiles" and not ok and "<UDIM>" not in full:
+                ok2 = glob.glob(re.sub(r"\.1\d\d\d\.", ".*.", full))
+                ok = True if ok2 else ok
+            nfiles += 1
+            nmiss += ok is False
+            det = owner + (f" · {extra}" if extra else "")
+            if raw.startswith("//"):
+                det += f" · {raw}"
+            nodes.append(_bn(os.path.basename(raw.replace("\\", "/")) or owner, det, None, full, ok))
+        miss = sum(1 for n in nodes if n[4] is False)
+        ref_groups.append(_bn(grp, f"{len(nodes):,}" + (f" · {miss} missing" if miss else ""), _bn_capped(nodes, 800)))
+    order = ["Linked libraries", "Images", "Caches (Alembic / USD)", "Volumes (VDB)", "Sounds", "Movie clips", "Fonts", "Texts"]
+    ref_groups.sort(key=lambda n: order.index(n[0]) if n[0] in order else 99)
+    tree.append(_bn("References", f"{nfiles:,} files" + (f" · {nmiss} missing" if nmiss else ""), ref_groups))
+    if nmiss:
+        info.append(("Missing files", f"{nmiss:,}"))
+    images, materials = [], []
+    th = blend_thumbnail(bf)
+    if th is not None:
+        images.append(("File thumbnail", th))
+    try:
+        materials = blend_materials(bf, path)
+    except Exception as ex:
+        notes.append(f"Materials couldn't be read in detail ({type(ex).__name__}).")
+    if materials:
+        mat_nodes = []
+        for i, m in enumerate(sorted(materials, key=lambda m: m["name"].lower())):
+            rows = m.pop("_rows", [])
+            prv = m.pop("_preview", None)
+            if prv is not None:
+                m["_image"] = prv
+            mat_nodes.append(_bn(m["name"], ("stored preview · " if prv is not None else "") + f"{len(rows)} inputs" if rows else
+                                 ("stored preview" if prv is not None else "viewport colour"), rows, f"material:{i}", None))
+        materials = sorted(materials, key=lambda m: m["name"].lower())
+        tree.append(_bn("Materials", f"{len(materials):,}", _bn_capped(mat_nodes, 500)))
+    counts = {_BLEND_ID_CODES.get(c, c): n for c, n in bf.counts.items()
+              if c not in ("WM", "SN", "SR", "WS", "BR", "PL", "PC", "LS")}
+    tree.append(_bn("Data-blocks", f"{sum(counts.values()):,}", _bn_counts(counts)))
+    return {"kind": "Blender file", "info": info, "tree": tree, "notes": notes, "images": images, "materials": materials}
+
+
+# --------------------------------------------------------------------------- dispatch + text export
+SCENE_BREAKDOWN_EXTS = {".umap": "unreal", ".uasset": "unreal", ".uproject": "unreal",
+                        ".unity": "unity", ".prefab": "unity", ".unitypackage": "unity",
+                        ".asset": "unity-yaml", ".controller": "unity-yaml", ".overrideController": "unity-yaml",
+                        ".ma": "maya", ".mb": "maya", ".blend": "blender"}
+
+
+def scene_breakdown_kind(path: str) -> str:
+    """'unreal' / 'unity' / 'maya' / 'blender' if Kestrel can break this file down, else ''. Extensions shared
+    with other programs (.mat is also MATLAB) are only claimed when the file is Unity YAML."""
+    ext = os.path.splitext(path)[1]
+    k = SCENE_BREAKDOWN_EXTS.get(ext) or SCENE_BREAKDOWN_EXTS.get(ext.lower(), "")
+    if k == "unity-yaml":
+        try:
+            with open(path, "rb") as f:
+                return "unity" if f.read(5) == b"%YAML" else ""
+        except OSError:
+            return ""
+    if k == "maya" and ext.lower() == ".ma":
+        try:
+            with open(path, "rb") as f:
+                head = f.read(4096)
+            return "maya" if (head.startswith(b"//Maya") or b"requires maya" in head or b"createNode " in head) else ""
+        except OSError:
+            return ""
+    return k
+
+
+def scene_breakdown(path: str) -> dict:
+    """Run in the heavy worker: {kind, info, tree, notes} or {error}."""
+    t0 = time.monotonic()
+    k = scene_breakdown_kind(path)
+    fn = {"unreal": breakdown_unreal, "unity": breakdown_unity, "maya": breakdown_maya, "blender": breakdown_blend}.get(k)
+    if fn is None:
+        return {"error": "not a scene file Kestrel can read"}
+    try:
+        if os.path.getsize(path) < 16:
+            return {"error": "the file is empty"}
+        res = fn(path)
+    except struct.error:
+        return {"error": "the file is truncated or not in a format Kestrel understands"}
+    except Exception as ex:
+        return {"error": f"{type(ex).__name__}: {ex}"}
+    res["seconds"] = time.monotonic() - t0
+    bench(f"breakdown {k}: {os.path.basename(path)} {res['seconds']:.2f}s")
+    return res
+
+
+def breakdown_text(res: dict, title: str = "") -> str:
+    """Plain-text version of a breakdown (Copy as text)."""
+    lines = [title or res.get("kind", "")]
+    for k, v in res.get("info", []):
+        lines.append(f"  {k}: {v}")
+    for n in res.get("notes", []):
+        lines.append(f"  note: {n}")
+
+    def walk(nodes, depth):
+        for n in nodes:
+            extra = []
+            if n[1]:
+                extra.append(n[1])
+            if n[3] and not n[3].startswith("material:"):
+                extra.append(n[3] + ("  [MISSING]" if n[4] is False else ""))
+            lines.append("  " * depth + "- " + n[0] + (f"   ({' · '.join(extra)})" if extra else ""))
+            walk(n[2], depth + 1)
+    lines.append("")
+    walk(res.get("tree", []), 0)
+    return "\n".join(lines) + "\n"
+
+
+# =========================================================================== shader & material previews (p3f)
+# A material read from any format becomes one plain dict (MATERIAL_DEFAULTS keys, colours in linear RGB,
+# textures as file paths or (path, channel, invert) tuples) and is rendered as a "material ball": a sphere in a
+# small studio (key, fill and rim light plus a procedural softbox environment), GGX specular, optional clear
+# coat, normal map, emission, opacity / transmission. numpy only, so it works without OpenGL.
+
+MATERIAL_DEFAULTS = {
+    "name": "", "base_color": (0.8, 0.8, 0.8), "base_weight": 1.0, "base_color_tex": None,
+    "metallic": 0.0, "metallic_tex": None, "roughness": 0.5, "roughness_tex": None,
+    "specular": 1.0, "normal_tex": None, "normal_strength": 1.0,
+    "emission": (0.0, 0.0, 0.0), "emission_tex": None, "opacity": 1.0, "opacity_tex": None,
+    "transmission": 0.0, "coat": 0.0, "coat_roughness": 0.1, "coat_color": (1.0, 1.0, 1.0), "coat_color_tex": None,
+    "tiling": (1.0, 1.0),
+}
+
+_TEX_CACHE: Dict[Tuple[str, int], object] = {}
+
+
+def _srgb_to_linear(c):
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+
+
+def _lin1(v: float) -> float:
+    """One sRGB-encoded channel → linear (no numpy needed)."""
+    v = float(v)
+    return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+
+
+def load_texture_array(path: str, max_size: int = 512):
+    """Image file → float32 H×W×4 in 0..1 (as stored: colour maps are still sRGB-encoded). UDIM / <UVTILE>
+    paths use the first tile. None when it can't be read."""
+    if not path:
+        return None
+    p = path
+    if re.search(r"<UDIM>|<udim>|<UVTILE>|\$\{?UDIM\}?|%\(UDIM\)d", p):
+        hits = sorted(glob.glob(re.sub(r"<UDIM>|<udim>|<UVTILE>|\$\{?UDIM\}?|%\(UDIM\)d", "*", p)))
+        if not hits:
+            return None
+        p = hits[0]
+    key = (p, max_size)
+    if key in _TEX_CACHE:
+        return _TEX_CACHE[key]
+    arr = None
+    ext = os.path.splitext(p)[1].lower()
+    try:
+        if ext in PREVIEW_DECODERS:
+            raw = PREVIEW_DECODERS[ext](p, max_size, max_size)
+            if raw is not None:
+                a = np.frombuffer(raw.rgb, np.uint8).reshape(raw.h, raw.w, 3).astype(np.float32) / 255.0
+                arr = np.concatenate([a, np.ones((raw.h, raw.w, 1), np.float32)], 2)
+        if arr is None:
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(p, max_size, max_size, True)
+                w, h, n, rs = pb.get_width(), pb.get_height(), pb.get_n_channels(), pb.get_rowstride()
+                buf = np.frombuffer(pb.get_pixels(), np.uint8)
+                a = np.lib.stride_tricks.as_strided(buf, (h, w, n), (rs, n, 1)).astype(np.float32) / 255.0
+                if n == 3:
+                    a = np.concatenate([a, np.ones((h, w, 1), np.float32)], 2)
+                arr = a
+            except Exception:
+                try:                                              # development / tests without GdkPixbuf
+                    from PIL import Image as _PILImage
+                    im = _PILImage.open(p).convert("RGBA")
+                    im.thumbnail((max_size, max_size))
+                    arr = np.asarray(im, np.float32) / 255.0
+                except Exception:
+                    arr = None
+    except Exception:
+        arr = None
+    if len(_TEX_CACHE) > 48:
+        _TEX_CACHE.clear()
+    _TEX_CACHE[key] = arr
+    return arr
+
+
+def _tex_sample(arr, u, v):
+    """Bilinear, wrapping. u, v arrays in texture repeats."""
+    h, w = arr.shape[:2]
+    x = (u % 1.0) * w - 0.5
+    y = (1.0 - (v % 1.0)) * h - 0.5
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    fx = (x - x0)[..., None].astype(np.float32)
+    fy = (y - y0)[..., None].astype(np.float32)
+    x0 %= w
+    y0 %= h
+    x1 = (x0 + 1) % w
+    y1 = (y0 + 1) % h
+    a = arr[y0, x0] * (1 - fx) + arr[y0, x1] * fx
+    b = arr[y1, x0] * (1 - fx) + arr[y1, x1] * fx
+    return a * (1 - fy) + b * fy
+
+
+def _norm(v):
+    return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-8)
+
+
+def _studio_env(d):
+    """Procedural studio environment seen along directions d (…×3): graded backdrop, a big softbox above
+    the key side, a strip light behind for rims. Linear radiance."""
+    y = d[..., 1:2]
+    sky = 0.18 + 0.32 * np.clip(y * 0.5 + 0.5, 0, 1)
+    env = np.concatenate([sky * 0.95, sky * 0.97, sky * 1.0], -1)
+    floor = np.clip((0.05 - y) / 0.35, 0, 1) ** 1.5                     # soft horizon, no hard line
+    env = env * (1 - floor) + np.array([0.11, 0.105, 0.10], np.float32) * floor
+    key = _norm(np.array([-0.55, 0.65, 0.55], np.float32))
+    c = np.clip((d * key).sum(-1, keepdims=True), 0, 1)
+    env = env + 9.0 * np.clip((c - 0.93) / 0.07, 0, 1) ** 1.5           # softbox
+    rim = _norm(np.array([0.6, 0.25, -0.75], np.float32))
+    c2 = np.clip((d * rim).sum(-1, keepdims=True), 0, 1)
+    env = env + 4.0 * np.clip((c2 - 0.96) / 0.04, 0, 1)                   # strip light
+    return env.astype(np.float32)
+
+
+def _env_avg(n):
+    """Cosine-blurred version of the studio (diffuse irradiance / very rough reflections)."""
+    y = n[..., 1:2]
+    up = np.clip(y * 0.5 + 0.5, 0, 1)
+    base = 0.12 + 0.30 * up
+    key = _norm(np.array([-0.55, 0.65, 0.55], np.float32))
+    k = np.clip((n * key).sum(-1, keepdims=True), 0, 1)
+    rim = _norm(np.array([0.6, 0.25, -0.75], np.float32))
+    r = np.clip((n * rim).sum(-1, keepdims=True), 0, 1)
+    v = base + 0.55 * k ** 2 + 0.18 * r ** 3
+    return np.concatenate([v * 0.97, v * 0.98, v], -1).astype(np.float32)
+
+
+def _env_brdf(nv, rough):
+    """Karis' analytic approximation of the split-sum environment BRDF → (scale, bias) for F0."""
+    c0 = np.array([-1.0, -0.0275, -0.572, 0.022], np.float32)
+    c1 = np.array([1.0, 0.0425, 1.04, -0.04], np.float32)
+    r = rough[..., None] * c0 + c1
+    a004 = np.minimum(r[..., 0] * r[..., 0], np.exp2(-9.28 * nv)) * r[..., 0] + r[..., 1]
+    return a004 * -1.04 + r[..., 2], a004 * 1.04 + r[..., 3]
+
+
+def _ggx_direct(n, v, l, rough, f0):
+    h = _norm(v + l)
+    nl = np.clip((n * l).sum(-1), 0, 1)
+    nv = np.clip((n * v).sum(-1), 1e-4, 1)
+    nh = np.clip((n * h).sum(-1), 0, 1)
+    vh = np.clip((v * h).sum(-1), 0, 1)
+    a = np.maximum(rough * rough, 2e-3)
+    a2 = a * a
+    d = a2 / (math.pi * (nh * nh * (a2 - 1) + 1) ** 2)
+    k = (rough + 1) ** 2 / 8
+    g = (nv / (nv * (1 - k) + k)) * (nl / (nl * (1 - k) + k))
+    f = f0 + (1 - f0) * ((1 - vh) ** 5)[..., None]
+    spec = (d * g / (4 * nv * np.maximum(nl, 1e-4)))[..., None] * f
+    return spec, nl
+
+
+def render_material_ball(mat: dict, size: int = 360, yaw: float = 0.45, tilt: float = 0.25) -> RawImage:
+    """Material dict → RawImage of a shaded sphere (2× supersampled)."""
+    m = dict(MATERIAL_DEFAULTS)
+    m.update({k: v for k, v in mat.items() if v is not None})
+    S = int(size) * 2
+    f32 = np.float32
+    ys, xs = np.mgrid[0:S, 0:S].astype(f32)
+    px = (xs + 0.5) / S * 2 - 1
+    py = 1 - (ys + 0.5) / S * 2
+    R = 0.78
+    cx, cy = 0.0, 0.08
+    sx, sy = (px - cx) / R, (py - cy) / R
+    rr = sx * sx + sy * sy
+    inside = rr < 1.0
+    # backdrop: gradient + contact shadow
+    bg_t = np.clip(py * 0.5 + 0.5, 0, 1)[..., None]
+    bg = (np.array([0.055, 0.055, 0.06], f32) * (1 - bg_t) + np.array([0.20, 0.205, 0.215], f32) * bg_t)
+    sh = np.exp(-(((px - cx) / 0.85) ** 2 + ((py - (cy - R - 0.02)) / 0.11) ** 2) * 2.2)[..., None]
+    bg = bg * (1 - 0.65 * sh)
+    out = bg.copy()
+    idx = np.nonzero(inside)
+    if len(idx[0]):
+        x, y = sx[idx], sy[idx]
+        z = np.sqrt(np.clip(1 - x * x - y * y, 0, 1))
+        n_view = np.stack([x, y, z], -1).astype(f32)
+        v = np.array([0, 0, 1], f32)[None, :].repeat(len(x), 0)
+        # object space (spin + tilt) for UVs
+        cyw, syw, ct, st = math.cos(yaw), math.sin(yaw), math.cos(tilt), math.sin(tilt)
+        oy = n_view[:, 1] * ct - n_view[:, 2] * st
+        oz0 = n_view[:, 1] * st + n_view[:, 2] * ct
+        ox = n_view[:, 0] * cyw - oz0 * syw
+        oz = n_view[:, 0] * syw + oz0 * cyw
+        phi = np.arctan2(ox, oz)
+        u = (phi / (2 * math.pi) + 0.5) * 2.0 * float(m["tiling"][0])
+        vv = (np.arcsin(np.clip(oy, -1, 1)) / math.pi + 0.5) * float(m["tiling"][1])
+
+        def tex(key, srgb=False):
+            spec = m.get(key)
+            if not spec:
+                return None
+            path, ch, inv = (spec, None, False) if isinstance(spec, str) else (tuple(spec) + (None, False))[:3]
+            arr = load_texture_array(path)
+            if arr is None:
+                return None
+            s = _tex_sample(arr, u, vv)
+            if ch is not None:
+                c = s[:, "rgba".index(ch) if isinstance(ch, str) else int(ch)]
+                c = 1 - c if inv else c
+                return c
+            rgb = s[:, :3]
+            return _srgb_to_linear(rgb) if srgb else rgb
+
+        base = np.array(m["base_color"], f32)[None, :] * float(m["base_weight"])
+        t = tex("base_color_tex", True)
+        if t is not None:
+            base = base * t if t.ndim == 2 else base * t[:, None]
+        base = np.ascontiguousarray(np.broadcast_to(base, (len(x), 3)), dtype=f32)
+        metal = np.full(len(x), float(m["metallic"]), f32)
+        t = tex("metallic_tex")
+        if t is not None:
+            metal = (metal * t) if t.ndim == 1 else metal * t[:, 2]
+        rough = np.full(len(x), float(m["roughness"]), f32)
+        t = tex("roughness_tex")
+        if t is not None:
+            rough = (t if t.ndim == 1 else t[:, 1]) * (1.0 if float(m["roughness"]) <= 0 else 1.0)
+        rough = np.clip(rough, 0.03, 1.0)
+        n = n_view
+        t = tex("normal_tex")
+        if t is not None:
+            # tangent along +u in object space, brought back to view space
+            tx_o = np.stack([np.cos(phi), np.zeros_like(phi), -np.sin(phi)], -1)
+            tx_v = np.stack([tx_o[:, 0] * cyw + tx_o[:, 2] * syw, np.zeros_like(phi), -tx_o[:, 0] * syw + tx_o[:, 2] * cyw], -1)
+            ty = tx_v[:, 1] * ct + tx_v[:, 2] * st
+            tz = -tx_v[:, 1] * st + tx_v[:, 2] * ct
+            T = _norm(np.stack([tx_v[:, 0], ty, tz], -1))
+            B = _norm(np.cross(n, T))
+            nm = (t * 2 - 1) * np.array([m["normal_strength"], m["normal_strength"], 1], f32)
+            n = _norm(T * nm[:, 0:1] + B * nm[:, 1:2] + n * nm[:, 2:3])
+        nv = np.clip((n * v).sum(-1), 1e-4, 1)
+        spec_lvl = 0.08 * float(m["specular"]) * 0.5
+        f0 = spec_lvl * (1 - metal[:, None]) + base * metal[:, None]
+        diffuse_col = base * (1 - metal[:, None])
+        col = np.zeros_like(base)
+        for ldir, lcol in (((-0.55, 0.65, 0.55), (1.9, 1.82, 1.7)), ((0.7, 0.15, 0.6), (0.3, 0.33, 0.4)),
+                           ((0.6, 0.25, -0.75), (1.3, 1.3, 1.4))):
+            l = _norm(np.array(ldir, f32))[None, :].repeat(len(x), 0)
+            spec, nl = _ggx_direct(n, v, l, rough, f0)
+            col += (diffuse_col / math.pi * nl[:, None] + spec * nl[:, None]) * np.array(lcol, f32)
+        # environment: diffuse irradiance + split-sum specular
+        col += diffuse_col * _env_avg(n) * 0.55
+        refl = _norm(2 * nv[:, None] * n - v)
+        sharp = _studio_env(refl)
+        blur = _env_avg(refl)
+        mixr = np.clip(rough * rough * 1.6, 0, 1)[:, None]
+        env_spec = sharp * (1 - mixr) + blur * mixr
+        a, b = _env_brdf(nv, rough)
+        col += env_spec * (f0 * a[:, None] + b[:, None])
+        # clear coat
+        coat = float(m["coat"])
+        if coat > 0:
+            cc = np.array(m["coat_color"], f32)[None, :]
+            t = tex("coat_color_tex", True)
+            if t is not None:
+                cc = t
+            col = col * (cc * coat + (1 - coat))
+            cr = np.full(len(x), max(0.03, float(m["coat_roughness"])), f32)
+            f0c = np.full((len(x), 3), 0.04, f32)
+            cspec = np.zeros_like(col)
+            for ldir, lcol in (((-0.55, 0.65, 0.55), (2.6, 2.5, 2.35)), ((0.6, 0.25, -0.75), (1.6, 1.6, 1.7))):
+                l = _norm(np.array(ldir, f32))[None, :].repeat(len(x), 0)
+                s_, nl = _ggx_direct(n_view, v, l, cr, f0c)
+                cspec += s_ * nl[:, None] * np.array(lcol, f32)
+            nvc = np.clip(z, 1e-4, 1)
+            refl_c = _norm(2 * nvc[:, None] * n_view - v)
+            a, b = _env_brdf(nvc, cr)
+            fc = 0.04 * a + b
+            mc = np.clip(cr * cr * 1.6, 0, 1)[:, None]
+            col = col * (1 - coat * fc[:, None]) + coat * (cspec + (_studio_env(refl_c) * (1 - mc) + _env_avg(refl_c) * mc) * fc[:, None])
+        # emission
+        em = np.array(m["emission"], f32)[None, :]
+        t = tex("emission_tex", True)
+        if t is not None:
+            em = em * t if np.any(em) else t
+        col += em
+        # transmission / opacity: see the backdrop through the ball (bent a little for glass)
+        trans = float(m["transmission"])
+        op = np.full(len(x), float(m["opacity"]), f32)
+        t = tex("opacity_tex")
+        if t is not None:
+            op = op * (t if t.ndim == 1 else t[:, 0])
+        # glass bends the backdrop upside down (a ball lens); plain transparency shows it straight
+        behind_y = np.clip(((cy + y * R * (-0.8 if trans > 0 else 1.0)) * 0.5 + 0.5), 0, 1)[:, None]
+        behind = np.array([0.055, 0.055, 0.06], f32) * (1 - behind_y) + np.array([0.20, 0.205, 0.215], f32) * behind_y
+        fres = (0.04 + 0.96 * (1 - nv) ** 5)[:, None]
+        if trans > 0:
+            tint = base if np.any(base) else np.ones_like(base)
+            caustic = np.exp(-((x + 0.15) ** 2 + (y + 0.45) ** 2) * 6.0)[:, None] * 0.35
+            glass = (behind * 1.6 + caustic) * tint * (1 - fres) + env_spec * fres * 1.4
+            col = col * (1 - trans) + (glass + env_spec * (f0 * a[:, None] + b[:, None]) * 0.5) * trans
+        if np.any(op < 1):
+            o = op[:, None]
+            col = col * o + behind * (1 - o) + env_spec * fres * (1 - o)
+        out[idx] = col
+    # filmic tone map (ACES approx) + sRGB, then 2×2 downsample
+    a_, b_, c_, d_, e_ = 2.51, 0.03, 2.43, 0.59, 0.14
+    x_ = out * 1.0
+    tm = np.clip((x_ * (a_ * x_ + b_)) / (x_ * (c_ * x_ + d_) + e_), 0, 1)
+    srgb = np.where(tm <= 0.0031308, tm * 12.92, 1.055 * np.power(tm, 1 / 2.4) - 0.055)
+    small = srgb.reshape(S // 2, 2, S // 2, 2, 3).mean(axis=(1, 3))
+    rgb = (np.clip(small, 0, 1) * 255 + 0.5).astype(np.uint8)
+    return RawImage(S // 2, S // 2, rgb.tobytes())
+
+
+# --------------------------------------------------------------------------- material / shader readers
+# Each returns a preview dict: {"kind", "info", "tree", "notes", "materials": [material dict],
+# "code": (text, language) or None, "glsl": {"source", "style"} for live-renderable fragment shaders,
+# "images": [(label, RawImage)] for previews stored in the file itself}.
+
+def _mat_from(**kw) -> dict:
+    return {k: v for k, v in kw.items() if v is not None}
+
+
+def _floats(s: str) -> list:
+    return [float(x) for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s or "")]
+
+
+def _col3(s, default=None):
+    f = _floats(s) if isinstance(s, str) else list(s or [])
+    if len(f) >= 3:
+        return (f[0], f[1], f[2])
+    if len(f) == 1:
+        return (f[0],) * 3
+    return default
+
+
+def _tex_node(label: str, path: str, owner: str = "", base: str = "") -> list:
+    full, ok = resolve_scene_path(path, base or path) if path else ("", None)
+    return _bn(label, owner, None, full or path, ok)
+
+
+def _mat_summary_nodes(m: dict) -> list:
+    """Material dict → breakdown rows (values and textures)."""
+    rows = []
+    for key, label in (("base_color", "Base colour"), ("base_weight", "Base weight"), ("metallic", "Metalness"),
+                       ("roughness", "Roughness"), ("specular", "Specular"), ("coat", "Coat"),
+                       ("coat_roughness", "Coat roughness"), ("emission", "Emission"), ("opacity", "Opacity"),
+                       ("transmission", "Transmission")):
+        if key in m:
+            v = m[key]
+            txt = ", ".join(f"{c:.3g}" for c in v) if isinstance(v, (tuple, list)) else f"{v:.3g}"
+            rows.append(_bn(label, txt))
+    for key, label in (("base_color_tex", "Base colour map"), ("metallic_tex", "Metalness map"),
+                       ("roughness_tex", "Roughness map"), ("normal_tex", "Normal map"), ("emission_tex", "Emission map"),
+                       ("opacity_tex", "Opacity map"), ("coat_color_tex", "Coat colour map")):
+        t = m.get(key)
+        if t:
+            p = t if isinstance(t, str) else t[0]
+            extra = "" if isinstance(t, str) else f"channel {t[1]}" + (" inverted" if len(t) > 2 and t[2] else "")
+            ok = os.path.exists(p) if p else None
+            if p and re.search(r"<UDIM>|<UVTILE>", p):
+                ok = bool(glob.glob(re.sub(r"<UDIM>|<UVTILE>", "*", p)))
+            rows.append(_bn(label, extra or os.path.basename(p), None, p, ok))
+    return rows
+
+
+# ---- MaterialX
+_MTLX_MAP = {
+    "standard_surface": {"base": "base_weight", "base_color": "base_color", "metalness": "metallic",
+                         "specular_roughness": "roughness", "specular": "specular", "coat": "coat",
+                         "coat_color": "coat_color", "coat_roughness": "coat_roughness", "emission": "_em_w",
+                         "emission_color": "_em_c", "opacity": "opacity", "transmission": "transmission",
+                         "transmission_color": "_tr_c", "normal": "normal"},
+    "open_pbr_surface": {"base_weight": "base_weight", "base_color": "base_color", "base_metalness": "metallic",
+                         "specular_roughness": "roughness", "specular_weight": "specular", "coat_weight": "coat",
+                         "coat_color": "coat_color", "coat_roughness": "coat_roughness",
+                         "emission_luminance": "_em_w_nits", "emission_color": "_em_c", "geometry_opacity": "opacity",
+                         "transmission_weight": "transmission", "transmission_color": "_tr_c",
+                         "geometry_normal": "normal"},
+    "UsdPreviewSurface": {"diffuseColor": "base_color", "metallic": "metallic", "roughness": "roughness",
+                          "emissiveColor": "emission", "opacity": "opacity", "normal": "normal",
+                          "clearcoat": "coat", "clearcoatRoughness": "coat_roughness"},
+    "gltf_pbr": {"base_color": "base_color", "metallic": "metallic", "roughness": "roughness", "emissive": "_em_c",
+                 "emissive_strength": "_em_w", "alpha": "opacity", "transmission": "transmission",
+                 "clearcoat": "coat", "clearcoat_roughness": "coat_roughness", "normal": "normal"},
+    "disney_principled": {"basecolor": "base_color", "baseColor": "base_color", "metallic": "metallic",
+                          "roughness": "roughness", "clearcoat": "coat", "specular": "specular"},
+}
+
+
+def _mtlx_preview(path: str) -> dict:
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as ex:
+        raise ValueError(f"not readable as MaterialX XML ({ex})")
+    base_dir = os.path.dirname(os.path.abspath(path))
+    nodes: Dict[str, object] = {}
+    prefix_of: Dict[int, str] = {}
+    parent_of: Dict[int, object] = {}
+
+    def walk(el, prefix):
+        pre = el.get("fileprefix", prefix) if el.get("fileprefix") is not None else prefix
+        for ch in el:
+            parent_of[id(ch)] = el
+            prefix_of[id(ch)] = ch.get("fileprefix", pre) if ch.get("fileprefix") is not None else pre
+            if ch.get("name"):
+                nodes.setdefault(ch.get("name"), ch)
+                scoped = (el.get("name") or "") + "/" + ch.get("name")
+                nodes[scoped] = ch
+            walk(ch, prefix_of[id(ch)])
+    prefix_of[id(root)] = root.get("fileprefix", "")
+    walk(root, prefix_of[id(root)])
+    textures: Dict[str, list] = {}
+
+    def images_upstream(node, depth=0, seen=None):
+        """Every image file feeding a node (depth-first, nearest first)."""
+        seen = set() if seen is None else seen
+        if node is None or depth > 12 or id(node) in seen:
+            return []
+        seen.add(id(node))
+        out = []
+        for inp in node.findall("input"):
+            if inp.get("type") == "filename" and inp.get("value"):
+                pre = prefix_of.get(id(inp), "") or prefix_of.get(id(node), "")
+                p = os.path.normpath(os.path.join(base_dir, pre + inp.get("value")))
+                textures.setdefault(p, []).append(node.get("name", ""))
+                out.append(p)
+        for inp in node.findall("input"):
+            up = upstream(inp, node)
+            if up is not None:
+                out += images_upstream(up, depth + 1, seen)
+        return out
+
+    _want = {"normal": r"norm|nrm|_n\.|bump", "roughness": r"rough|gloss", "metallic": r"metal",
+             "base_color": r"col|albedo|diff|base|basecolor", "_em_c": r"emis|emit", "opacity": r"opac|alpha|mask",
+             "coat_color": r"col|albedo|diff"}
+
+    def file_of(node, key=None):
+        """The image a shader input most likely shows: the upstream file whose name fits the input."""
+        files = images_upstream(node)
+        if not files:
+            return None
+        pat = _want.get(key or "")
+        if pat:
+            best = [f for f in files if re.search(pat, os.path.basename(f).lower())]
+            if best:
+                return best[0]
+            if key == "normal":
+                return None                                   # a colour map isn't a normal map
+        return files[0]
+
+    def upstream(inp, owner):
+        if inp.get("nodegraph"):
+            ng = nodes.get(inp.get("nodegraph"))
+            if ng is None:
+                return None
+            outs = ng.findall("output")
+            out = next((o for o in outs if o.get("name") == inp.get("output", "out")), None)
+            if out is None:
+                out = outs[0] if outs else None
+            if out is None:
+                return None
+            hit = nodes.get(f"{ng.get('name')}/{out.get('nodename')}")
+            return hit if hit is not None else nodes.get(out.get("nodename") or "")
+        if inp.get("nodename"):
+            scope = parent_of.get(id(owner))
+            scoped = f"{scope.get('name')}/{inp.get('nodename')}" if scope is not None and scope.get("name") else ""
+            hit = nodes.get(scoped) if scoped else None
+            return hit if hit is not None else nodes.get(inp.get("nodename"))
+        if inp.get("interfacename"):
+            return None
+        return None
+    mats, tree_mats = [], []
+    for sm in root.iter("surfacematerial"):
+        si = next((i for i in sm.findall("input") if i.get("name") == "surfaceshader"), None)
+        sh = upstream(si, sm) if si is not None else None
+        if sh is None:
+            continue
+        kind = sh.tag
+        mp = _MTLX_MAP.get(kind, {})
+        m = {"name": sm.get("name", "")}
+        rows = []
+        em_w, em_c = None, None
+        for inp in sh.findall("input"):
+            nm = inp.get("name")
+            key = mp.get(nm)
+            up = upstream(inp, sh)
+            if up is not None:
+                f = file_of(up, key)
+                rows.append(_bn(nm, f"← {up.get('name')} ({up.tag})", None, f or "", (os.path.exists(f) if f else None)))
+                if f and key:
+                    tk = {"base_color": "base_color_tex", "metallic": "metallic_tex", "roughness": "roughness_tex",
+                          "normal": "normal_tex", "_em_c": "emission_tex", "emission": "emission_tex",
+                          "opacity": "opacity_tex", "coat_color": "coat_color_tex"}.get(key)
+                    if tk:
+                        m[tk] = f
+                        if key == "base_color":
+                            m.setdefault("base_color", (1.0, 1.0, 1.0))
+                continue
+            val = inp.get("value", "")
+            rows.append(_bn(nm, val))
+            if not key or not val:
+                continue
+            if key in ("base_color", "coat_color", "emission"):
+                m[key] = _col3(val, (0.8, 0.8, 0.8))
+            elif key == "_em_c":
+                em_c = _col3(val)
+            elif key == "_tr_c":
+                m["_tr_c"] = _col3(val)
+            elif key == "_em_w":
+                em_w = (_floats(val) or [0])[0]
+            elif key == "_em_w_nits":
+                em_w = (_floats(val) or [0])[0] / 1000.0
+            elif key == "opacity":
+                f = _floats(val)
+                m["opacity"] = sum(f) / len(f) if f else 1.0
+            elif key != "normal":
+                f = _floats(val)
+                if f:
+                    m[key] = f[0]
+        tr_c = m.pop("_tr_c", None)
+        if tr_c and m.get("transmission", 0) > 0 and "base_color_tex" not in m:
+            m["base_color"] = tr_c                              # glass / liquids: show the transmission tint
+        if em_c or em_w:
+            c = em_c or (1.0, 1.0, 1.0)
+            w = 1.0 if em_w is None else em_w
+            m["emission"] = (c[0] * w, c[1] * w, c[2] * w)
+        mats.append(m)
+        tree_mats.append(_bn(m["name"], f"{kind}", [_bn("Inputs", f"{len(rows)}", rows)] + ([_bn("Ball preview uses", "", _mat_summary_nodes(m))]),
+                             f"material:{len(mats) - 1}"))
+    counts: Dict[str, int] = {}
+    for el in root.iter():
+        if el.get("name") and el.tag not in ("input", "output"):
+            counts[el.tag] = counts.get(el.tag, 0) + 1
+    tex_nodes = [_bn(os.path.basename(p), ", ".join(sorted(set(o)))[:80], None, p, os.path.exists(p)) for p, o in sorted(textures.items())]
+    miss = sum(1 for t in tex_nodes if t[4] is False)
+    tree = [_bn("Materials", f"{len(mats)}", tree_mats),
+            _bn("References", f"{len(tex_nodes)} textures" + (f" · {miss} missing" if miss else ""), [_bn("Textures", f"{len(tex_nodes)}", tex_nodes)] if tex_nodes else []),
+            _bn("Nodes", f"{sum(counts.values())}", _bn_counts(counts))]
+    info = [("MaterialX", root.get("version", "?")), ("Materials", f"{len(mats)}")]
+    if root.get("colorspace"):
+        info.append(("Colour space", root.get("colorspace")))
+    return {"kind": "MaterialX document", "info": info, "tree": tree, "notes": [] if mats else
+            ["No surface material in this document (a node definition or test graph): nothing to put on the ball."],
+            "materials": mats, "code": None}
+
+
+# ---- OSL source and compiled .oso
+_RE_OSL_HEAD = re.compile(r"\b(shader|surface|displacement|volume|light)\s+(\w+)\s*(?:\[\[.*?\]\]\s*)?\(", re.S)
+
+
+def _strip_c_comments(src: str) -> str:
+    src = re.sub(r"/\*.*?\*/", lambda m: " " * len(m.group(0)), src, flags=re.S)
+    return re.sub(r"//[^\n]*", "", src)
+
+
+def _osl_params(src: str):
+    """→ (shader type, name, [(output?, type, name, default, metadata)])"""
+    clean = _strip_c_comments(src)
+    m = _RE_OSL_HEAD.search(clean)
+    if not m:
+        return None, None, []
+    i = m.end()
+    depth, j = 1, i
+    while j < len(clean) and depth:
+        depth += {"(": 1, ")": -1}.get(clean[j], 0)
+        j += 1
+    body = clean[i:j - 1]
+    params, cur, d = [], "", 0
+    for ch in body:                                          # split on top-level commas
+        if ch in "([{":
+            d += 1
+        elif ch in ")]}":
+            d -= 1
+        if ch == "," and d == 0:
+            params.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        params.append(cur)
+    out = []
+    for p in params:
+        meta = " ".join(re.findall(r"\[\[(.*?)\]\]", p, re.S))
+        p2 = re.sub(r"\[\[.*?\]\]", "", p, flags=re.S).strip()
+        mm = re.match(r"(output\s+)?(\w+(?:\s*\[\s*\d*\s*\])?)\s+(\w+)\s*(?:\[\s*\d*\s*\])?\s*(?:=\s*(.*))?$", p2, re.S)
+        if mm:
+            out.append((bool(mm.group(1)), mm.group(2), mm.group(3), (mm.group(4) or "").strip(), meta.strip()))
+    return m.group(1), m.group(2), out
+
+
+def _osl_guess_material(params, base: str) -> dict:
+    m = {}
+    for is_out, typ, name, default, meta in params:
+        if is_out:
+            continue
+        low = name.lower()
+        if typ == "color" and "base_color" not in m and re.search(r"^cd$|diffuse|base|albedo|colou?r", low) and "spec" not in low:
+            m["base_color"] = _col3(default, None) or m.get("base_color")
+        elif typ == "float" and re.search(r"rough", low) and "roughness" not in m:
+            f = _floats(default)
+            if f:
+                m["roughness"] = f[0]
+        elif typ == "float" and re.search(r"metal", low):
+            f = _floats(default)
+            if f:
+                m["metallic"] = f[0]
+        elif typ == "string" and re.search(r"tex|file|map|image", low) and default.strip('"'):
+            p = default.strip().strip('"')
+            if p and "base_color_tex" not in m:
+                m["base_color_tex"] = resolve_scene_path(p, base)[0]
+    return {k: v for k, v in m.items() if v is not None}
+
+
+def _osl_preview(path: str) -> dict:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        src = f.read()
+    if path.lower().endswith(".oso"):
+        return _oso_preview(path, src)
+    stype, name, params = _osl_params(src)
+    def _meta(meta):
+        h = re.search(r'string\s+help\s*=\s*"([^"]*)"', meta)
+        return " ".join((h.group(1) if h else meta).split())[:90]
+    rows = [_bn(nm, f"{'output ' if o else ''}{t}" + (f" = {' '.join(d.split())}" if d else "") + (f"  · {_meta(meta)}" if meta else ""))
+            for o, t, nm, d, meta in params]
+    incs = re.findall(r'#include\s+[<"]([^>"]+)[>"]', src)
+    m = _osl_guess_material(params, path)
+    tree = [_bn("Parameters", f"{len(params)}", rows)]
+    if incs:
+        tree.append(_bn("Includes", f"{len(incs)}", [_bn(i) for i in incs]))
+    closures = sorted(set(re.findall(r"\b(diffuse|oren_nayar|phong|ward|microfacet\w*|reflection|refraction|transparent|emission|background|translucent|subsurface|holdout|debug|principled\w*|conductor_bsdf|dielectric_bsdf|generalized_schlick_bsdf|sheen_bsdf|burley_diffuse_bsdf|oren_nayar_diffuse_bsdf)\s*\(", src)))
+    if closures:
+        tree.append(_bn("Closures used", f"{len(closures)}", [_bn(c) for c in closures]))
+    notes = ["The ball is a guess from the parameter defaults (colour / roughness / metal / texture names); "
+             "OSL itself isn't executed."] if m else []
+    return {"kind": f"OSL {stype or 'shader'}", "info": [("Shader", name or "?"), ("Type", stype or "?"),
+                                                           ("Parameters", f"{len(params)}")],
+            "tree": tree, "notes": notes, "materials": [m] if m else [], "code": (src, "c")}
+
+
+def _oso_preview(path: str, src: str) -> dict:
+    params, stype, name, ver = [], "", "", ""
+    for line in src.splitlines():
+        parts = line.split("\t") if "\t" in line else line.split()
+        if not parts:
+            continue
+        if parts[0] == "OpenShadingLanguage":
+            ver = parts[1] if len(parts) > 1 else ""
+        elif parts[0] in ("shader", "surface", "displacement", "volume", "light"):
+            stype, name = parts[0], parts[1] if len(parts) > 1 else ""
+        elif parts[0] in ("param", "oparam") and len(parts) >= 3:
+            vals = [p for p in parts[3:] if p and not p.startswith("%")]
+            params.append((parts[0] == "oparam", parts[1], parts[2], " ".join(vals[:4]), ""))
+        elif parts[0] == "code":
+            break
+    rows = [_bn(nm, f"{'output ' if o else ''}{t}" + (f" = {d}" if d else "")) for o, t, nm, d, _ in params]
+    m = _osl_guess_material(params, path)
+    return {"kind": f"Compiled OSL {stype or 'shader'}", "info": [("Shader", name), ("OSL", ver), ("Parameters", f"{len(params)}")],
+            "tree": [_bn("Parameters", f"{len(params)}", rows)], "notes": [], "materials": [m] if m else [], "code": (src, "c")}
+
+
+# ---- GLSL / HLSL source
+_GLSL_EXTS = (".glsl", ".frag", ".fs", ".fsh", ".vert", ".vs", ".vsh", ".geom", ".gs", ".comp", ".tesc", ".tese", ".shader_glsl")
+_HLSL_EXTS = (".hlsl", ".fx", ".fxh", ".hlsli", ".cg", ".cginc", ".usf", ".ush", ".ps", ".compute")
+
+
+def glsl_style(src: str) -> str:
+    """'shadertoy' (mainImage), 'sandbox' (main + gl_FragColor / out vec4 with time/resolution uniforms),
+    or '' when the source isn't a stand-alone fragment shader."""
+    clean = _strip_c_comments(src)
+    if re.search(r"\bvoid\s+mainImage\s*\(\s*out\s+vec4", clean):
+        return "shadertoy"
+    if re.search(r"\bvoid\s+main\s*\(", clean) and (("gl_FragColor" in clean) or re.search(r"\bout\s+vec4\s+\w+\s*;", clean)) \
+            and "gl_Position" not in clean and "layout(local_size" not in clean.replace(" ", ""):
+        return "sandbox"
+    return ""
+
+
+def _shader_source_preview(path: str) -> dict:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        src = f.read(4 << 20)
+    ext = os.path.splitext(path)[1].lower()
+    clean = _strip_c_comments(src)
+    hlsl = ext in _HLSL_EXTS or bool(re.search(r"\b(cbuffer|SV_Target|Texture2D|SamplerState|float4x4)\b", clean))
+    tree, info = [], []
+    unis = re.findall(r"\buniform\s+(?:(?:lowp|mediump|highp)\s+)?(\w+)\s+(\w+)\s*(\[[^\]]*\])?\s*(?:=\s*([^;]+))?;", clean)
+    if unis:
+        tree.append(_bn("Uniforms", f"{len(unis)}", [_bn(n + (a or ""), t + (f" = {d.strip()}" if d else "")) for t, n, a, d in unis]))
+    ins = re.findall(r"\b(?:in|varying|attribute)\s+(?:(?:flat|smooth|noperspective|lowp|mediump|highp)\s+)*(\w+)\s+(\w+)\s*;", clean)
+    if ins:
+        tree.append(_bn("Inputs", f"{len(ins)}", [_bn(n, t) for t, n in ins]))
+    if hlsl:
+        cbs = re.findall(r"\bcbuffer\s+(\w+)", clean)
+        texs = re.findall(r"\b(Texture\w*|TextureCube\w*|sampler\w*|SamplerState)\s+(\w+)", clean)
+        if cbs:
+            tree.append(_bn("Constant buffers", f"{len(cbs)}", [_bn(c) for c in cbs]))
+        if texs:
+            tree.append(_bn("Textures & samplers", f"{len(texs)}", [_bn(n, t) for t, n in texs]))
+    funcs = re.findall(r"^\s*(?:\w+\s+)+?(\w+)\s*\([^;{}]*\)\s*\{", clean, re.M)
+    funcs = [f for f in funcs if f not in ("if", "for", "while", "switch")]
+    if funcs:
+        tree.append(_bn("Functions", f"{len(funcs)}", [_bn(f) for f in funcs]))
+    incs = re.findall(r'#\s*include\s+[<"]([^>"]+)[>"]', src)
+    if incs:
+        nodes = []
+        for i in incs:
+            full = os.path.normpath(os.path.join(os.path.dirname(path), i))
+            nodes.append(_bn(os.path.basename(i), i, None, full, os.path.exists(full)))
+        tree.append(_bn("References", f"{len(incs)} includes", nodes))
+    ver = re.search(r"#version\s+(\d+(?:\s+es)?)", src)
+    if ver:
+        info.append(("GLSL", ver.group(1)))
+    style = "" if hlsl else glsl_style(src)
+    kind = ("HLSL" if hlsl else "GLSL") + " shader"
+    if style:
+        info.append(("Runs live", "Shadertoy style" if style == "shadertoy" else "fragment shader"))
+    elif not hlsl:
+        stage = {".vert": "vertex", ".vs": "vertex", ".vsh": "vertex", ".geom": "geometry", ".gs": "geometry",
+                 ".comp": "compute", ".tesc": "tessellation control", ".tese": "tessellation evaluation"}.get(ext)
+        if stage:
+            info.append(("Stage", stage))
+    notes = []
+    if hlsl:
+        notes.append("HLSL is shown as source; only GLSL fragment shaders can run live here.")
+    return {"kind": kind, "info": info, "tree": tree, "notes": notes, "materials": [], "code": (src, "glsl" if not hlsl else "c"),
+            "glsl": {"source": src, "style": style} if style else None}
+
+
+# ---- Unity: .mat (material), .shader (ShaderLab), .shadergraph
+def _unity_mat_preview(path: str) -> dict:
+    root = unity_project_root(path)
+    guids, _ = unity_guid_index(root) if root else ({}, False)
+    text = open(path, "r", encoding="utf-8", errors="replace").read()
+
+    def asset(g):
+        return _UNITY_BUILTIN_GUIDS.get(g) or guids.get(g, "")
+    name = (re.search(r"^[ \t]*m_Name:[ \t]*(.*)$", text, re.M) or [None, ""])[1].strip() or os.path.splitext(os.path.basename(path))[0]
+    sh = re.search(r"m_Shader:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*([0-9a-f]{32}))?", text)
+    shader = ""
+    if sh:
+        g = sh.group(2) or ""
+        if g in _UNITY_BUILTIN_GUIDS:
+            shader = {"46": "Standard", "45": "Standard (Specular setup)", "7": "Legacy/Diffuse", "10703": "Sprites/Default",
+                      "10750": "Unlit/Texture", "10720": "UI/Default"}.get(sh.group(1), f"built-in shader {sh.group(1)}")
+        elif g:
+            sp = guids.get(g, "")
+            shader = os.path.basename(sp) if sp else f"shader {g[:8]}… (in a package that isn't installed here)"
+    texs, floats, cols = {}, {}, {}
+    sec = None
+    cur = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s in ("m_TexEnvs:", "m_Floats:", "m_Colors:", "m_Ints:"):
+            sec = s[:-1]
+            continue
+        if sec and re.match(r"^\s{4}\w", line) and not s.startswith("-"):
+            sec = None
+        if sec == "m_TexEnvs":
+            mm = re.match(r"-\s*(\w+):\s*$", s)
+            if mm:
+                cur = mm.group(1)
+                continue
+            mm = re.match(r"m_Texture:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*([0-9a-f]{32}))?", s)
+            if mm and cur and mm.group(2):
+                texs[cur] = asset(mm.group(2)) or f"missing GUID {mm.group(2)}"
+            mm = re.match(r"m_Scale:\s*\{x:\s*([-\d.e]+),\s*y:\s*([-\d.e]+)", s)
+            if mm and cur in texs:
+                texs[cur + "@scale"] = (float(mm.group(1)), float(mm.group(2)))
+        elif sec in ("m_Floats", "m_Ints"):
+            mm = re.match(r"-\s*(\w+):\s*([-\d.eE]+)", s)
+            if mm:
+                floats[mm.group(1)] = float(mm.group(2))
+        elif sec == "m_Colors":
+            mm = re.match(r"-\s*(\w+):\s*\{r:\s*([-\d.eE]+),\s*g:\s*([-\d.eE]+),\s*b:\s*([-\d.eE]+),\s*a:\s*([-\d.eE]+)", s)
+            if mm:
+                cols[mm.group(1)] = tuple(float(mm.group(i)) for i in range(2, 6))
+
+    def full(rel):
+        return os.path.join(root, rel) if root and rel and not rel.startswith(("Unity ", "missing")) else rel
+
+    def usable(rel):
+        return bool(rel) and not rel.startswith(("Unity ", "missing"))
+    m = {"name": name}
+    c = cols.get("_BaseColor") or cols.get("_Color")
+    if c:
+        m["base_color"] = tuple(_lin1(v) for v in c[:3])
+        if c[3] < 0.999 and (floats.get("_Surface", 0) == 1 or floats.get("_Mode", 0) in (2, 3)):
+            m["opacity"] = c[3]
+    t = texs.get("_BaseMap") or texs.get("_MainTex") or texs.get("_BaseColorMap")
+    if usable(t):
+        m["base_color_tex"] = full(t)
+        sc = texs.get(("_BaseMap" if "_BaseMap" in texs else "_MainTex") + "@scale")
+        if sc:
+            m["tiling"] = sc
+    if "_Metallic" in floats:
+        m["metallic"] = floats["_Metallic"]
+    sm = floats.get("_Smoothness", floats.get("_Glossiness"))
+    if sm is not None:
+        m["roughness"] = 1 - sm
+    mg = texs.get("_MetallicGlossMap") or texs.get("_MaskMap")
+    if usable(mg):
+        m["metallic_tex"] = (full(mg), "r", False)
+        m["roughness_tex"] = (full(mg), "a", True)
+        m["metallic"] = 1.0
+    nm = texs.get("_BumpMap") or texs.get("_NormalMap")
+    if usable(nm):
+        m["normal_tex"] = full(nm)
+    ec = cols.get("_EmissionColor")
+    kw = " ".join(re.findall(r"^[ \t]*m_(?:ShaderKeywords|ValidKeywords):[ \t]*(.*)$", text, re.M))
+    kw += " " + " ".join(re.findall(r"^[ \t]*-[ \t]*(_EMISSION)\b", text, re.M))
+    if ec and any(v > 0.001 for v in ec[:3]) and ("_EMISSION" in kw or floats.get("_EmissionEnabled") == 1):
+        m["emission"] = ec[:3]
+    em = texs.get("_EmissionMap")
+    if usable(em) and "emission" in m:
+        m["emission_tex"] = full(em)
+    tex_rows = []
+    for k, v in sorted(texs.items()):
+        if k.endswith("@scale"):
+            continue
+        p = full(v)
+        tex_rows.append(_bn(k, os.path.basename(v), None, p if not v.startswith(("Unity ", "missing")) else "",
+                            os.path.exists(p) if not v.startswith(("Unity ", "missing")) else (False if v.startswith("missing") else None)))
+    miss = sum(1 for r in tex_rows if r[4] is False)
+    tree = [_bn("Shader", shader or "?"),
+            _bn("References", f"{len(tex_rows)} textures" + (f" · {miss} missing" if miss else ""), [_bn("Textures", f"{len(tex_rows)}", tex_rows)] if tex_rows else []),
+            _bn("Colours", f"{len(cols)}", [_bn(k, ", ".join(f"{x:.3g}" for x in v)) for k, v in sorted(cols.items())]),
+            _bn("Floats", f"{len(floats)}", [_bn(k, f"{v:g}") for k, v in sorted(floats.items())]),
+            _bn("Ball preview uses", "", _mat_summary_nodes(m))]
+    return {"kind": "Unity material", "info": [("Unity", unity_version(root) or "?"), ("Shader", shader or "?")],
+            "tree": tree, "notes": [] if root else ["No Unity project found above this file: texture GUIDs can't be resolved."],
+            "materials": [m], "code": None}
+
+
+def _shaderlab_preview(path: str) -> dict:
+    src = open(path, "r", encoding="utf-8", errors="replace").read()
+    clean = _strip_c_comments(src)
+    name = (re.search(r'Shader\s+"([^"]+)"', clean) or [None, "?"])[1]
+    props = re.findall(r'(\[[^\]]*\]\s*)*(\w+)\s*\(\s*"([^"]*)"\s*,\s*([\w]+(?:\s*\([^)]*\))?)\s*\)\s*=\s*([^\n]+)', clean)
+    rows = [_bn(n, f"{t} = {d.strip()}" + (f"  · {lab}" if lab and lab != n else "")) for _, n, lab, t, d in props]
+    subs = len(re.findall(r"\bSubShader\b", clean))
+    passes = re.findall(r"\bPass\s*\{(?:[^{}]|\{[^{}]*\})*?Name\s+\"([^\"]+)\"", clean)
+    pragmas = sorted(set(re.findall(r"#pragma\s+(\w+\s*\w*)", clean)))
+    tags = sorted(set(re.findall(r'"RenderPipeline"\s*=\s*"(\w+)"', clean)))
+    m = {}
+    for _, n, lab, t, d in props:
+        if n in ("_Color", "_BaseColor") and t.startswith("Color"):
+            c = _col3(d)
+            if c:
+                m["base_color"] = tuple(_lin1(v) for v in c)
+        elif n == "_Metallic":
+            f = _floats(d)
+            m["metallic"] = f[0] if f else 0
+        elif n in ("_Glossiness", "_Smoothness"):
+            f = _floats(d)
+            if f:
+                m["roughness"] = 1 - f[0]
+    tree = [_bn("Properties", f"{len(rows)}", rows), _bn("Sub-shaders", f"{subs}"),
+            _bn("Named passes", f"{len(passes)}", [_bn(p) for p in passes])]
+    if pragmas:
+        tree.append(_bn("Pragmas", f"{len(pragmas)}", [_bn(p) for p in pragmas]))
+    incs = re.findall(r'#include\s+"([^"]+)"', src)
+    if incs:
+        tree.append(_bn("Includes", f"{len(incs)}", [_bn(os.path.basename(i), i) for i in incs]))
+    info = [("Shader", name), ("Properties", f"{len(rows)}")]
+    if tags:
+        info.append(("Pipeline", ", ".join(tags)))
+    return {"kind": "Unity shader (ShaderLab)", "info": info, "tree": tree, "notes": [],
+            "materials": [m] if m else [], "code": (src, "c")}
+
+
+def _shadergraph_preview(path: str) -> dict:
+    raw = open(path, "r", encoding="utf-8", errors="replace").read()
+    objs = []
+    dec = json.JSONDecoder()
+    i = 0
+    while i < len(raw):
+        while i < len(raw) and raw[i] in " \r\n\t":
+            i += 1
+        if i >= len(raw):
+            break
+        try:
+            o, j = dec.raw_decode(raw, i)
+        except ValueError:
+            break
+        objs.append(o)
+        i = j
+    props, node_types, targets = [], {}, []
+    for o in objs:
+        t = o.get("m_Type", "")
+        if t.endswith("ShaderProperty"):
+            props.append((o.get("m_Name", "?"), t.split(".")[-1].replace("ShaderProperty", ""), o.get("m_Value")))
+        elif t.endswith("Node") or ".Nodes." in t:
+            nt = t.split(".")[-1]
+            node_types[nt] = node_types.get(nt, 0) + 1
+        elif "Target" in t and "SubTarget" not in t:
+            targets.append(t.split(".")[-1])
+        for sp in o.get("m_SerializedProperties", []):                      # pre-2020 graphs
+            try:
+                d = json.loads(sp.get("JSONnodeData", "{}"))
+                props.append((d.get("m_Name", "?"), sp.get("typeInfo", {}).get("fullName", "").split(".")[-1].replace("ShaderProperty", ""), d.get("m_Value")))
+            except ValueError:
+                pass
+        for sn in o.get("m_SerializableNodes", []):
+            nt = sn.get("typeInfo", {}).get("fullName", "?").split(".")[-1]
+            node_types[nt] = node_types.get(nt, 0) + 1
+
+    def fmt(v):
+        if isinstance(v, dict):
+            if "r" in v:
+                return ", ".join(f"{v.get(k, 0):.3g}" for k in "rgba")
+            if "x" in v:
+                return ", ".join(f"{v.get(k, 0):.3g}" for k in "xyzw" if k in v)
+            if "m_SerializedTexture" in v or "m_SerializedTexture" in json.dumps(v):
+                return "texture"
+            return ""
+        return f"{v}" if v is not None else ""
+    tree = [_bn("Properties", f"{len(props)}", [_bn(n, f"{t}" + (f" = {fmt(v)}" if fmt(v) else "")) for n, t, v in props]),
+            _bn("Nodes", f"{sum(node_types.values())}", _bn_counts(node_types))]
+    if targets:
+        tree.append(_bn("Targets", "", [_bn(t) for t in targets]))
+    return {"kind": "Unity Shader Graph", "info": [("Properties", f"{len(props)}"), ("Nodes", f"{sum(node_types.values())}")]
+            + ([("Targets", ", ".join(targets))] if targets else []), "tree": tree, "notes": [], "materials": [], "code": None}
+
+
+# --------------------------------------------------------------------------- IES photometric files (IESNA LM-63)
+class IESProfile:
+    """Candela table of an .ies file: vertical angles (0 = straight down), horizontal angles, candela[h][v]
+    (multiplier and ballast factor applied), keywords, lumens, watts and the luminous-opening size."""
+
+    def __init__(self, path: str):
+        with open(path, "r", encoding="latin-1", errors="replace") as f:
+            text = f.read()
+        lines = text.splitlines()
+        self.header = lines[0].strip() if lines else ""
+        self.keywords: Dict[str, str] = {}
+        i = 0
+        last = None
+        while i < len(lines):
+            ln = lines[i].strip()
+            if ln.upper().startswith("TILT"):
+                break
+            m = re.match(r"\[(\w+)\]\s*(.*)", ln)
+            if m:
+                k = m.group(1).upper()
+                if k == "MORE" and last:
+                    self.keywords[last] += " " + m.group(2).strip()
+                else:
+                    self.keywords[k] = (self.keywords.get(k, "") + " " + m.group(2).strip()).strip()
+                    last = k
+            i += 1
+        if i >= len(lines):
+            raise ValueError("no TILT line: not an IES file")
+        tilt = lines[i].split("=", 1)[1].strip().upper() if "=" in lines[i] else "NONE"
+        nums = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", " ".join(lines[i + 1:]))]
+        p = 0
+        if tilt == "INCLUDE":
+            p += 1                                              # lamp-to-luminaire geometry
+            n = int(nums[p])
+            p += 1 + 2 * n                                      # angles + multiplying factors
+        self.tilt = tilt
+        (self.n_lamps, self.lumens_per_lamp, mult, nv, nh, self.photometric_type, self.units,
+         self.width, self.length, self.height) = nums[p:p + 10]
+        p += 10
+        ballast, _, self.watts = nums[p:p + 3]
+        p += 3
+        nv, nh = int(nv), int(nh)
+        if not (0 < nv < 2000 and 0 < nh < 2000):
+            raise ValueError("implausible angle counts")
+        self.v = np.array(nums[p:p + nv], np.float64)
+        p += nv
+        self.h = np.array(nums[p:p + nh], np.float64)
+        p += nh
+        cd = np.array(nums[p:p + nv * nh], np.float64)
+        if len(cd) < nv * nh:
+            raise ValueError("candela table is truncated")
+        self.cd = cd.reshape(nh, nv) * mult * (ballast or 1.0)
+        self.multiplier = mult
+
+    # ---- lookups
+    def candela(self, vert, horiz):
+        """Bilinear candela for arrays of vertical (0..180, 0 = down) and horizontal (0..360) angles, with the
+        file's symmetry expanded (single plane, quadrant 0–90, bilateral 0–180, full 0–360)."""
+        h = np.mod(horiz, 360.0)
+        hmax = self.h[-1]
+        if len(self.h) == 1:
+            h = np.zeros_like(h)
+        elif hmax <= 90.0 + 1e-6:
+            h = np.where(h > 180, 360 - h, h)
+            h = np.where(h > 90, 180 - h, h)
+        elif hmax <= 180.0 + 1e-6:
+            h = np.where(h > 180, 360 - h, h)
+        if self.h[0] >= 90.0 - 1e-6 and hmax <= 270 + 1e-6 and len(self.h) > 1:       # 90–270 (type B/C variants)
+            h = np.clip(h, self.h[0], hmax)
+        v = np.clip(vert, self.v[0], self.v[-1])
+        vi = np.clip(np.searchsorted(self.v, v) - 1, 0, len(self.v) - 2) if len(self.v) > 1 else np.zeros_like(v, int)
+        if len(self.v) > 1:
+            v0, v1 = self.v[vi], self.v[vi + 1]
+            fv = np.where(v1 > v0, (v - v0) / np.maximum(v1 - v0, 1e-9), 0.0)
+        else:
+            fv = np.zeros_like(v)
+        out_v = np.clip(vert, 0, 180)
+        outside = (out_v < self.v[0]) | (out_v > self.v[-1])
+        if len(self.h) > 1:
+            hi = np.clip(np.searchsorted(self.h, h) - 1, 0, len(self.h) - 2)
+            h0, h1 = self.h[hi], self.h[hi + 1]
+            fh = np.where(h1 > h0, (h - h0) / np.maximum(h1 - h0, 1e-9), 0.0)
+        else:
+            hi = np.zeros_like(v, int)
+            fh = np.zeros_like(v)
+        c = self.cd
+        if len(self.v) > 1:
+            a = c[hi, vi] * (1 - fv) + c[hi, vi + 1] * fv
+            b = c[np.minimum(hi + 1, len(self.h) - 1), vi] * (1 - fv) + c[np.minimum(hi + 1, len(self.h) - 1), vi + 1] * fv
+        else:
+            a = c[hi, 0]
+            b = c[np.minimum(hi + 1, len(self.h) - 1), 0]
+        val = a * (1 - fh) + b * fh
+        return np.where(outside, 0.0, val)
+
+    def summary(self) -> dict:
+        peak = float(self.cd.max()) if self.cd.size else 0.0
+        # beam (50 %) and field (10 %) angles in the C0 plane, as full cone angles
+        prof = self.cd[0]
+        beam = field = None
+        if peak > 0 and len(self.v) > 1 and self.v[0] <= 0.5:
+            down = self.v <= 90.0
+            pk = prof[down].max() if down.any() else 0
+            for frac, name in ((0.5, "beam"), (0.1, "field")):
+                idx = np.nonzero((prof < frac * pk) & down)[0]
+                if len(idx) and pk > 0 and prof[0] >= 0.5 * pk:   # only for lights whose peak points down
+                    ang = 2 * float(self.v[idx[0]])
+                    if name == "beam":
+                        beam = ang
+                    else:
+                        field = ang
+        # luminous flux of the table (sum of candela × solid angle), for files that state -1 lumens
+        vv = np.radians(np.clip(self.v, 0, 180))
+        dv = np.gradient(vv) if len(vv) > 1 else np.array([math.pi])
+        if len(self.h) > 1:
+            span = np.radians(self.h[-1] - self.h[0])
+            rep = 2 * math.pi / max(span, 1e-6) if span > 0 else 1.0
+        else:
+            rep = 1.0
+        mean_cd = self.cd.mean(axis=0)
+        flux = float((mean_cd * np.sin(vv) * dv).sum() * 2 * math.pi) if len(vv) > 1 else 0.0
+        return {"peak": peak, "beam": beam, "field": field, "flux": flux,
+                "symmetry": ("rotationally symmetric" if len(self.h) == 1 else
+                             "quadrant symmetric" if self.h[-1] <= 90 else
+                             "bilateral" if self.h[-1] <= 180 else "full 360°")}
+
+
+def _ies_wall(prof: IESProfile, size: int = 300):
+    """Light hitting a wall: a fixture 0.25 units in front of the wall near the top, aimed down."""
+    S = size
+    ys, xs = np.mgrid[0:S, 0:S].astype(np.float64)
+    wx = (xs + 0.5) / S * 4 - 2                                  # wall 4 × 4 units
+    wy = 0.6 - (ys + 0.5) / S * 4
+    d = 0.35
+    vx, vy, vz = wx, wy, np.full_like(wx, -d)                   # light at origin, wall plane z = -d
+    r2 = vx * vx + vy * vy + vz * vz
+    r = np.sqrt(r2)
+    vert = np.degrees(np.arccos(np.clip(-vy / r, -1, 1)))         # 0 = straight down
+    horiz = np.degrees(np.arctan2(vz, vx)) % 360                  # C-plane around the vertical axis
+    cd = prof.candela(vert, horiz)
+    e = cd * (d / r) / r2                                         # cosine law on the wall / inverse square
+    e = e / max(float(np.percentile(e, 99.7)), 1e-9)
+    t = 1 - np.exp(-2.2 * e)
+    warm = np.array([1.0, 0.86, 0.66])
+    base = np.array([0.045, 0.045, 0.05])
+    img = base + t[..., None] * warm * 0.95
+    floor = (wy < -3.0)
+    img[floor] *= 0.6
+    srgb = np.where(img <= 0.0031308, img * 12.92, 1.055 * np.power(np.clip(img, 0, 1), 1 / 2.4) - 0.055)
+    return (np.clip(srgb, 0, 1) * 255 + 0.5).astype(np.uint8)
+
+
+def _draw_line(img, x0, y0, x1, y1, col, width=1.2):
+    """Anti-aliased polyline segment on an H×W×3 float image (distance-based coverage)."""
+    h, w = img.shape[:2]
+    xa, xb = int(max(0, min(x0, x1) - width - 1)), int(min(w - 1, max(x0, x1) + width + 1))
+    ya, yb = int(max(0, min(y0, y1) - width - 1)), int(min(h - 1, max(y0, y1) + width + 1))
+    if xb < xa or yb < ya:
+        return
+    ys, xs = np.mgrid[ya:yb + 1, xa:xb + 1].astype(np.float64)
+    dx, dy = x1 - x0, y1 - y0
+    L2 = dx * dx + dy * dy
+    t = np.clip(((xs - x0) * dx + (ys - y0) * dy) / L2, 0, 1) if L2 > 0 else np.zeros_like(xs)
+    dist = np.hypot(xs - (x0 + t * dx), ys - (y0 + t * dy))
+    a = np.clip(width / 2 + 0.5 - dist, 0, 1)[..., None]
+    img[ya:yb + 1, xa:xb + 1] = img[ya:yb + 1, xa:xb + 1] * (1 - a) + np.array(col) * a
+
+
+def _ies_polar(prof: IESProfile, size: int = 300):
+    """Polar candela diagram: C0–C180 plane (orange) and C90–C270 plane (blue), down = 0°."""
+    S = size
+    img = np.empty((S, S, 3), np.float64)
+    img[:] = (0.075, 0.075, 0.085)
+    cx, cy, R = S / 2, S / 2, S * 0.44
+    grid = (0.22, 0.22, 0.25)
+    for k in (0.25, 0.5, 0.75, 1.0):                             # rings
+        n = 96
+        for i in range(n):
+            a0, a1 = 2 * math.pi * i / n, 2 * math.pi * (i + 1) / n
+            _draw_line(img, cx + R * k * math.cos(a0), cy + R * k * math.sin(a0), cx + R * k * math.cos(a1), cy + R * k * math.sin(a1), grid, 1.0)
+    for deg in range(0, 360, 30):                                # spokes
+        a = math.radians(deg)
+        _draw_line(img, cx, cy, cx + R * math.cos(a), cy + R * math.sin(a), grid, 1.0)
+    peak = max(float(prof.cd.max()), 1e-9)
+    angles = np.linspace(0, 180, 181)
+    for h_left, h_right, col in ((180, 0, (1.0, 0.62, 0.25)), (270, 90, (0.35, 0.65, 1.0))):
+        for side, hh in ((1, h_right), (-1, h_left)):
+            cd = prof.candela(angles, np.full_like(angles, hh)) / peak
+            pts = [(cx + side * R * c * math.sin(math.radians(a)), cy + R * c * math.cos(math.radians(a))) for a, c in zip(angles, cd)]
+            for (x0, y0), (x1, y1) in zip(pts[:-1], pts[1:]):
+                _draw_line(img, x0, y0, x1, y1, col, 1.8)
+    return (np.clip(img, 0, 1) * 255 + 0.5).astype(np.uint8)
+
+
+def ies_preview(path: str) -> dict:
+    prof = IESProfile(path)
+    s = prof.summary()
+    wall = _ies_wall(prof, 300)
+    polar = _ies_polar(prof, 300)
+    gap = np.full((300, 8, 3), 30, np.uint8)
+    both = np.concatenate([wall, gap, polar], 1)
+    img = RawImage(both.shape[1], both.shape[0], np.ascontiguousarray(both).tobytes())
+    kw = prof.keywords
+    lumens = prof.lumens_per_lamp * prof.n_lamps
+    info = [("Standard", prof.header[:40])]
+    for k, label in (("MANUFAC", "Manufacturer"), ("LUMCAT", "Catalogue no."), ("LUMINAIRE", "Luminaire"), ("LAMP", "Lamp"),
+                     ("LAMPCAT", "Lamp catalogue")):
+        if kw.get(k):
+            info.append((label, kw[k][:80]))
+    info.append(("Lumens", f"{lumens:,.0f}" if lumens > 0 else f"absolute photometry (≈{s['flux']:,.0f} lm from the table)"))
+    if prof.watts:
+        info.append(("Input power", f"{prof.watts:g} W" + (f" · {lumens / prof.watts:.0f} lm/W" if lumens > 0 and prof.watts else "")))
+    info.append(("Peak intensity", f"{s['peak']:,.0f} cd"))
+    if s["beam"]:
+        info.append(("Beam / field angle", f"{s['beam']:.0f}° / {s['field']:.0f}°" if s["field"] else f"{s['beam']:.0f}°"))
+    info.append(("Distribution", s["symmetry"] + {1: " · type C", 2: " · type B", 3: " · type A"}.get(int(prof.photometric_type), "")))
+    tree = [_bn("Keywords", f"{len(kw)}", [_bn(k, v) for k, v in kw.items()]),
+            _bn("Photometry", "", [_bn("Vertical angles", f"{len(prof.v)} · {prof.v[0]:g}° – {prof.v[-1]:g}°"),
+                                   _bn("Horizontal angles", f"{len(prof.h)} · {prof.h[0]:g}° – {prof.h[-1]:g}°"),
+                                   _bn("Candela multiplier", f"{prof.multiplier:g}"),
+                                   _bn("Luminous opening", f"{prof.width:g} × {prof.length:g} × {prof.height:g} {'ft' if int(prof.units) == 1 else 'm'}"),
+                                   _bn("Tilt", prof.tilt)])]
+    return {"kind": "IES light profile", "info": info, "tree": tree,
+            "notes": ["Left: the light on a wall from a fixture just in front of it. Right: candela in the C0–C180 (orange) and C90–C270 (blue) planes, 0° pointing down."],
+            "images": [("Light pattern · polar diagram", img)], "materials": [], "code": None}
+
+
+# --------------------------------------------------------------------------- image bytes, dispatch
+def decode_image_bytes(data: bytes) -> Optional["RawImage"]:
+    """PNG / JPEG bytes (thumbnails stored inside files) → RawImage."""
+    if not data:
+        return None
+    try:
+        loader = GdkPixbuf.PixbufLoader()
+        loader.write(data)
+        loader.close()
+        pb = loader.get_pixbuf()
+        w, h, n, rs = pb.get_width(), pb.get_height(), pb.get_n_channels(), pb.get_rowstride()
+        buf = np.frombuffer(pb.get_pixels(), np.uint8)
+        a = np.lib.stride_tricks.as_strided(buf, (h, w, n), (rs, n, 1))
+        rgb = a[..., :3].astype(np.float32)
+        if n == 4:                                            # over the preview's dark backdrop
+            al = a[..., 3:4].astype(np.float32) / 255.0
+            rgb = rgb * al + 42.0 * (1 - al)
+        return RawImage(w, h, np.ascontiguousarray(rgb.astype(np.uint8)).tobytes())
+    except Exception:
+        try:
+            from PIL import Image as _PILImage
+            im = _PILImage.open(io.BytesIO(data)).convert("RGB")
+            return RawImage(im.width, im.height, im.tobytes())
+        except Exception:
+            return None
+
+
+SHADER_PREVIEW_EXTS = {".mtlx": "materialx", ".osl": "osl", ".oso": "osl", ".shader": "unity-shader",
+                       ".shadergraph": "unity-graph", ".shadersubgraph": "unity-graph", ".mat": "unity-mat", ".ies": "ies"}
+SHADER_PREVIEW_EXTS.update({e: "source" for e in _GLSL_EXTS + _HLSL_EXTS})
+
+
+def shader_preview_kind(path: str) -> str:
+    """What the shader / material / light-profile preview would show for this file ('' = not ours)."""
+    ext = os.path.splitext(path)[1].lower()
+    k = SHADER_PREVIEW_EXTS.get(ext, "")
+    if k in ("unity-mat", "unity-shader", "ies", "source"):
+        try:
+            with open(path, "rb") as f:
+                head = f.read(4096)
+        except OSError:
+            return ""
+        if k == "unity-mat" and not head.startswith(b"%YAML"):
+            return ""                                         # MATLAB .mat and friends
+        if k == "unity-shader" and b"Shader" not in head:
+            return ""
+        if k == "ies" and b"TILT" not in head.upper() and not head.upper().startswith(b"IESNA"):
+            return ""
+        if k == "source" and (b"\0" in head or head.lstrip().startswith(b"%!")):
+            return ""                                         # compiled blobs, PostScript (.ps)
+        if k == "source" and not re.search(rb"\b(?:[biud]?vec[234]|mat[234]|float[234]|half[234]|fixed[234]|uniform|gl_\w+|SV_\w+|cbuffer|"
+                                           rb"Texture2D|sampler\w*|layout\s*\()|#\s*(?:version|pragma|include|define)", head):
+            return ""                                         # F# (.fs), Apps Script (.gs)… that only share the extension
+    return k
+
+
+def shader_preview(path: str) -> dict:
+    """Worker entry point: breakdown + material ball / light pattern / code / live GLSL for one file."""
+    t0 = time.monotonic()
+    k = shader_preview_kind(path)
+    fn = {"materialx": _mtlx_preview, "osl": _osl_preview, "unity-shader": _shaderlab_preview,
+          "unity-graph": _shadergraph_preview, "unity-mat": _unity_mat_preview, "ies": ies_preview,
+          "source": _shader_source_preview}.get(k)
+    if fn is None:
+        return {"error": "not a shader or material file Kestrel can read"}
+    try:
+        res = fn(path)
+    except Exception as ex:
+        return {"error": f"{type(ex).__name__}: {ex}"}
+    res.setdefault("images", [])
+    if not res.get("code") and k in ("materialx", "unity-mat", "unity-graph", "ies"):
+        try:
+            if os.path.getsize(path) <= (2 << 20):
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    res["code"] = (f.read(), {"materialx": "xml", "unity-mat": "yaml", "unity-graph": "json"}.get(k, ""))
+        except OSError:
+            pass
+    if res.get("materials") and not res["images"] and np is not None:
+        try:
+            res["images"].append((res["materials"][0].get("name") or "Material", render_material_ball(res["materials"][0])))
+        except Exception as ex:
+            res.setdefault("notes", []).append(f"The material ball couldn't be drawn ({type(ex).__name__}: {ex}).")
+    res["seconds"] = time.monotonic() - t0
+    return res
+
+
+def material_ball_for(mat: dict) -> Optional["RawImage"]:
+    """Worker entry point for a material picked in a scene breakdown: its stored preview, else a rendered ball."""
+    if mat.get("_image") is not None:
+        return mat["_image"]
+    return render_material_ball(mat) if np is not None else None
+
+
+# --------------------------------------------------------------------------- live GLSL (Shadertoy / glslsandbox)
+_GLSL_VS = """
+out vec2 _uv;
+void main() {
+    vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0, (gl_VertexID == 2) ? 3.0 : -1.0);
+    _uv = p * 0.5 + 0.5;
+    gl_Position = vec4(p, 0.0, 1.0);
+}
+"""
+_SHADERTOY_HEAD = """
+uniform vec3 iResolution;
+uniform float iTime;
+uniform float iTimeDelta;
+uniform float iFrameRate;
+uniform int iFrame;
+uniform vec4 iMouse;
+uniform vec4 iDate;
+uniform float iSampleRate;
+uniform vec3 iChannelResolution[4];
+uniform float iChannelTime[4];
+uniform sampler2D iChannel0;
+uniform sampler2D iChannel1;
+uniform sampler2D iChannel2;
+uniform sampler2D iChannel3;
+in vec2 _uv;
+out vec4 _kestrelOut;
+#define texture2D texture
+"""
+_SHADERTOY_TAIL = """
+void main() {
+    vec4 c = vec4(0.0, 0.0, 0.0, 1.0);
+    mainImage(c, gl_FragCoord.xy);
+    _kestrelOut = vec4(c.rgb, 1.0);
+}
+"""
+
+
+def glsl_build_fragment(src: str, style: str, header: str) -> Tuple[str, int]:
+    """User source → complete fragment shader for this context, plus how many lines were added before the
+    user's first line. A `#line 1` directive keeps compile-error line numbers matching the user's file."""
+    body = re.sub(r"^[ \t]*#[ \t]*version[^\n]*", "", src, count=1, flags=re.M)
+    if style == "shadertoy":
+        pre = header + _SHADERTOY_HEAD
+        tail = _SHADERTOY_TAIL
+    else:
+        pre = header + "in vec2 _uv;\n#define texture2D texture\n#define varying in\n"
+        if not re.search(r"^\s*(?:layout\s*\([^)]*\)\s*)?out\s+(?:(?:lowp|mediump|highp)\s+)?vec4\s+\w+\s*;", _strip_c_comments(body), re.M):
+            pre += "out vec4 _kestrelOut;\n#define gl_FragColor _kestrelOut\n"
+        tail = ""
+    # GLSL < 3.30 numbers the line after "#line N" as N+1; ES and 3.30+ as N.
+    line = "#line 1\n" if (" es" in header or re.search(r"#version\s+(3[3-9]\d|[4-9]\d\d)", header)) else "#line 0\n"
+    return pre + line + body + "\n" + tail, pre.count("\n") + 1
+
+
+def glsl_error_text(ex) -> str:
+    """PyOpenGL's ShaderCompilationError → just the driver's info log, one message per line."""
+    msg = str(ex.args[0]) if getattr(ex, "args", None) else str(ex)
+    m = re.search(r"""b(['"])(.*)\1""", msg, re.S)
+    log = m.group(2).replace("\\n", "\n").replace("\\t", "  ").replace("\\'", "'") if m else msg
+    return "\n".join(l.rstrip() for l in log.strip().splitlines() if l.strip())[:3000]
+
+
+class GLSLRunner:
+    """Compiles and draws one fragment shader full-screen (any GL context, no GTK). Uniforms are set by
+    name: Shadertoy (iTime, iResolution, iMouse, iFrame, iDate, iChannel0-3) and glslsandbox / Book of
+    Shaders (time, resolution, mouse, u_time, u_resolution, u_mouse)."""
+
+    def __init__(self, header: str):
+        self.hdr = header
+        self.prog = None
+        self.error = ""
+        self.vao = _GL.glGenVertexArrays(1)
+        self.tex = None
+        self.uniforms: Dict[str, Tuple[int, int]] = {}
+
+    def compile(self, src: str, style: str) -> bool:
+        self.free_program()
+        frag, offset = glsl_build_fragment(src, style, self.hdr)
+        try:
+            vs = _GLshaders.compileShader(self.hdr + _GLSL_VS, _GL.GL_VERTEX_SHADER)
+            fs = _GLshaders.compileShader(frag, _GL.GL_FRAGMENT_SHADER)
+            self.prog = _GLshaders.compileProgram(vs, fs)
+        except Exception as ex:
+            self.error = glsl_error_text(ex)
+            self.prog = None
+            return False
+        self.error = ""
+        self.uniforms = {}
+        try:
+            n = _GL.glGetProgramiv(self.prog, _GL.GL_ACTIVE_UNIFORMS)
+            for i in range(int(n)):
+                name, size, typ = _GL.glGetActiveUniform(self.prog, i)
+                name = name.decode() if isinstance(name, bytes) else str(name)
+                self.uniforms[name.split("[")[0]] = (int(typ), _GL.glGetUniformLocation(self.prog, name.split("[")[0]))
+        except Exception:
+            for nm in ("iTime", "iResolution", "iMouse", "iFrame", "iDate", "iTimeDelta", "iFrameRate", "time", "resolution",
+                       "mouse", "u_time", "u_resolution", "u_mouse", "iChannel0", "iChannel1", "iChannel2", "iChannel3"):
+                loc = _GL.glGetUniformLocation(self.prog, nm)
+                if loc >= 0:
+                    self.uniforms[nm] = (0, loc)
+        return True
+
+    def _noise_texture(self):
+        if self.tex is None:
+            rng = np.random.default_rng(7)
+            data = np.ascontiguousarray(rng.integers(0, 256, (256, 256, 4), dtype=np.uint8))
+            self.tex = _GL.glGenTextures(1)
+            _GL.glBindTexture(_GL.GL_TEXTURE_2D, self.tex)
+            _GL.glTexParameteri(_GL.GL_TEXTURE_2D, _GL.GL_TEXTURE_MIN_FILTER, _GL.GL_LINEAR)
+            _GL.glTexParameteri(_GL.GL_TEXTURE_2D, _GL.GL_TEXTURE_MAG_FILTER, _GL.GL_LINEAR)
+            _GL.glTexImage2D(_GL.GL_TEXTURE_2D, 0, _GL.GL_RGBA8, 256, 256, 0, _GL.GL_RGBA, _GL.GL_UNSIGNED_BYTE, data)
+        return self.tex
+
+    def draw(self, W: int, H: int, t: float, frame: int, mouse=(0.0, 0.0, 0.0, 0.0), target_fb: int = 0):
+        _GL.glBindFramebuffer(_GL.GL_FRAMEBUFFER, target_fb)
+        _GL.glViewport(0, 0, W, H)
+        _GL.glDisable(_GL.GL_DEPTH_TEST)
+        _GL.glDisable(_GL.GL_BLEND)
+        if self.prog is None:
+            _GL.glClearColor(0.08, 0.08, 0.09, 1.0)
+            _GL.glClear(_GL.GL_COLOR_BUFFER_BIT)
+            return
+        _GL.glUseProgram(self.prog)
+        u = self.uniforms
+        GL_FLOAT_VEC2, GL_FLOAT_VEC3, GL_FLOAT_VEC4 = 0x8B50, 0x8B51, 0x8B52
+
+        def setf(names, *vals):
+            for nm in names:
+                if nm in u:
+                    typ, loc = u[nm]
+                    n = {GL_FLOAT_VEC2: 2, GL_FLOAT_VEC3: 3, GL_FLOAT_VEC4: 4}.get(typ, len(vals))
+                    v = (list(vals) + [0.0, 0.0, 0.0])[:n]
+                    (_GL.glUniform1f, _GL.glUniform2f, _GL.glUniform3f, _GL.glUniform4f)[n - 1](loc, *v)
+        setf(("iTime", "time", "u_time"), t)
+        setf(("iTimeDelta",), 1 / 60.0)
+        setf(("iFrameRate",), 60.0)
+        setf(("iResolution",), float(W), float(H), 1.0)
+        setf(("resolution", "u_resolution"), float(W), float(H))
+        setf(("iMouse",), *mouse)
+        setf(("mouse", "u_mouse"), mouse[0] / max(W, 1), mouse[1] / max(H, 1))
+        lt = time.localtime()
+        setf(("iDate",), float(lt.tm_year), float(lt.tm_mon - 1), float(lt.tm_mday), float(lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec))
+        if "iFrame" in u:
+            _GL.glUniform1i(u["iFrame"][1], int(frame))
+        tex = None
+        for i in range(4):
+            if f"iChannel{i}" in u:
+                tex = tex or self._noise_texture()
+                _GL.glActiveTexture(_GL.GL_TEXTURE0 + i)
+                _GL.glBindTexture(_GL.GL_TEXTURE_2D, tex)
+                _GL.glUniform1i(u[f"iChannel{i}"][1], i)
+        _GL.glBindVertexArray(self.vao)
+        _GL.glDrawArrays(_GL.GL_TRIANGLES, 0, 3)
+        _GL.glBindVertexArray(0)
+        _GL.glUseProgram(0)
+        _GL.glActiveTexture(_GL.GL_TEXTURE0)
+
+    def free_program(self):
+        if self.prog:
+            try:
+                _GL.glDeleteProgram(self.prog)
+            except Exception:
+                pass
+        self.prog = None
+
+    def free(self):
+        self.free_program()
+        try:
+            _GL.glDeleteVertexArrays(1, [self.vao])
+            if self.tex:
+                _GL.glDeleteTextures(1, [self.tex])
+        except Exception:
+            pass
+
+
+class GLSLView(Gtk.GLArea):
+    """Runs a fragment shader live in the preview pane. Animates while visible and the window is active;
+    click (or drag) feeds iMouse; double-click restarts the clock."""
+
+    def __init__(self):
+        super().__init__()
+        self.set_auto_render(False)
+        self.set_has_depth_buffer(False)
+        self.runner: Optional[GLSLRunner] = None
+        self.src, self.style = "", ""
+        self.dirty = False
+        self.t0 = time.monotonic()
+        self.frame = 0
+        self.playing = True
+        self.mouse = [0.0, 0.0, 0.0, 0.0]
+        self.on_status = None                # callable(error text or "") set by the window
+        self.flavour = ""
+        self._tick = None
+        self.connect("create-context", self._create_context)
+        self.connect("realize", self._realize)
+        self.connect("unrealize", self._unrealize)
+        self.connect("render", self._render)
+        self.connect("map", lambda w: self._start() if self.playing else None)
+        self.connect("unmap", lambda w: self._stop())
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.POINTER_MOTION_MASK)
+        self.connect("button-press-event", self._press)
+        self.connect("button-release-event", self._release)
+        self.connect("motion-notify-event", self._motion)
+
+    def _create_context(self, area):
+        ctx, label = gl_try_contexts(self.get_window(), [])
+        self.flavour = label or ""
+        return ctx
+
+    def _realize(self, w):
+        self.make_current()
+        if self.get_error() is not None or self.get_context() is None:
+            if self.on_status:
+                GLib.idle_add(lambda: (self.on_status("OpenGL isn't available here, so the shader can't run live."), False)[1])
+            return
+        try:
+            self.runner = GLSLRunner(_gl_header(self.get_context()))
+        except Exception as ex:
+            if self.on_status:
+                msg = f"OpenGL error: {ex}"
+                GLib.idle_add(lambda: (self.on_status(msg), False)[1])
+            return
+        self.dirty = bool(self.src)
+        self._start()
+
+    def _unrealize(self, w):
+        self._stop()
+        self.make_current()
+        if self.runner:
+            self.runner.free()
+        self.runner = None
+
+    def load(self, src: str, style: str):
+        self.src, self.style = src, style
+        self.t0 = time.monotonic()
+        self.frame = 0
+        self.dirty = True
+        self.playing = True
+        self.queue_render()
+        self._start()
+
+    def set_playing(self, on: bool):
+        self.playing = on
+        if on:
+            self.t0 = time.monotonic() - getattr(self, "_paused_at", 0.0)
+            self._start()
+        else:
+            self._paused_at = time.monotonic() - self.t0
+            self._stop()
+
+    def _start(self):
+        if self._tick is None and self.get_realized():
+            self._tick = self.add_tick_callback(self._on_tick)
+
+    def _stop(self):
+        if self._tick is not None:
+            self.remove_tick_callback(self._tick)
+            self._tick = None
+
+    def _on_tick(self, widget, clock):
+        top = self.get_toplevel()
+        active = top.is_active() if isinstance(top, Gtk.Window) else True
+        if self.playing and active and self.get_mapped():
+            self.queue_render()
+        return True
+
+    def _render(self, area, ctx):
+        if self.runner is None:
+            return True
+        if self.dirty:
+            self.dirty = False
+            ok = self.runner.compile(self.src, self.style)
+            if self.on_status:
+                self.on_status("" if ok else self.runner.error)
+        scale = self.get_scale_factor()
+        W, H = max(1, self.get_allocated_width() * scale), max(1, self.get_allocated_height() * scale)
+        fb = int(np.asarray(_GL.glGetIntegerv(_GL.GL_DRAW_FRAMEBUFFER_BINDING)).reshape(-1)[0])
+        t = (time.monotonic() - self.t0) if self.playing else getattr(self, "_paused_at", 0.0)
+        self.runner.draw(W, H, t, self.frame, tuple(self.mouse), fb)
+        self.frame += 1
+        return True
+
+    def _xy(self, event):
+        s = self.get_scale_factor()
+        return event.x * s, (self.get_allocated_height() - event.y) * s
+
+    def _press(self, w, event):
+        if event.type == Gdk.EventType._2BUTTON_PRESS:
+            self.t0 = time.monotonic()
+            self.frame = 0
+            return True
+        x, y = self._xy(event)
+        self.mouse = [x, y, x, y]
+        self.queue_render()
+        return True
+
+    def _release(self, w, event):
+        self.mouse[2], self.mouse[3] = -abs(self.mouse[2]), -abs(self.mouse[3])
+        return True
+
+    def _motion(self, w, event):
+        if event.state & Gdk.ModifierType.BUTTON1_MASK:
+            x, y = self._xy(event)
+            self.mouse[0], self.mouse[1] = x, y
+            self.queue_render()
+        return True
 
 
 # --------------------------------------------------------------------------- icon / thumbnail cache
@@ -9053,6 +15517,25 @@ class FolderView(Gtk.Box):
 
     # ---- mouse
     def _on_button(self, view, event, kind):
+        if DEBUG_INPUT and kind == "tree":
+            hit = view.get_path_at_pos(int(event.x), int(event.y))
+            input_log(f"list: {event.type.value_nick} button={event.button} row={hit[0].get_indices()[0] if hit else None} "
+                      f"state={int(event.state & Gtk.accelerator_get_default_mod_mask())} t={event.time}")
+        if kind == "tree" and event.button == 1:
+            # Same fix as the icon grid: pair clicks ourselves instead of trusting GDK's 2-click events, which
+            # chain across a folder change (the TreeView would otherwise activate on GDK's count).
+            if event.type in (Gdk.EventType._2BUTTON_PRESS, Gdk.EventType._3BUTTON_PRESS):
+                return True
+            hit = view.get_path_at_pos(int(event.x), int(event.y))
+            row = hit[0].get_indices()[0] if hit else -1
+            mods = event.state & Gtk.accelerator_get_default_mod_mask()
+            if not mods and is_double_click(getattr(self, "_tree_last_click", None), row, event):
+                self._tree_last_click = None
+                if not self.cfg["single_click"]:
+                    view.row_activated(hit[0], hit[1])
+                    return True
+            else:
+                self._tree_last_click = (row, event.time, event.x_root, event.y_root)
         if event.button == 3:
             if kind == "tree":
                 hit = view.get_path_at_pos(int(event.x), int(event.y))
@@ -9302,6 +15785,9 @@ class FolderView(Gtk.Box):
         """Runs on the main loop. Small folders are filled at once; big ones in chunks so the UI never stalls."""
         if gen != self.gen:
             return False
+        self._tree_last_click = None
+        if DEBUG_INPUT:
+            input_log(f"view: refill {self.path} ({len(ents)} items)")
         self.busy = False
         self.indexed_paint = False
         for rec in reversed(NAV_LOG):
@@ -9612,6 +16098,16 @@ def _short_drive_label(label: str) -> str:
 
 
 # --------------------------------------------------------------------------- main window
+def _tabular_digits():
+    """Pango attributes for fixed-width digits, so a ticking counter doesn't wobble."""
+    attrs = Pango.AttrList()
+    try:
+        attrs.insert(Pango.attr_font_features_new("tnum 1"))
+    except Exception:
+        pass
+    return attrs
+
+
 class MainWindow(Gtk.ApplicationWindow):
     MENU_KEYS = {"file": "File", "home": "Home", "share": "Share", "view": "View", "tools": "Tools", "help": "Help"}
 
@@ -9734,8 +16230,18 @@ class MainWindow(Gtk.ApplicationWindow):
         self.addr.connect("key-press-event", self._on_address_key)
         self.path_stack.add_named(self.addr, "entry")
         frame = Gtk.Frame()
+        frame.set_shadow_type(Gtk.ShadowType.NONE)
         frame.get_style_context().add_class("pathbar")
         frame.add(self.path_stack)
+        # The bar's outline is painted here rather than by CSS: themes differ in whether a GtkFrame draws a
+        # CSS border, and the outline must always be there (faint at rest, firmer under the pointer) so the
+        # clickable address area is obvious.
+        self._pathbar_hover = False
+        frame.connect("draw", self._draw_pathbar_outline)
+        self.path_stack.connect("notify::visible-child-name", lambda *a: frame.queue_draw())   # firmer while typing
+        crumb_frame.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        crumb_frame.connect("enter-notify-event", lambda w, e: self._pathbar_hovered(frame, True))
+        crumb_frame.connect("leave-notify-event", lambda w, e: e.detail == Gdk.NotifyType.INFERIOR or self._pathbar_hovered(frame, False))
         tb.pack_start(frame, True, True, 0)
         self.searchbox = Gtk.SearchEntry(width_chars=22)
         self.searchbox.set_placeholder_text("Search")
@@ -9743,6 +16249,37 @@ class MainWindow(Gtk.ApplicationWindow):
         self.searchbox.connect("stop-search", lambda e: self.clear_search())
         tb.pack_start(self.searchbox, False, False, 0)
         return tb
+
+    def _pathbar_hovered(self, frame, on: bool):
+        if self._pathbar_hover != on:
+            self._pathbar_hover = on
+            frame.queue_draw()
+        return False
+
+    def _draw_pathbar_outline(self, w, cr):
+        a = w.get_allocation()
+        fg = w.get_style_context().get_color(Gtk.StateFlags.NORMAL)
+        x, y, ww, hh, r = 0.5, 0.5, a.width - 1.0, a.height - 1.0, 6.0
+        cr.new_sub_path()
+        cr.arc(x + ww - r, y + r, r, -math.pi / 2, 0)
+        cr.arc(x + ww - r, y + hh - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + hh - r, r, math.pi / 2, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, 1.5 * math.pi)
+        cr.close_path()
+        # Matches the search box's outline as it renders (measured: the foreground colour at ~7.5 % over the
+        # window background; GTK's reported border colour for it is the full foreground, far too bright).
+        # While typing a path: the highlight colour the search box uses when it has focus.
+        if self.path_stack.get_visible_child_name() == "entry":
+            ok, sel = self.searchbox.get_style_context().lookup_color("theme_selected_bg_color")
+            if ok:
+                cr.set_source_rgba(sel.red, sel.green, sel.blue, 1.0)
+            else:
+                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.3)
+        else:
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.075)
+        cr.set_line_width(1.0)
+        cr.stroke()
+        return False                     # children (crumbs / entry) draw on top
 
     def _history_popup(self, btn, event):
         if event.button == 3:
@@ -9958,6 +16495,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self._fill_quick(self.nav_quick)
         self.nav_store.append(None, [NavNode("", None, None, False, "spacer")])
         pc = self.nav_store.append(None, [NavNode("This PC", THISPC, Gio.ThemedIcon.new("computer"), True, "root")])
+        it = self.nav_store.append(pc, [NavNode(os.path.basename(HOME.rstrip("/")) or "Home", HOME, Gio.ThemedIcon.new("user-home"))])
+        self.nav_store.append(it, [None])
         for label, p, icon in xdg_user_dirs():
             it = self.nav_store.append(pc, [NavNode(label, p, Gio.ThemedIcon.new(icon))])
             self.nav_store.append(it, [None])
@@ -10609,17 +17148,74 @@ class MainWindow(Gtk.ApplicationWindow):
         mbar.pack_start(self.model_count, True, True, 4)
         self.model_full_toggle = Gtk.ToggleButton(label="All triangles")
         self.model_full_toggle.set_tooltip_text("Override the 500,000-face preview cap and load every triangle.\n"
-                                                "Heavy meshes will orbit slowly — this is a software renderer.")
+                                                "Heavy meshes orbit slowly in the software renderer.")
         self.model_full_toggle.get_style_context().add_class("flat")
         self.model_full_toggle.connect("toggled", self._toggle_model_full)
         mbar.pack_end(self.model_full_toggle, False, False, 0)
+        self.model_bd_btn = Gtk.Button(label="Breakdown")
+        self.model_bd_btn.set_tooltip_text("Show what's in this scene: outliner, references, materials, settings")
+        self.model_bd_btn.get_style_context().add_class("flat")
+        self.model_bd_btn.connect("clicked", lambda b: self._switch_blend_view("breakdown"))
+        self.model_bd_btn.set_no_show_all(True)
+        mbar.pack_end(self.model_bd_btn, False, False, 0)
+        self.seq_button = Gtk.Button(label="Preview as sequence")
+        self.seq_button.set_tooltip_text("Play the selected caches as frames of one sequence, in name order")
+        self.seq_button.get_style_context().add_class("flat")
+        self.seq_button.connect("clicked", self._seq_button_clicked)
+        self.seq_button.set_no_show_all(True)
+        mbar.pack_end(self.seq_button, False, False, 0)
         mbox.pack_start(clip_width(mbar), False, False, 0)
         self.model_slot = Gtk.Box()
         mbox.pack_start(self.model_slot, True, True, 0)
+        # time slider for a selected sequence of caches (several .vdb / .bgeo frames selected together)
+        sbar = Gtk.Box(spacing=4)
+        self.seq_play = Gtk.Button.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.BUTTON)
+        self.seq_play.get_style_context().add_class("flat")
+        self.seq_play.set_tooltip_text("Play / pause (Space in the viewer; ← → step a frame)")
+        self.seq_play.connect("clicked", lambda b: self._seq_toggle_play())
+        sbar.pack_start(self.seq_play, False, False, 0)
+        self.seq_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 1)
+        self.seq_scale.set_draw_value(False)
+        self.seq_scale.set_digits(0)
+        self.seq_scale.set_round_digits(0)
+        self.seq_scale.set_hexpand(True)
+        self.seq_scale.set_size_request(120, -1)          # the slider gets the room; nothing beside it grows
+        self.seq_scale.set_show_fill_level(True)
+        self.seq_scale.set_restrict_to_fill_level(False)
+        self.seq_scale.connect("value-changed", self._seq_scrub)
+        sbar.pack_start(self.seq_scale, True, True, 0)
+        # Fixed width: the slider must not shift as frame numbers change length during playback (tabular
+        # digits). The file name lives in its own row above the viewer, so it never squeezes the slider.
+        self.seq_counter = Gtk.Label(xalign=1)
+        self.seq_counter.set_width_chars(9)
+        self.seq_counter.set_max_width_chars(9)
+        self.seq_counter.set_attributes(_tabular_digits())
+        sbar.pack_start(self.seq_counter, False, False, 0)
+        self.seq_label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE)
+        self.seq_label.get_style_context().add_class("dim-label")
+        self.seq_label.set_margin_start(4)
+        self.seq_label.set_no_show_all(True)
+        self.seq_fps = Gtk.SpinButton.new_with_range(1, 60, 1)
+        self.seq_fps.set_width_chars(2)
+        self.seq_fps.set_value(float(self.cfg.get("seq_fps", 24)))
+        self.seq_fps.set_tooltip_text("Playback speed (frames per second)")
+        self.seq_fps.connect("value-changed", self._seq_fps_changed)
+        sbar.pack_start(self.seq_fps, False, False, 0)
+        sbar.pack_start(Gtk.Label(label="fps"), False, False, 0)
+        sbar.show_all()
+        sbar.set_no_show_all(True)
+        sbar.hide()
+        self.seq_bar = sbar
+        self._seq = None
+        self.connect("notify::is-active", self._seq_focus_changed)
+        mbox.pack_start(sbar, False, False, 0)
+        mbox.pack_start(self.seq_label, False, False, 0)
+        mbox.reorder_child(self.seq_label, 1)            # current frame's file name: between the bar and the viewer
         mhint = Gtk.Label(label="LMB orbit · MMB pan · Alt+RMB or wheel zoom · double-click reset · W wireframe · S flat/smooth", ellipsize=Pango.EllipsizeMode.END)
         mhint.get_style_context().add_class("dim-label")
         mbox.pack_start(mhint, False, False, 0)
         self.preview_stack.add_named(mbox, "model")
+        self.preview_stack.add_named(self._build_breakdown_page(), "breakdown")
         self.preview_stack.add_named(self.preview_image, "image")
         self.video = VideoPreview() if gst_sink_available() else None
         if self.video is not None:
@@ -10727,14 +17323,40 @@ class MainWindow(Gtk.ApplicationWindow):
                 ev.set()
                 setattr(self, attr, None)
         if self.cfg["preview_pane"]:
-            self._update_preview(e)
+            # Several caches selected: preview the clicked one and offer "Preview as sequence". The sequence
+            # plays only after the button is pressed, and only while that same set stays selected.
+            cands = self._cache_selection(sel)
+            paths = tuple(x.path for x in cands) if cands else None
+            seq = cands if (paths and paths == getattr(self, "_seq_requested", None)) else None
+            if seq is None:
+                self._seq_requested = None
+            self._seq_candidates = cands
+            self.seq_button.set_visible(bool(cands) and seq is None)
+            if seq is None and cands and (e is None or not houdini_kind(e.name)):
+                e = cands[0]                          # Ctrl+A in a folder that starts with a .hip / .ember
+            self._update_preview(e, seq)
         if self.cfg["details_pane"]:
             if self.editing_pinned and self.edit_entry is not None and (e is None or e.path != self.edit_path):
                 sel = [self.edit_entry]        # keep the edited file's details on screen while editing
             self._update_details(sel)
 
     # ---- preview
-    def _update_preview(self, e: Optional[Entry]):
+    @staticmethod
+    def _cache_selection(sel) -> Optional[list]:
+        """Two or more selected Houdini caches of one kind (.vdb, or .bgeo/.geo), in natural name order — what
+        "Preview as sequence" would play. Other selected files (a .hip or .ember next to the caches) are
+        ignored. Nothing here decides that they ARE a sequence: the user does, with the button."""
+        caches = [x for x in sel if not x.is_dir and x.path and houdini_kind(x.name)]
+        if len(caches) < 2:
+            return None
+        k0 = houdini_kind(caches[0].name)
+        frames = [x for x in caches if houdini_kind(x.name) == k0]
+        if len(frames) < 2:
+            return None
+        nat = lambda x: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", x.name)]
+        return sorted(frames, key=nat)
+
+    def _update_preview(self, e: Optional[Entry], seq: Optional[list] = None):
         gen = self._side_gen
         # unsaved quick-edit: selecting something else (or nothing) asks first; "Keep editing" stays put
         if self.editing_pinned and (e is None or e.path != self.edit_path):
@@ -10755,6 +17377,17 @@ class MainWindow(Gtk.ApplicationWindow):
             self._show_edit_caption()
             self._show_preview("text")      # same file re-selected: keep the edits
             return
+        if seq:
+            key = ("seq",) + tuple(x.path for x in seq)
+            if key == getattr(self, "_preview_key", None) and self.preview_stack.get_visible_child_name() == "model":
+                self._drop_snapshot()
+                return
+            self._preview_key = key
+            if self.video is not None and self.preview_stack.get_visible_child_name() == "video":
+                self.video.stop()
+            self._load_model_sequence(seq, e, gen)
+            return
+        self._seq_stop()
         # Re-selecting the item already on screen (same path, size and mtime) keeps the finished preview:
         # re-decoding a model or a big image on every click made double-clicks feel laggy.
         key = (e.path, e.size, e.mtime) if e is not None else None
@@ -10873,13 +17506,21 @@ class MainWindow(Gtk.ApplicationWindow):
                 return False
             threading.Thread(target=work, daemon=True).start()
             return
+        if e.path and e.ext.lower() in SHADER_PREVIEW_EXTS and (e.size or 0) <= (64 << 20) and shader_preview_kind(e.path):
+            self._load_breakdown(e, gen, shader=True)
+            return
+        if e.path and (e.ext in SCENE_BREAKDOWN_EXTS or e.ext.lower() in SCENE_BREAKDOWN_EXTS) \
+                and not (e.ext == ".blend" and self.cfg.get("blend_view") == "3d") and scene_breakdown_kind(e.path):
+            self._load_breakdown(e, gen)
+            return
         model_exts = (".obj", ".stl", ".ply", ".fbx", ".usd", ".usda", ".usdc", ".usdz", ".abc", ".gltf", ".glb", ".dae", ".blend", ".3ds", ".x3d", ".lwo", ".off")
         # text formats are parsed whole, so cap them; Alembic/USD/.blend readers only touch the first sample
-        model_cap = (16 << 30) if e.ext in (".abc", ".usd", ".usdc", ".usdz", ".blend") else (600 << 20)
-        if e.path and e.ext in model_exts and (e.size or 0) >= model_cap:
+        hou_cache = bool(e.path and houdini_kind(e.name))
+        model_cap = (16 << 30) if (hou_cache or e.ext in (".abc", ".usd", ".usdc", ".usdz", ".blend")) else (600 << 20)
+        if e.path and (e.ext in model_exts or hou_cache) and (e.size or 0) >= model_cap:
             self._preview_as_icon(e, f"Too large to preview ({fmt_size(e.size)})")
             return
-        if e.path and e.ext in model_exts:
+        if e.path and (e.ext in model_exts or hou_cache):
             self._load_model_preview(e, gen)
             return
         if e.path and (e.ext in PREVIEW_DECODERS or e.ext in SEVENZIP_EXTS or e.ext in (".obj", ".pdf", ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".jar", ".whl",
@@ -10973,6 +17614,12 @@ class MainWindow(Gtk.ApplicationWindow):
             lang = self._lang_mgr.get_language({"makefile": "makefile", "dockerfile": "dockerfile", "cmakelists.txt": "cmake"}[os.path.basename(path).lower()])
         buf.set_language(lang)
         buf.set_highlight_syntax(lang is not None)
+        scheme = self._source_scheme()
+        if scheme is not None:
+            buf.set_style_scheme(scheme)
+
+    def _source_scheme(self):
+        """GtkSourceView colour scheme matching the light / dark theme."""
         settings = Gtk.Settings.get_default()
         dark = bool(settings and settings.get_property("gtk-application-prefer-dark-theme"))
         if not dark and settings:
@@ -10980,8 +17627,8 @@ class MainWindow(Gtk.ApplicationWindow):
         for name in (("Adwaita-dark", "oblivion", "cobalt", "classic") if dark else ("Adwaita", "classic", "tango")):
             scheme = self._style_mgr.get_scheme(name)
             if scheme is not None:
-                buf.set_style_scheme(scheme)
-                break
+                return scheme
+        return None
 
     def prompt_save(self) -> bool:
         """Ask Save / Discard / Keep editing for unsaved quick-edit changes. Returns True if it's OK to move on."""
@@ -11256,8 +17903,34 @@ class MainWindow(Gtk.ApplicationWindow):
         if self.cfg.get("gl_preview", True) and HAVE_GL:
             v = GLModelView()
             v.on_error = self._gl_failed
-            return v
-        return ModelView()
+            v.on_cache_failed = self._gl_cache_failed
+        else:
+            v = ModelView()
+        v.connect("key-press-event", self._model_key)
+        return v
+
+    def _gl_cache_failed(self, m: dict, msg: str):
+        """The GL viewer can't draw particles/volumes here (no float render targets…): software for caches."""
+        self._gl_cache_ok = False
+        self.flash("OpenGL can't draw volumes on this system; using the software renderer for caches")
+        mv = self._ensure_model_view(software=True)
+        mv.set_model(m)
+        st = self.preview_stack.get_allocation()
+        mv.prime(max(mv.get_allocated_width(), st.width), max(mv.get_allocated_height(), st.height - 60))
+
+    def _model_key(self, w, event):
+        """Sequence keys in the 3D viewer: Space plays/pauses, ← → step one frame."""
+        if self._seq is None:
+            return False
+        if event.keyval == Gdk.KEY_space:
+            self._seq_toggle_play()
+            return True
+        if event.keyval in (Gdk.KEY_Left, Gdk.KEY_Right):
+            self._seq_set_playing(False)
+            n = len(self._seq["paths"])
+            self._seq_goto((self._seq["cur"] + (1 if event.keyval == Gdk.KEY_Right else -1)) % n)
+            return True
+        return False
 
     def _gl_failed(self, msg: str):
         """OpenGL viewer reported a failure: show it where the user is looking, drop to the software renderer."""
@@ -11268,12 +17941,24 @@ class MainWindow(Gtk.ApplicationWindow):
         self.model_count.set_markup(f"<span foreground='#c0392b'>OpenGL failed: {GLib.markup_escape_text(msg[:160])}</span>")
         self.model_count.set_tooltip_text(msg)
 
-    def _ensure_model_view(self):
-        if self.model_view is None:
-            self.model_view = self._make_model_view()
-            self.model_slot.pack_start(self.model_view, True, True, 0)
-            self.model_view.show()
-        return self.model_view
+    def _ensure_model_view(self, software: bool = False):
+        """The viewer widget. software=True (particles / volumes, which only the software renderer draws)
+        swaps in a ModelView even when OpenGL is on; the next plain mesh swaps the GL viewer back."""
+        want_soft = software or not (self.cfg.get("gl_preview", True) and HAVE_GL)
+        cur = self.model_view
+        if cur is not None and isinstance(cur, ModelView) != want_soft:
+            self.model_slot.remove(cur)
+            cur = None
+        if cur is None:
+            if want_soft:
+                cur = ModelView()
+                cur.connect("key-press-event", self._model_key)
+            else:
+                cur = self._make_model_view()
+            self.model_slot.pack_start(cur, True, True, 0)
+            cur.show()
+            self.model_view = cur
+        return cur
 
     def toggle_gl_preview(self):
         """Preferences → Optional. Swaps the viewer widget in place and re-shows the model."""
@@ -11322,9 +18007,19 @@ class MainWindow(Gtk.ApplicationWindow):
                 return False
             for k, v in m["info"]:
                 self._qv_add(k, v)
-            mv = self._ensure_model_view()
+            cache = any(k in m for k in ("points", "vpts"))
+            mv = self._ensure_model_view(software=cache and not getattr(self, "_gl_cache_ok", True))
             shown, total = len(m["faces"]), m.get("nfaces_total", len(m["faces"]))
-            self.model_count.set_text(f"{shown:,} of {total:,} faces" if shown < total else f"{total:,} faces")
+            self.model_full_toggle.set_visible(bool(total))      # nothing to un-cap on a volume / point cache
+            self.model_bd_btn.set_visible(e.ext == ".blend")
+            parts = []
+            if total:
+                parts.append(f"{shown:,} of {total:,} faces" if shown < total else f"{total:,} faces")
+            if "points" in m:
+                parts.append(f"{len(m['points']):,} points")
+            if "vpts" in m:
+                parts.append(f"{len(m['vpts']):,} voxels")
+            self.model_count.set_text("  ·  ".join(parts) or "empty")
             if isinstance(mv, ModelView) and np is not None:
                 # software renderer: fade in when the first frame arrives, not before (the widget would be blank)
                 mv.on_first_frame = lambda: gen == self._side_gen and self._show_preview("model")
@@ -11339,11 +18034,711 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _toggle_model_full(self, btn):
         e = getattr(self, "_model_entry", None)
+        if getattr(self, "_seq", None) is not None:
+            self._preview_key = None              # reload the whole sequence at the new detail level
+            self._update_side()
+            return
         if e is None or self.preview_stack.get_visible_child_name() not in ("model", "info"):
             return
         self._side_gen += 1
         self._preview_key = None            # force a reload of the same file at the new detail level
         self._load_model_preview(e, self._side_gen)
+
+    # ---- scene breakdowns (Unreal / Unity / Maya / Blender)
+    def _build_breakdown_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        head = Gtk.Box(spacing=6)
+        self.bd_title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.bd_title.get_style_context().add_class("dim-label")
+        head.pack_start(self.bd_title, True, True, 4)
+        self.bd_copy = Gtk.Button.new_from_icon_name("edit-copy-symbolic", Gtk.IconSize.BUTTON)
+        self.bd_copy.set_tooltip_text("Copy the breakdown as text")
+        self.bd_copy.get_style_context().add_class("flat")
+        self.bd_copy.connect("clicked", self._bd_copy_all)
+        head.pack_end(self.bd_copy, False, False, 0)
+        self.bd_3d = Gtk.Button(label="3D view")
+        self.bd_3d.set_tooltip_text("Preview the geometry instead (starts Blender in the background)")
+        self.bd_3d.get_style_context().add_class("flat")
+        self.bd_3d.connect("clicked", lambda b: self._switch_blend_view("3d"))
+        self.bd_3d.set_no_show_all(True)
+        head.pack_end(self.bd_3d, False, False, 0)
+        self.bd_code_btn = Gtk.ToggleButton(label="Code")
+        self.bd_code_btn.set_tooltip_text("Show the source instead of the breakdown")
+        self.bd_code_btn.get_style_context().add_class("flat")
+        self.bd_code_btn.set_active(bool(self.cfg.get("bd_code")))
+        self.bd_code_btn.connect("toggled", self._bd_code_toggled)
+        self.bd_code_btn.set_no_show_all(True)
+        head.pack_end(self.bd_code_btn, False, False, 0)
+        box.pack_start(clip_width(head), False, False, 0)
+        # top half: stored preview / material ball / light pattern / live GLSL; bottom half: tree or code
+        self.bd_paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL, wide_handle=False)
+        self.bd_paned.connect("notify::position", self._bd_pane_moved)
+        self._bd_ratio, self._bd_pos_busy = None, False
+        media = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.bd_media_stack = Gtk.Stack()
+        self.bd_image = FitImage()
+        self.bd_media_stack.add_named(self.bd_image, "image")
+        self.bd_glsl: Optional[GLSLView] = None             # created on first use (needs a GL context)
+        media.pack_start(self.bd_media_stack, True, True, 0)
+        cap = Gtk.Box(spacing=4)
+        self.bd_media_label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.bd_media_label.get_style_context().add_class("dim-label")
+        cap.pack_start(self.bd_media_label, True, True, 4)
+        self.bd_play = Gtk.Button.new_from_icon_name("media-playback-pause-symbolic", Gtk.IconSize.MENU)
+        self.bd_play.set_relief(Gtk.ReliefStyle.NONE)
+        self.bd_play.set_tooltip_text("Pause / play (double-click the picture to restart the clock)")
+        self.bd_play.connect("clicked", self._bd_glsl_toggle)
+        self.bd_play.set_no_show_all(True)
+        cap.pack_end(self.bd_play, False, False, 0)
+        media.pack_start(clip_width(cap), False, False, 0)
+        media.show_all()
+        media.set_no_show_all(True)
+        media.hide()
+        self.bd_media = media
+        self.bd_paned.pack1(media, True, False)
+        lower = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.bd_err = Gtk.Label(xalign=0, wrap=True, selectable=True)
+        self.bd_err.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.bd_err.get_style_context().add_class("bd-error")
+        self.bd_err.set_no_show_all(True)
+        lower.pack_start(self.bd_err, False, False, 0)
+        self.bd_filter = Gtk.SearchEntry()
+        self.bd_filter.set_placeholder_text("Filter names, types and paths")
+        self.bd_filter.connect("search-changed", self._bd_refilter)
+        lower.pack_start(self.bd_filter, False, False, 0)
+        self.bd_notes = Gtk.Label(xalign=0, wrap=True)
+        self.bd_notes.get_style_context().add_class("dim-label")
+        self.bd_notes.set_no_show_all(True)
+        lower.pack_start(self.bd_notes, False, False, 0)
+        # name, info, path, colour, visible, tooltip, key (material:N rows)
+        self.bd_store = Gtk.TreeStore(str, str, str, str, bool, str, str)
+        self.bd_model = self.bd_store.filter_new()
+        self.bd_model.set_visible_column(4)
+        tv = Gtk.TreeView(model=self.bd_model)
+        tv.set_enable_search(False)
+        tv.set_tooltip_column(5)
+        for title, col, ell, expand in (("Name", 0, Pango.EllipsizeMode.END, True), ("Info", 1, Pango.EllipsizeMode.END, True),
+                                         ("Location", 2, Pango.EllipsizeMode.START, True)):
+            r = Gtk.CellRendererText(ellipsize=ell)
+            c = Gtk.TreeViewColumn(title, r)
+            c.set_resizable(True)
+            c.set_expand(expand)
+            c.set_min_width(60)
+            c.set_cell_data_func(r, self._bd_cell, col)
+            tv.append_column(c)
+        tv.connect("row-activated", self._bd_activate)
+        tv.connect("button-press-event", self._bd_button)
+        tv.get_selection().connect("changed", self._bd_selection)
+        self.bd_view = tv
+        sw = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        sw.add(tv)
+        if GtkSource is not None:
+            self.bd_code = GtkSource.View.new_with_buffer(GtkSource.Buffer())
+            self.bd_code.set_show_line_numbers(True)
+            self.bd_code.set_tab_width(4)
+        else:
+            self.bd_code = Gtk.TextView()
+        self.bd_code.set_monospace(True)
+        self.bd_code.set_editable(False)
+        self.bd_code.set_left_margin(6)
+        csw = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        csw.add(self.bd_code)
+        self.bd_lower = Gtk.Stack()
+        self.bd_lower.add_named(sw, "tree")
+        self.bd_lower.add_named(csw, "code")
+        lower.pack_start(self.bd_lower, True, True, 0)
+        self.bd_paned.pack2(lower, True, False)
+        self.bd_paned.connect("size-allocate", lambda w, a: self._bd_place_pane())
+        box.pack_start(self.bd_paned, True, True, 0)
+        box.show_all()
+        return box
+
+    def _bd_cell(self, col, cell, model, it, idx):
+        text = model.get_value(it, idx) or ""
+        colour = model.get_value(it, 3)
+        if idx == 0:
+            cell.set_property("text", text)
+            cell.set_property("foreground", colour or None)
+            cell.set_property("foreground-set", bool(colour))
+            cell.set_property("weight", 700 if model.get_path(it).get_depth() == 1 else 400)
+        else:
+            alpha = "100%" if (idx == 2 and colour) else "62%"
+            fg = f' foreground="{colour}"' if (idx == 2 and colour) else ""
+            cell.set_property("markup", f'<span alpha="{alpha}"{fg}>{GLib.markup_escape_text(text)}</span>' if text else "")
+
+    def _load_breakdown(self, e: Entry, gen: int, shader: bool = False):
+        """Scene breakdown (Unreal / Unity / Maya / Blender) or, with `shader`, a shader / material / IES file:
+        same page, plus a picture on top (stored thumbnail, material ball, light pattern or live GLSL)."""
+        self._placeholder("Reading shader…" if shader else "Reading scene…", gen)
+        path = e.path
+        self._bd_entry = e
+
+        def work():
+            try:
+                res = run_heavy(shader_preview if shader else scene_breakdown, path)
+            except Exception as ex:
+                res = {"error": str(ex)}
+            GLib.idle_add(done, res)
+
+        def done(res):
+            if gen != self._side_gen:
+                return False
+            if not res or "error" in res:
+                if e.ext == ".blend":
+                    self._load_model_preview(e, gen)          # fall back to the 3D preview
+                elif shader and self._bd_text_fallback(e):
+                    pass
+                else:
+                    self._preview_as_icon(e, ("Couldn't read this file" if shader else "Couldn't read this scene")
+                                          + (f"\n{res.get('error', '')}" if res else ""))
+                return False
+            self._bd_res = res
+            for k, v in res.get("info", []):
+                self._qv_add(k, v)
+            self.bd_title.set_text(res.get("kind", "") + (f"  ·  read in {res['seconds']:.2f} s" if res.get("seconds", 0) >= 0.5 else ""))
+            notes = res.get("notes") or []
+            self.bd_notes.set_text("\n".join(notes))
+            self.bd_notes.set_visible(bool(notes))
+            self.bd_3d.set_visible(e.ext == ".blend")
+            self.bd_filter.set_text("")
+            self._bd_fill(res)
+            self._bd_set_code(res.get("code"), path)
+            self._bd_set_media(res)
+            self._show_preview("breakdown")
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _bd_text_fallback(self, e: Entry) -> bool:
+        """A shader file the reader choked on still previews as plain text."""
+        try:
+            with open(e.path, "rb") as f:
+                data = f.read(64 << 10)
+        except OSError:
+            return False
+        if b"\0" in data:
+            return False
+        self._load_text(e.path, data, (e.size or 0) <= 64 << 10)
+        self.edit_entry = e
+        self._show_preview("text")
+        return True
+
+    def _bd_set_code(self, code, path: str):
+        """Source view for the Code toggle: (text, language id) or None."""
+        buf = self.bd_code.get_buffer()
+        has = bool(code and code[0])
+        self.bd_code_btn.set_visible(has)
+        buf.set_text(code[0][:2 << 20] if has else "")
+        if GtkSource is not None and has:
+            lang = None
+            for lid in {"glsl": ("glsl", "c"), "c": ("c",), "xml": ("xml",), "yaml": ("yaml",), "json": ("json", "js")}.get(code[1] or "", ()):
+                lang = self._lang_mgr.get_language(lid)
+                if lang is not None:
+                    break
+            if lang is None:
+                ct, _ = Gio.content_type_guess(path, None)
+                lang = self._lang_mgr.guess_language(path, ct)
+            buf.set_language(lang)
+            buf.set_highlight_syntax(lang is not None)
+            scheme = self._source_scheme()
+            if scheme is not None:
+                buf.set_style_scheme(scheme)
+        self.bd_lower.set_visible_child_name("code" if has and self.bd_code_btn.get_active() else "tree")
+        self.bd_filter.set_visible(not (has and self.bd_code_btn.get_active()))
+
+    def _bd_code_toggled(self, btn):
+        on = btn.get_active()
+        self.cfg["bd_code"] = on
+        save_config(self.cfg)
+        self.bd_lower.set_visible_child_name("code" if on else "tree")
+        self.bd_filter.set_visible(not on)
+
+    def _bd_set_media(self, res: dict):
+        """Top half of the page: live GLSL when the file is a runnable fragment shader (and GL works), else
+        the first stored / rendered picture, else nothing."""
+        self.bd_err.hide()
+        self.bd_play.hide()
+        if self.bd_glsl is not None:
+            self.bd_glsl.set_playing(False)
+        glsl = res.get("glsl")
+        if glsl and self.cfg.get("gl_preview", True) and HAVE_GL and not getattr(self, "_glsl_broken", False):
+            if self.bd_glsl is None:
+                self.bd_glsl = GLSLView()
+                self.bd_glsl.on_status = self._bd_glsl_status
+                self.bd_glsl.show()
+                self.bd_media_stack.add_named(self.bd_glsl, "glsl")
+            self.bd_media_stack.set_visible_child_name("glsl")
+            self.bd_glsl.load(glsl["source"], glsl["style"])
+            self.bd_media_label.set_text({"shadertoy": "Shadertoy shader", "sandbox": "Fragment shader"}.get(glsl["style"], "Shader")
+                                         + " · live")
+            self.bd_play.set_image(Gtk.Image.new_from_icon_name("media-playback-pause-symbolic", Gtk.IconSize.MENU))
+            self.bd_play.show()
+            self._bd_show_media(True)
+            return
+        imgs = res.get("images") or []
+        if imgs:
+            self._bd_show_image(imgs[0][1], imgs[0][0])
+            return
+        self._bd_show_media(False)
+
+    def _bd_show_image(self, img, label: str):
+        pb = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(img.rgb), GdkPixbuf.Colorspace.RGB, False, 8, img.w, img.h, img.w * 3)
+        self.bd_image.set_from_pixbuf(pb)
+        self.bd_media_stack.set_visible_child_name("image")
+        self.bd_media_label.set_text(label)
+        self.bd_play.hide()
+        if self.bd_glsl is not None:
+            self.bd_glsl.set_playing(False)
+        self._bd_show_media(True, img.h + 30)
+
+    def _bd_show_media(self, on: bool, want: int = 0):
+        """Show / hide the picture half. `want` = height the content needs (small thumbnails get less room)."""
+        was = self.bd_media.get_visible()
+        self.bd_media.set_visible(on)
+        if on and (not was or want != getattr(self, "_bd_want", 0)):
+            self._bd_want = want
+            self._bd_placed = False
+            self._bd_place_pane()
+
+    def _bd_place_pane(self):
+        """Give the picture about half the page (or what the user dragged it to) once the page has a size."""
+        if getattr(self, "_bd_placed", True) or not self.bd_media.get_visible():
+            return
+        h = self.bd_paned.get_allocated_height()
+        w = self.bd_paned.get_allocated_width()
+        if h < 50:
+            return
+        self._bd_placed = True
+        pos = int(h * self._bd_ratio) if self._bd_ratio else min(int(h * 0.55), w + 30, getattr(self, "_bd_want", 0) or h)
+        self._bd_pos_busy = True
+        GLib.idle_add(lambda: (self.bd_paned.set_position(max(80, pos)), setattr(self, "_bd_pos_busy", False), False)[2])
+
+    def _bd_pane_moved(self, paned, pspec):
+        h = paned.get_allocated_height()
+        if not self._bd_pos_busy and getattr(self, "_bd_placed", False) and h > 50 and self.bd_media.get_visible():
+            self._bd_ratio = paned.get_position() / h
+
+    def _bd_glsl_status(self, msg: str):
+        if msg and msg.startswith("OpenGL"):
+            # no usable GL context: don't try again this session; show the source instead of a black box
+            self._glsl_broken = True
+            self._bd_show_media(False)
+            self.bd_err.set_text(msg)
+            self.bd_err.show()
+            if self.bd_code_btn.get_visible():
+                self.bd_lower.set_visible_child_name("code")
+                self.bd_filter.hide()
+        elif msg:
+            self.bd_err.set_text("Shader didn't compile:\n" + msg)
+            self.bd_err.show()
+        else:
+            self.bd_err.hide()
+
+    def _bd_glsl_toggle(self, btn):
+        v = self.bd_glsl
+        if v is None:
+            return
+        v.set_playing(not v.playing)
+        btn.set_image(Gtk.Image.new_from_icon_name("media-playback-pause-symbolic" if v.playing else "media-playback-start-symbolic",
+                                                   Gtk.IconSize.MENU))
+
+    def _bd_selection(self, sel):
+        """A material row picked in a breakdown: show its stored preview or render a ball for it."""
+        m, it = sel.get_selected()
+        key = m.get_value(it, 6) if it is not None else ""
+        res = getattr(self, "_bd_res", None) or {}
+        mats = res.get("materials") or []
+        if not key or not key.startswith("material:") or res.get("glsl"):
+            return
+        try:
+            mat = mats[int(key.split(":", 1)[1])]
+        except (ValueError, IndexError):
+            return
+        gen = self._side_gen
+        name = mat.get("name") or "Material"
+
+        def work():
+            try:
+                img = run_heavy(material_ball_for, mat)
+            except Exception:
+                img = None
+            GLib.idle_add(done, img)
+
+        def done(img):
+            if gen == self._side_gen and img is not None and self.preview_stack.get_visible_child_name() == "breakdown":
+                self._bd_show_image(img, name + (" · stored preview" if mat.get("_image") is not None else " · material ball"))
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _bd_fill(self, res: dict):
+        st = self.bd_store
+        self.bd_view.set_model(None)                          # detached: tens of thousands of rows fill fast
+        st.clear()
+        missing = "#e5534b"
+
+        def add(parent, nodes):
+            for label, detail, kids, path, ok in nodes:
+                tip = None
+                if path:
+                    tip = GLib.markup_escape_text(path) + ("\n<b>Missing on this machine</b>" if ok is False else
+                                                           ("\n<i>Not checked: a path from another machine</i>" if ok is None else ""))
+                key = ""
+                if path and path.startswith("material:"):
+                    key, path, tip = path, "", "Select to preview this material"
+                it = st.append(parent, [label, detail, path, missing if ok is False else "", True, tip, key])
+                if kids:
+                    add(it, kids)
+        add(None, res.get("tree", []))
+        self.bd_view.set_model(self.bd_model)
+        self._bd_default_expand()
+
+    def _bd_default_expand(self):
+        """Sections open; outliners and reference groups one level deeper (when not huge)."""
+        tv, m = self.bd_view, self.bd_model
+        it = m.get_iter_first()
+        while it is not None:
+            p = m.get_path(it)
+            tv.expand_row(p, False)
+            if m.get_value(it, 0) in ("Outliner", "Hierarchy", "Scenes", "References") and m.iter_n_children(it) <= 60:
+                c = m.iter_children(it)
+                while c is not None:
+                    if m.iter_n_children(c) <= 200:
+                        tv.expand_row(m.get_path(c), False)
+                    c = m.iter_next(c)
+            it = m.iter_next(it)
+
+    def _bd_refilter(self, entry):
+        q = entry.get_text().strip().lower()
+        st = self.bd_store
+
+        def visit(it, shown_by_ancestor):
+            vis_any = False
+            while it is not None:
+                hit = bool(q) and (q in (st.get_value(it, 0) or "").lower() or q in (st.get_value(it, 1) or "").lower()
+                                   or q in (st.get_value(it, 2) or "").lower())
+                kids = visit(st.iter_children(it), shown_by_ancestor or hit or not q)
+                vis = not q or shown_by_ancestor or hit or kids
+                st.set_value(it, 4, vis)
+                vis_any = vis_any or vis
+                it = st.iter_next(it)
+            return vis_any
+        visit(st.get_iter_first(), False)
+        self.bd_model.refilter()
+        if q:
+            self.bd_view.expand_all()
+        else:
+            self.bd_view.collapse_all()
+            self._bd_default_expand()
+
+    def _bd_row_path(self, tree_path) -> str:
+        it = self.bd_model.get_iter(tree_path)
+        return self.bd_model.get_value(it, 2) or ""
+
+    def _bd_reveal(self, path: str):
+        if not path:
+            return
+        if os.path.isdir(path):
+            self.navigate(path)
+            return
+        d = os.path.dirname(path)
+        if not os.path.isdir(d):
+            self.flash(f"Not on this machine: {path}")
+            return
+        self.tab.remember[d] = os.path.basename(path)
+        self.navigate(d)
+
+    def _bd_activate(self, tv, tree_path, col):
+        p = self._bd_row_path(tree_path)
+        if p:
+            if os.path.exists(p):
+                self._bd_reveal(p)
+            else:
+                self.flash(f"Missing: {p}")
+        elif tv.row_expanded(tree_path):
+            tv.collapse_row(tree_path)
+        else:
+            tv.expand_row(tree_path, False)
+
+    def _bd_button(self, tv, event):
+        if event.button != 3:
+            return False
+        hit = tv.get_path_at_pos(int(event.x), int(event.y))
+        if not hit:
+            return False
+        tv.get_selection().select_path(hit[0])
+        it = self.bd_model.get_iter(hit[0])
+        name, path = self.bd_model.get_value(it, 0), self.bd_model.get_value(it, 2)
+        menu = Gtk.Menu()
+        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        items = [("Copy name", lambda *_: cb.set_text(name, -1))]
+        if path:
+            items = [("Show in folder", lambda *_: self._bd_reveal(path)), ("Copy path", lambda *_: cb.set_text(path, -1))] + items
+        for label, fn in items:
+            mi = Gtk.MenuItem(label=label)
+            mi.connect("activate", fn)
+            menu.append(mi)
+        menu.show_all()
+        menu.attach_to_widget(tv, None)
+        menu.popup_at_pointer(event)
+        return True
+
+    def _bd_copy_all(self, btn):
+        res = getattr(self, "_bd_res", None)
+        if res:
+            e = getattr(self, "_bd_entry", None)
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(breakdown_text(res, f"{e.path if e else ''}\n{res.get('kind', '')}"), -1)
+            self.flash("Breakdown copied")
+
+    def _switch_blend_view(self, which: str):
+        """.blend files: breakdown (default) or 3D preview; the choice is remembered."""
+        self.cfg["blend_view"] = which
+        save_config(self.cfg)
+        e = getattr(self, "_bd_entry", None) if which == "3d" else getattr(self, "_model_entry", None)
+        if e is None:
+            return
+        self._side_gen += 1
+        self._preview_key = None
+        if which == "3d":
+            self._load_model_preview(e, self._side_gen)
+        else:
+            self._load_breakdown(e, self._side_gen)
+
+    # ---- cache sequences: time slider over several selected .vdb / .bgeo frames
+    SEQ_MAX_VOXELS = 1_000_000           # per frame (~16 MB): a sequence keeps many frames in memory
+
+    @staticmethod
+    def _seq_budget() -> int:
+        """Bytes of decoded frames to keep: a third of RAM, at most 3 GB."""
+        try:
+            with open("/proc/meminfo") as f:
+                tot = int(next(l for l in f if l.startswith("MemTotal")).split()[1]) * 1024
+        except Exception:
+            tot = 8 << 30
+        return int(min(3 << 30, tot // 3))
+
+    def _load_model_sequence(self, seq: list, focus: Optional[Entry], gen: int):
+        self._seq_stop()
+        paths = [x.path for x in seq]
+        start = next((i for i, x in enumerate(seq) if focus is not None and x.path == focus.path), 0)
+        self._seq = {"paths": paths, "gen": gen, "cur": start, "shown": -1, "frames": {}, "futures": {},
+                     "norm": None, "bytes": 0, "fbytes": 0, "budget": self._seq_budget(), "playing": False,
+                     "timer": None, "failed": set()}
+        self._model_entry = seq[start]
+        self._placeholder(f"Loading sequence ({len(paths)} frames)…", gen)
+        self._seq_guard = True
+        self.seq_scale.set_range(0, max(1, len(paths) - 1))
+        self.seq_scale.set_value(start)
+        self._seq_guard = False
+        self.seq_scale.clear_marks()
+        self._seq_label()
+        self._seq_request(start)
+
+    def _seq_button_clicked(self, btn):
+        cands = getattr(self, "_seq_candidates", None)
+        if not cands:
+            return
+        self._seq_requested = tuple(x.path for x in cands)
+        self._preview_key = None
+        self._update_side()
+
+    def _seq_stop(self):
+        s, self._seq = getattr(self, "_seq", None), None
+        if s is None:
+            return
+        if s["timer"]:
+            GLib.source_remove(s["timer"])
+        for fut in s["futures"].values():
+            fut.cancel()
+        self.seq_bar.hide()
+        self.seq_label.hide()
+        self.seq_play.set_image(Gtk.Image.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.BUTTON))
+
+    def _seq_request(self, i: int):
+        s = self._seq
+        if s is None or i in s["frames"] or i in s["futures"] or i in s["failed"]:
+            return
+        if s["norm"] is None and s["futures"]:
+            return                                    # frame 1 sets the box: wait for it before the rest
+        full = self.model_full_toggle.get_active()
+        try:
+            fut = seq_pool().submit(load_model, s["paths"][i], sys.maxsize if full else 500000, s["norm"], self.SEQ_MAX_VOXELS)
+        except Exception as ex:
+            bench(f"sequence: worker pool failed: {ex}")
+            return
+        s["futures"][i] = fut
+        fut.add_done_callback(lambda f, i=i, s=s: GLib.idle_add(self._seq_loaded, s, i, f))
+
+    def _seq_loaded(self, s, i: int, fut):
+        if s is not self._seq or fut.cancelled():
+            return False
+        s["futures"].pop(i, None)
+        try:
+            m = fut.result()
+        except Exception as ex:
+            m = {"error": str(ex)}
+        if not m or "error" in m:
+            s["failed"].add(i)
+            if s["shown"] < 0 and (i == s["cur"] or s["norm"] is None):
+                self._preview_as_icon(self._model_entry, "Couldn't read this frame" + (f"\n{m['error']}" if m else ""))
+                self._seq_stop()
+                return False
+        else:
+            if s["norm"] is None:
+                s["norm"] = m.get("norm")
+            nb = sum(getattr(v, "nbytes", 0) for v in m.values())
+            s["frames"][i] = m
+            s["bytes"] += nb
+            s["fbytes"] = max(s["fbytes"], nb)
+            if i == s["cur"]:
+                self._seq_show(i)
+        self._seq_pump()
+        self._seq_label()
+        return False
+
+    def _seq_window(self) -> list:
+        """Frames worth holding: from the current one onwards (wrapping, playback loops), as many as fit."""
+        s = self._seq
+        n = len(s["paths"])
+        fit = n if not s["fbytes"] else max(2, int(s["budget"] // max(s["fbytes"], 1)))
+        return [(s["cur"] + k) % n for k in range(min(n, fit))]
+
+    def _seq_pump(self):
+        """Keep the worker processes busy on the frames ahead; drop decoded frames outside the window."""
+        s = self._seq
+        if s is None or s["norm"] is None:
+            return
+        win = self._seq_window()
+        keep = set(win)
+        for i in [i for i in s["frames"] if i not in keep]:
+            m = s["frames"].pop(i)
+            s["bytes"] -= sum(getattr(v, "nbytes", 0) for v in m.values())
+        for i, fut in list(s["futures"].items()):
+            if i not in keep and fut.cancel():
+                s["futures"].pop(i, None)
+        slots = 2 * max(1, min(4, (os.cpu_count() or 2) // 4)) - len(s["futures"])
+        for i in win:
+            if slots <= 0:
+                break
+            if i not in s["frames"] and i not in s["futures"] and i not in s["failed"]:
+                self._seq_request(i)
+                slots -= 1
+
+    def _seq_show(self, i: int):
+        s = self._seq
+        m = s["frames"][i]
+        first = s["shown"] < 0
+        s["shown"] = i
+        if first:
+            for k, v in m["info"]:
+                self._qv_add(k, v)
+            self._qv_add("Sequence", f"{len(s['paths'])} frames")
+        cache = any(k in m for k in ("points", "vpts"))
+        mv = self._ensure_model_view(software=cache and not getattr(self, "_gl_cache_ok", True))
+        total = m.get("nfaces_total", len(m["faces"]))
+        self.model_full_toggle.set_visible(bool(total))
+        parts = []
+        if total:
+            parts.append(f"{total:,} faces")
+        if "points" in m:
+            parts.append(f"{len(m['points']):,} points")
+        if "vpts" in m:
+            parts.append(f"{len(m['vpts']):,} voxels")
+        self.model_count.set_text("  ·  ".join(parts) or "empty")
+        if first:
+            self._set_caption(f"{os.path.basename(s['paths'][0])} … {os.path.basename(s['paths'][-1])}  ·  {len(s['paths'])} frames")
+            self.seq_bar.show()
+            self.seq_label.show()
+            if isinstance(mv, ModelView) and np is not None:
+                gen = s["gen"]
+                mv.on_first_frame = lambda: gen == self._side_gen and self._show_preview("model")
+                mv.set_model(m)
+                st = self.preview_stack.get_allocation()
+                mv.prime(max(mv.get_allocated_width(), st.width), max(mv.get_allocated_height(), st.height - 60))
+            else:
+                mv.set_model(m)
+                self._show_preview("model")
+        else:
+            mv.set_model(m, keep_view=True)
+
+    def _seq_label(self):
+        s = self._seq
+        if s is None:
+            return
+        n = len(s["paths"])
+        name = os.path.basename(s["paths"][s["cur"]])
+        held = len(s["frames"])
+        self.seq_counter.set_text(f"{s['cur'] + 1}/{n}")
+        self.seq_label.set_text(name)
+        # shade the slider up to the last frame decoded ahead of the playhead (like a video player's buffer)
+        k = 0
+        while k < n and (s["cur"] + k) % n in s["frames"]:
+            k += 1
+        self.seq_scale.set_fill_level(n - 1 if k >= n else min(n - 1, s["cur"] + max(k - 1, 0)))
+        self.seq_label.set_tooltip_text(f"{held} of {n} frames decoded and held in memory"
+                                        f" ({fmt_size(max(s['bytes'], 0))})")
+
+    def _seq_goto(self, i: int):
+        s = self._seq
+        if s is None:
+            return
+        s["cur"] = i
+        self._seq_guard = True
+        self.seq_scale.set_value(i)
+        self._seq_guard = False
+        if i in s["frames"]:
+            self._seq_show(i)
+        else:
+            self._seq_request(i)
+        self._seq_pump()
+        self._seq_label()
+
+    def _seq_scrub(self, scale):
+        if getattr(self, "_seq_guard", False) or self._seq is None:
+            return
+        i = int(round(scale.get_value()))
+        if i != self._seq["cur"]:
+            self._seq_goto(i)
+
+    def _seq_toggle_play(self):
+        if self._seq is not None:
+            self._seq_set_playing(not self._seq["playing"])
+
+    def _seq_set_playing(self, on: bool):
+        s = self._seq
+        if s is None or s["playing"] == on:
+            return
+        s["playing"] = on
+        if s["timer"]:
+            GLib.source_remove(s["timer"])
+            s["timer"] = None
+        if on:
+            s["timer"] = GLib.timeout_add(max(15, int(1000 / self.seq_fps.get_value())), self._seq_tick)
+        icon = "media-playback-pause-symbolic" if on else "media-playback-start-symbolic"
+        self.seq_play.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON))
+
+    def _seq_tick(self):
+        s = self._seq
+        if s is None or not s["playing"]:
+            return False
+        nxt = (s["cur"] + 1) % len(s["paths"])
+        if nxt in s["frames"]:
+            self._seq_goto(nxt)
+        else:
+            self._seq_request(nxt)                    # not decoded yet: hold this frame until it is
+            self.seq_label.set_text(f"buffering {nxt + 1}…")
+        return True
+
+    def _seq_focus_changed(self, win, pspec):
+        """Playback pauses when the Kestrel window loses focus (and stays paused until Play is pressed)."""
+        if not self.is_active() and self._seq is not None and self._seq["playing"]:
+            self._seq_set_playing(False)
+
+    def _seq_fps_changed(self, spin):
+        self.cfg["seq_fps"] = int(spin.get_value())
+        save_config(self.cfg)
+        s = self._seq
+        if s is not None and s["playing"]:
+            self._seq_set_playing(False)
+            self._seq_set_playing(True)
 
     FADE_MS = 125
 
@@ -11401,6 +18796,31 @@ class MainWindow(Gtk.ApplicationWindow):
             surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, a.width * scale, a.height * scale)
             surf.set_device_scale(scale, scale)
             cr = cairo.Context(surf)
+            # Preferred: copy the pane's pixels straight off the window — exactly what the user sees (GL
+            # viewport and video included). Re-drawing the widgets (below) fails with "gtk_widget_draw:
+            # assertion '!widget->priv->alloc_needed'" whenever the pane is mid-relayout, which happens on
+            # most selection changes, and then the snapshot comes out empty (a flash instead of a fade).
+            pb = None
+            try:
+                # a no-window widget's allocation is in the coordinates of the GdkWindow it draws into
+                win = self.preview_stack.get_window()
+                if win is not None and win.is_viewable() and not self.preview_stack.get_has_window():
+                    pb = Gdk.pixbuf_get_from_window(win, a.x, a.y, a.width, a.height)
+            except Exception:
+                pb = None
+            if pb is not None:
+                cr.save()
+                cr.scale(a.width / pb.get_width(), a.height / pb.get_height())
+                Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
+                cr.paint()
+                cr.restore()
+                self._snap_surface = surf
+                if hold:
+                    self._fade_token = getattr(self, "_fade_token", 0) + 1
+                    self._snap_draw = surf
+                    self._snap_alpha = 1.0
+                    self.snap_area.queue_draw()
+                return
             # The snapshot must be OPAQUE or the new content shows through it from frame one (only the old
             # text/image would appear to fade). Most of our containers have no background of their own —
             # the colour comes from the toplevel — so paint the theme's window colour first, then any
@@ -11414,7 +18834,8 @@ class MainWindow(Gtk.ApplicationWindow):
             Gtk.render_background(self.get_style_context(), cr, 0, 0, a.width, a.height)
             for wdg in (self.side, self.preview_box, self.preview_stack):
                 Gtk.render_background(wdg.get_style_context(), cr, 0, 0, a.width, a.height)
-            self.preview_stack.draw(cr)
+            if self.preview_stack.get_child_visible() and self.preview_stack.get_mapped():
+                self.preview_stack.draw(cr)
             self._snap_surface = surf
             if not hold:
                 return
@@ -13446,7 +20867,7 @@ menu menuitem:hover { background: alpha(@theme_selected_bg_color, 0.85); border-
 .toolbar-row button:hover, .statusbar button:hover, notebook > header button:hover { background: alpha(@theme_fg_color, 0.08); }
 .sidepane button:hover { background: alpha(@theme_fg_color, 0.08); }
 .toolbar-row button { min-width: 28px; min-height: 28px; padding: 2px; border-radius: 6px; }
-.pathbar { background: alpha(@theme_fg_color, 0.05); border: 1px solid alpha(@theme_fg_color, 0.14);
+.pathbar { background: alpha(@theme_fg_color, 0.05); border: 1px solid transparent;   /* outline: drawn in code */
            border-radius: 6px; padding: 1px 4px; min-height: 30px; }
 .pathbar > border { border-style: none; }        /* GtkFrame draws its own frame - keep only ours */
 .pathbar entry { border: none; background: transparent; box-shadow: none; min-height: 26px; }
@@ -13490,6 +20911,7 @@ notebook > header tab button.tab-close { min-width: 18px; min-height: 18px; padd
 .sidepane { background: alpha(@theme_fg_color, 0.025); }
 .sidepane textview, .sidepane textview text { background: alpha(@theme_fg_color, 0.03); }
 .edit-toolbar button { padding: 2px 8px; min-height: 24px; }
+.bd-error { color: #e5534b; font-family: monospace; font-size: 0.9em; padding: 2px 4px; }
 .edit-badge { font-size: 0.75em; font-weight: bold; letter-spacing: 1px; padding: 1px 6px; border-radius: 3px;
               color: alpha(@theme_fg_color, 0.55); background: alpha(@theme_fg_color, 0.07); }
 .edit-badge.badge-editing { color: #ffffff; background: #2b8a3e; }
@@ -13742,6 +21164,9 @@ def main():
         sys.argv = [sys.argv[0]]
     if "--preview-bench" in sys.argv[1:]:
         return run_preview_bench(big="--quick" not in sys.argv[1:])
+    if "--dcc-test" in sys.argv[1:]:
+        i = sys.argv.index("--dcc-test")
+        return run_dcc_test([a for a in sys.argv[i + 1:] if not a.startswith("--")])
     if "--selftest" in sys.argv[1:]:
         return run_selftest("--bench" in sys.argv[1:])
     if "--profile" in sys.argv[1:]:
