@@ -19,8 +19,12 @@ Or unzip the portable build and run `./kestrel` — nothing is installed (see [P
 
 ## Screenshots
 
-<!-- Taken in demo mode (docs/DEMO.md) — nothing here is a real machine. -->
+<!-- Stills taken in demo mode (docs/DEMO.md) — nothing here is a real machine. -->
 ![Kestrel main window](docs/screenshots/hero.png)
+
+![A 200-frame VDB campfire playing as smoke in the preview pane](docs/screenshots/vdb_viewer.gif)
+
+*VDB smoke in the preview pane: select the frames, press **Preview as sequence**, scrub or play — no Houdini needed.*
 
 | This PC | 3D preview | Video preview |
 |---|---|---|
@@ -73,7 +77,7 @@ repathing (move the renamed files into another folder, e.g. `../v005` or `/mnt/s
 to…; progress with pause.
 
 **Preview pane.** Images (GdkPixbuf formats plus built-in decoders for **EXR**, **Radiance HDR**,
-**Maya IFF**, **Photoshop PSD/PSB**), text with syntax highlighting and an inline quick editor,
+**Maya IFF**, **Photoshop PSD/PSB**; **animated GIF / WebP** play, click to pause), text with syntax highlighting and an inline quick editor,
 PDF, folder contents with sizes, archive listings, media info, **video and audio playback**
 (GStreamer), and a **3D model previewer** for OBJ, STL, PLY, FBX, glTF, Alembic (`.abc`, both Ogawa
 and legacy HDF5), USD and `.blend` — software rasteriser (multi-process, 5 M-triangle meshes in under a
@@ -168,7 +172,7 @@ Download `kestrel-<version>-portable.zip` from the Releases page (or build it wi
 `./make-portable.sh`, output in `dist/`). Unzip anywhere:
 
 ```
-kestrel-1.0-portable/
+kestrel-1.1-portable/
 ├── kestrel            # launcher: ./kestrel [folder]
 ├── kestrel.py         # the application
 ├── install.sh         # optional: install into ~/.local/bin later

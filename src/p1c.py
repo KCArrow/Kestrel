@@ -349,6 +349,25 @@ def run_selftest(bench: bool = False) -> int:
             self.assertGreater(int((img[:, :, :3].astype(int).sum(2) != 90).sum()), 2000)     # something was drawn
 
         @timed("built-in VDB reader")
+        @timed("GIF info")
+        def test_gif_info(self):
+            # hand-built 2×1 GIF89a: global palette, NETSCAPE loop forever, two frames of 50 ms and 0 ms
+            pal = bytes([0, 0, 0, 255, 255, 255])
+            frame = lambda d: (b"\x21\xf9\x04\x00" + struct.pack("<H", d) + b"\x00\x00"
+                               + b"\x2c" + struct.pack("<HHHH", 0, 0, 2, 1) + b"\x00" + b"\x02\x02\x44\x01\x00")
+            gif = (b"GIF89a" + struct.pack("<HH", 2, 1) + b"\x80\x00\x00" + pal
+                   + b"\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00" + frame(5) + frame(0) + b"\x3b")
+            p = os.path.join(self.tmp, "anim.gif")
+            with open(p, "wb") as f:
+                f.write(gif)
+            self.assertEqual(gif_info(p), {"w": 2, "h": 1, "frames": 2, "ms": 150, "loop": 0})
+            with open(p, "wb") as f:
+                f.write(gif[:-12])                                    # truncated mid-frame: still answers
+            self.assertEqual(gif_info(p)["frames"], 1)
+            with open(p, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n")
+            self.assertIsNone(gif_info(p))
+
         @timed("shader & IES previews")
         def test_shader_previews(self):
             j = lambda n: os.path.join(self.tmp, n)

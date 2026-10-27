@@ -2287,6 +2287,52 @@ def describe_archive(path: str) -> Optional[str]:
     return None
 
 
+def gif_info(path: str) -> Optional[dict]:
+    """Walk a GIF's blocks without decoding pixels: size, frame count, total duration (ms) and loop count
+    (0 = forever, None = plays once). Delays under 20 ms count as 100 ms, as browsers and GdkPixbuf do."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(512 << 20)
+    except OSError:
+        return None
+    if data[:6] not in (b"GIF87a", b"GIF89a") or len(data) < 13:
+        return None
+    w, h = struct.unpack_from("<HH", data, 6)
+    flags = data[10]
+    pos = 13 + (3 << ((flags & 7) + 1) if flags & 0x80 else 0)
+    frames, total, delay, loop = 0, 0, 0, None
+    n = len(data)
+
+    def skip_sub(p):
+        while p < n:
+            size = data[p]
+            p += 1 + size
+            if size == 0:
+                break
+        return p
+    while pos < n:
+        b = data[pos]
+        if b == 0x3B:                                         # trailer
+            break
+        if b == 0x21 and pos + 2 < n:                         # extension
+            label = data[pos + 1]
+            if label == 0xF9 and pos + 7 < n:                 # graphic control: this frame's delay
+                delay = struct.unpack_from("<H", data, pos + 4)[0] * 10
+            elif label == 0xFF and data[pos + 3:pos + 14] in (b"NETSCAPE2.0", b"ANIMEXTS1.0") and pos + 18 < n:
+                loop = struct.unpack_from("<H", data, pos + 16)[0]
+            pos = skip_sub(pos + 2)
+        elif b == 0x2C and pos + 10 < n:                      # image descriptor = one frame
+            lflags = data[pos + 9]
+            pos += 10 + (3 << ((lflags & 7) + 1) if lflags & 0x80 else 0)
+            pos = skip_sub(pos + 1)                           # LZW minimum code size, then the data
+            frames += 1
+            total += delay if delay >= 20 else 100
+            delay = 0
+        else:
+            break                                             # damaged / truncated: report what we have
+    return {"w": w, "h": h, "frames": frames, "ms": total, "loop": loop}
+
+
 def describe_media(path: str) -> List[Tuple[str, str]]:
     """Duration / resolution / codecs via ffprobe when available."""
     fp = _tool("ffprobe")
@@ -2925,6 +2971,25 @@ def run_selftest(bench: bool = False) -> int:
             self.assertGreater(int((img[:, :, :3].astype(int).sum(2) != 90).sum()), 2000)     # something was drawn
 
         @timed("built-in VDB reader")
+        @timed("GIF info")
+        def test_gif_info(self):
+            # hand-built 2×1 GIF89a: global palette, NETSCAPE loop forever, two frames of 50 ms and 0 ms
+            pal = bytes([0, 0, 0, 255, 255, 255])
+            frame = lambda d: (b"\x21\xf9\x04\x00" + struct.pack("<H", d) + b"\x00\x00"
+                               + b"\x2c" + struct.pack("<HHHH", 0, 0, 2, 1) + b"\x00" + b"\x02\x02\x44\x01\x00")
+            gif = (b"GIF89a" + struct.pack("<HH", 2, 1) + b"\x80\x00\x00" + pal
+                   + b"\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00" + frame(5) + frame(0) + b"\x3b")
+            p = os.path.join(self.tmp, "anim.gif")
+            with open(p, "wb") as f:
+                f.write(gif)
+            self.assertEqual(gif_info(p), {"w": 2, "h": 1, "frames": 2, "ms": 150, "loop": 0})
+            with open(p, "wb") as f:
+                f.write(gif[:-12])                                    # truncated mid-frame: still answers
+            self.assertEqual(gif_info(p)["frames"], 1)
+            with open(p, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n")
+            self.assertIsNone(gif_info(p))
+
         @timed("shader & IES previews")
         def test_shader_previews(self):
             j = lambda n: os.path.join(self.tmp, n)
@@ -6286,10 +6351,79 @@ class FitImage(Gtk.DrawingArea):
         self.max_size = max_size              # 0 = natural size cap is the pixbuf itself
         self.set_size_request(1, 1)
         self.connect("draw", self._draw)
+        # animated GIF / WebP: a GdkPixbufAnimation iterator advanced on its own frame delays
+        self._anim_iter = None
+        self._anim_timer = 0
+        self.anim_paused = False
+        self.connect("map", lambda w: self._anim_schedule())
+        self.connect("unmap", lambda w: self._anim_cancel())
 
     def set_from_pixbuf(self, pb):
+        self._anim_stop()
         self.pixbuf = pb
         self.queue_draw()
+
+    def set_animation(self, anim):
+        """Play a GdkPixbuf.PixbufAnimation (falls back to its still image when it has one frame).
+        Frames advance only while the widget is mapped and the window is active."""
+        self._anim_stop()
+        if anim is None:
+            self.set_from_pixbuf(None)
+            return
+        if anim.is_static_image():
+            self.set_from_pixbuf(anim.get_static_image())
+            return
+        self._anim_iter = anim.get_iter(None)
+        self.anim_paused = False
+        self.pixbuf = self._anim_iter.get_pixbuf()
+        self.queue_draw()
+        self._anim_schedule()
+
+    @property
+    def animating(self) -> bool:
+        return self._anim_iter is not None
+
+    def toggle_animation(self):
+        if self._anim_iter is None:
+            return
+        self.anim_paused = not self.anim_paused
+        if self.anim_paused:
+            self._anim_cancel()
+        else:
+            self._anim_iter.advance(None)          # restart timing from now, not from when we paused
+            self._anim_schedule()
+
+    def _anim_stop(self):
+        self._anim_cancel()
+        self._anim_iter = None
+
+    def _anim_cancel(self):
+        if self._anim_timer:
+            GLib.source_remove(self._anim_timer)
+            self._anim_timer = 0
+
+    def _anim_schedule(self):
+        if self._anim_iter is None or self._anim_timer or self.anim_paused or not self.get_mapped():
+            return
+        delay = self._anim_iter.get_delay_time()
+        if delay < 0:
+            return                                  # last frame of a GIF that doesn't loop
+        self._anim_timer = GLib.timeout_add(max(20, delay), self._anim_tick)
+
+    def _anim_tick(self):
+        self._anim_timer = 0
+        it = self._anim_iter
+        if it is None:
+            return False
+        top = self.get_toplevel()
+        if isinstance(top, Gtk.Window) and not top.is_active():
+            self._anim_timer = GLib.timeout_add(250, self._anim_tick)     # window in the background: idle
+            return False
+        if it.advance(None):
+            self.pixbuf = it.get_pixbuf()
+            self.queue_draw()
+        self._anim_schedule()
+        return False
 
     def _draw(self, w, cr):
         pb = self.pixbuf
@@ -17039,6 +17173,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.preview_overlay.add_overlay(self.snap_area)
         self.preview_overlay.set_overlay_pass_through(self.snap_area, True)
         self.preview_image = FitImage()
+        self.preview_image.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.preview_image.connect("button-press-event", self._preview_image_click)
         if GtkSource is not None:
             self.preview_text = GtkSource.View.new_with_buffer(GtkSource.Buffer())
             self.preview_text.set_show_line_numbers(True)
@@ -17476,6 +17612,8 @@ class MainWindow(Gtk.ApplicationWindow):
             return
         w = max(120, self.side.get_allocated_width() - 24)
         h = max(120, self.preview_box.get_allocated_height() - 24)
+        if e.path and e.ext.lower() in (".gif", ".webp") and (e.size or 0) <= (256 << 20) and self._load_animation(e, gen):
+            return
         if ct.startswith("image/") and e.path:
             self._placeholder("Loading preview…", gen)
             path = e.path
@@ -17542,6 +17680,50 @@ class MainWindow(Gtk.ApplicationWindow):
             except OSError:
                 pass
         self._preview_as_icon(e, "No preview available")
+
+    ANIM_MAX_BYTES = 1536 << 20          # decoded frames kept by GdkPixbuf; bigger GIFs preview as a still
+
+    def _load_animation(self, e: Entry, gen: int) -> bool:
+        """Animated GIF / WebP: play it in the preview (click to pause). Returns False to let the normal
+        still-image path handle files that are too big to keep decoded."""
+        path, gif = e.path, e.ext.lower() == ".gif"
+        info = gif_info(path) if gif else None
+        if info and info["w"] * info["h"] * 4 * max(1, info["frames"]) > self.ANIM_MAX_BYTES:
+            self._qv_add("Frames", f"{info['frames']:,} (too large to play; first frame shown)")
+            return False
+        self._placeholder("Loading preview…", gen)
+
+        def work():
+            try:
+                anim = GdkPixbuf.PixbufAnimation.new_from_file(path)
+            except GLib.Error:
+                anim = None
+            GLib.idle_add(done, anim)
+
+        def done(anim):
+            if gen != self._side_gen:
+                return False
+            if anim is None:
+                self._preview_as_icon(e, "Couldn't decode this image")
+                return False
+            self.preview_image.set_animation(anim)
+            self._qv_add("Dimensions", f"{anim.get_width()} × {anim.get_height()} px")
+            if info and info["frames"] > 1:
+                loop = "loops forever" if info["loop"] == 0 else ("plays once" if info["loop"] is None else f"loops {info['loop']}×")
+                self._qv_add("Animation", f"{info['frames']:,} frames · {info['ms'] / 1000:.1f} s · {loop}")
+            if self.preview_image.animating:
+                cap = getattr(self, "_pending_caption", None) or self.preview_caption.get_text()
+                self._set_caption(cap + "  ·  click to pause")
+            self._show_preview("image")
+            return False
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def _preview_image_click(self, w, event):
+        if event.button == 1 and event.type == Gdk.EventType.BUTTON_PRESS and self.preview_image.animating:
+            self.preview_image.toggle_animation()
+            return True
+        return False
 
     def _preview_dir_sizes(self, gen, subdirs: List[Entry], parent: str):
         """Fill in subfolder sizes in the folder preview, in the background, with a sanity cap."""

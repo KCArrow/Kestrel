@@ -992,6 +992,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.preview_overlay.add_overlay(self.snap_area)
         self.preview_overlay.set_overlay_pass_through(self.snap_area, True)
         self.preview_image = FitImage()
+        self.preview_image.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.preview_image.connect("button-press-event", self._preview_image_click)
         if GtkSource is not None:
             self.preview_text = GtkSource.View.new_with_buffer(GtkSource.Buffer())
             self.preview_text.set_show_line_numbers(True)
@@ -1429,6 +1431,8 @@ class MainWindow(Gtk.ApplicationWindow):
             return
         w = max(120, self.side.get_allocated_width() - 24)
         h = max(120, self.preview_box.get_allocated_height() - 24)
+        if e.path and e.ext.lower() in (".gif", ".webp") and (e.size or 0) <= (256 << 20) and self._load_animation(e, gen):
+            return
         if ct.startswith("image/") and e.path:
             self._placeholder("Loading preview…", gen)
             path = e.path
@@ -1495,6 +1499,50 @@ class MainWindow(Gtk.ApplicationWindow):
             except OSError:
                 pass
         self._preview_as_icon(e, "No preview available")
+
+    ANIM_MAX_BYTES = 1536 << 20          # decoded frames kept by GdkPixbuf; bigger GIFs preview as a still
+
+    def _load_animation(self, e: Entry, gen: int) -> bool:
+        """Animated GIF / WebP: play it in the preview (click to pause). Returns False to let the normal
+        still-image path handle files that are too big to keep decoded."""
+        path, gif = e.path, e.ext.lower() == ".gif"
+        info = gif_info(path) if gif else None
+        if info and info["w"] * info["h"] * 4 * max(1, info["frames"]) > self.ANIM_MAX_BYTES:
+            self._qv_add("Frames", f"{info['frames']:,} (too large to play; first frame shown)")
+            return False
+        self._placeholder("Loading preview…", gen)
+
+        def work():
+            try:
+                anim = GdkPixbuf.PixbufAnimation.new_from_file(path)
+            except GLib.Error:
+                anim = None
+            GLib.idle_add(done, anim)
+
+        def done(anim):
+            if gen != self._side_gen:
+                return False
+            if anim is None:
+                self._preview_as_icon(e, "Couldn't decode this image")
+                return False
+            self.preview_image.set_animation(anim)
+            self._qv_add("Dimensions", f"{anim.get_width()} × {anim.get_height()} px")
+            if info and info["frames"] > 1:
+                loop = "loops forever" if info["loop"] == 0 else ("plays once" if info["loop"] is None else f"loops {info['loop']}×")
+                self._qv_add("Animation", f"{info['frames']:,} frames · {info['ms'] / 1000:.1f} s · {loop}")
+            if self.preview_image.animating:
+                cap = getattr(self, "_pending_caption", None) or self.preview_caption.get_text()
+                self._set_caption(cap + "  ·  click to pause")
+            self._show_preview("image")
+            return False
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def _preview_image_click(self, w, event):
+        if event.button == 1 and event.type == Gdk.EventType.BUTTON_PRESS and self.preview_image.animating:
+            self.preview_image.toggle_animation()
+            return True
+        return False
 
     def _preview_dir_sizes(self, gen, subdirs: List[Entry], parent: str):
         """Fill in subfolder sizes in the folder preview, in the background, with a sanity cap."""

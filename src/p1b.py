@@ -674,6 +674,52 @@ def describe_archive(path: str) -> Optional[str]:
     return None
 
 
+def gif_info(path: str) -> Optional[dict]:
+    """Walk a GIF's blocks without decoding pixels: size, frame count, total duration (ms) and loop count
+    (0 = forever, None = plays once). Delays under 20 ms count as 100 ms, as browsers and GdkPixbuf do."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(512 << 20)
+    except OSError:
+        return None
+    if data[:6] not in (b"GIF87a", b"GIF89a") or len(data) < 13:
+        return None
+    w, h = struct.unpack_from("<HH", data, 6)
+    flags = data[10]
+    pos = 13 + (3 << ((flags & 7) + 1) if flags & 0x80 else 0)
+    frames, total, delay, loop = 0, 0, 0, None
+    n = len(data)
+
+    def skip_sub(p):
+        while p < n:
+            size = data[p]
+            p += 1 + size
+            if size == 0:
+                break
+        return p
+    while pos < n:
+        b = data[pos]
+        if b == 0x3B:                                         # trailer
+            break
+        if b == 0x21 and pos + 2 < n:                         # extension
+            label = data[pos + 1]
+            if label == 0xF9 and pos + 7 < n:                 # graphic control: this frame's delay
+                delay = struct.unpack_from("<H", data, pos + 4)[0] * 10
+            elif label == 0xFF and data[pos + 3:pos + 14] in (b"NETSCAPE2.0", b"ANIMEXTS1.0") and pos + 18 < n:
+                loop = struct.unpack_from("<H", data, pos + 16)[0]
+            pos = skip_sub(pos + 2)
+        elif b == 0x2C and pos + 10 < n:                      # image descriptor = one frame
+            lflags = data[pos + 9]
+            pos += 10 + (3 << ((lflags & 7) + 1) if lflags & 0x80 else 0)
+            pos = skip_sub(pos + 1)                           # LZW minimum code size, then the data
+            frames += 1
+            total += delay if delay >= 20 else 100
+            delay = 0
+        else:
+            break                                             # damaged / truncated: report what we have
+    return {"w": w, "h": h, "frames": frames, "ms": total, "loop": loop}
+
+
 def describe_media(path: str) -> List[Tuple[str, str]]:
     """Duration / resolution / codecs via ffprobe when available."""
     fp = _tool("ffprobe")

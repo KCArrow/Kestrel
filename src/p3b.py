@@ -48,10 +48,79 @@ class FitImage(Gtk.DrawingArea):
         self.max_size = max_size              # 0 = natural size cap is the pixbuf itself
         self.set_size_request(1, 1)
         self.connect("draw", self._draw)
+        # animated GIF / WebP: a GdkPixbufAnimation iterator advanced on its own frame delays
+        self._anim_iter = None
+        self._anim_timer = 0
+        self.anim_paused = False
+        self.connect("map", lambda w: self._anim_schedule())
+        self.connect("unmap", lambda w: self._anim_cancel())
 
     def set_from_pixbuf(self, pb):
+        self._anim_stop()
         self.pixbuf = pb
         self.queue_draw()
+
+    def set_animation(self, anim):
+        """Play a GdkPixbuf.PixbufAnimation (falls back to its still image when it has one frame).
+        Frames advance only while the widget is mapped and the window is active."""
+        self._anim_stop()
+        if anim is None:
+            self.set_from_pixbuf(None)
+            return
+        if anim.is_static_image():
+            self.set_from_pixbuf(anim.get_static_image())
+            return
+        self._anim_iter = anim.get_iter(None)
+        self.anim_paused = False
+        self.pixbuf = self._anim_iter.get_pixbuf()
+        self.queue_draw()
+        self._anim_schedule()
+
+    @property
+    def animating(self) -> bool:
+        return self._anim_iter is not None
+
+    def toggle_animation(self):
+        if self._anim_iter is None:
+            return
+        self.anim_paused = not self.anim_paused
+        if self.anim_paused:
+            self._anim_cancel()
+        else:
+            self._anim_iter.advance(None)          # restart timing from now, not from when we paused
+            self._anim_schedule()
+
+    def _anim_stop(self):
+        self._anim_cancel()
+        self._anim_iter = None
+
+    def _anim_cancel(self):
+        if self._anim_timer:
+            GLib.source_remove(self._anim_timer)
+            self._anim_timer = 0
+
+    def _anim_schedule(self):
+        if self._anim_iter is None or self._anim_timer or self.anim_paused or not self.get_mapped():
+            return
+        delay = self._anim_iter.get_delay_time()
+        if delay < 0:
+            return                                  # last frame of a GIF that doesn't loop
+        self._anim_timer = GLib.timeout_add(max(20, delay), self._anim_tick)
+
+    def _anim_tick(self):
+        self._anim_timer = 0
+        it = self._anim_iter
+        if it is None:
+            return False
+        top = self.get_toplevel()
+        if isinstance(top, Gtk.Window) and not top.is_active():
+            self._anim_timer = GLib.timeout_add(250, self._anim_tick)     # window in the background: idle
+            return False
+        if it.advance(None):
+            self.pixbuf = it.get_pixbuf()
+            self.queue_draw()
+        self._anim_schedule()
+        return False
 
     def _draw(self, w, cr):
         pb = self.pixbuf

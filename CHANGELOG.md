@@ -32,6 +32,8 @@
   folder (created if missing, works across drives), and a much faster live preview
 - Home folder listed first under This PC in the navigation pane; Browse… buttons use Kestrel's own folder
   picker instead of the GTK/Nautilus chooser
+- Animated GIFs (and animated WebP) play in the preview pane; click to pause. Frame count, length and
+  loop setting in the details
 - Address bar keeps a faint outline (matching the search box) so it's clear where to click to type a path
 - Fixed: a double-click right after opening a folder was ignored, and Shift-click after going back or
   reloading selected only one item
