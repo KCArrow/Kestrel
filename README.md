@@ -95,7 +95,10 @@ Unity (`.unity`, `.prefab`, `.unitypackage`), Maya (`.ma`, `.mb`) and Blender (`
 actors / components / materials, render settings and **every referenced file with its full path, flagged
 when it's missing** — read directly from the file, no Unreal, Unity, Maya or Blender needed. Filter, copy as
 text, double-click a reference to jump to it. Blender and Unreal files show their saved thumbnail, and
-picking a material in a Maya or Blender breakdown renders it on a material ball.
+picking a material in a Maya or Blender breakdown renders it on a material ball. Picking an **object** shows its
+geometry in a small 3D view (Blender 2.7x–5.x with collection instances; Maya ASCII natively, including instances
+and meshes built from a primitive's history; Maya binary too, and Maya's own evaluation of rigs and modelling history when Maya is installed),
+and picking a **texture** shows the image (UDIMs open their first tile).
 
 **Shaders, materials and lights.** MaterialX (`.mtlx`), OSL (`.osl`, `.oso`), Unity materials (`.mat`),
 ShaderLab (`.shader`) and Shader Graph show their inputs and textures on a **material ball** (GGX, clearcoat,

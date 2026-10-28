@@ -2286,6 +2286,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.bd_image.set_from_pixbuf(pb)
         self.bd_media_stack.set_visible_child_name("image")
         self.bd_media_label.set_text(label)
+        self.bd_media_label.set_tooltip_text(None)
         self.bd_play.hide()
         if self.bd_glsl is not None:
             self.bd_glsl.set_playing(False)
@@ -2343,32 +2344,190 @@ class MainWindow(Gtk.ApplicationWindow):
                                                    Gtk.IconSize.MENU))
 
     def _bd_selection(self, sel):
-        """A material row picked in a breakdown: show its stored preview or render a ball for it."""
+        """Picking a row in a breakdown: a material → its ball / stored preview; an outliner object → its
+        geometry in a small 3D view; a texture file → the image."""
         m, it = sel.get_selected()
-        key = m.get_value(it, 6) if it is not None else ""
-        res = getattr(self, "_bd_res", None) or {}
-        mats = res.get("materials") or []
-        if not key or not key.startswith("material:") or res.get("glsl"):
+        if it is None:
             return
-        try:
-            mat = mats[int(key.split(":", 1)[1])]
-        except (ValueError, IndexError):
+        key = m.get_value(it, 6) or ""
+        path = m.get_value(it, 2) or ""
+        res = getattr(self, "_bd_res", None) or {}
+        if res.get("glsl"):
             return
         gen = self._side_gen
-        name = mat.get("name") or "Material"
-
-        def work():
+        self._bd_pick = pick = getattr(self, "_bd_pick", 0) + 1
+        alive = lambda: gen == self._side_gen and pick == self._bd_pick and self.preview_stack.get_visible_child_name() == "breakdown"
+        if key.startswith("material:"):
             try:
-                img = run_heavy(material_ball_for, mat)
-            except Exception:
-                img = None
-            GLib.idle_add(done, img)
+                mat = (res.get("materials") or [])[int(key.split(":", 1)[1])]
+            except (ValueError, IndexError):
+                return
+            name = mat.get("name") or "Material"
 
-        def done(img):
-            if gen == self._side_gen and img is not None and self.preview_stack.get_visible_child_name() == "breakdown":
-                self._bd_show_image(img, name + (" · stored preview" if mat.get("_image") is not None else " · material ball"))
-            return False
-        threading.Thread(target=work, daemon=True).start()
+            def work():
+                try:
+                    img = run_heavy(material_ball_for, mat)
+                except Exception:
+                    img = None
+                GLib.idle_add(done, img)
+
+            def done(img):
+                if alive() and img is not None:
+                    self._bd_show_image(img, name + (" · stored preview" if mat.get("_image") is not None else " · material ball"))
+                return False
+            threading.Thread(target=work, daemon=True).start()
+        elif key.startswith("object:"):
+            e = getattr(self, "_bd_entry", None)
+            if e is None:
+                return
+            name = m.get_value(it, 0)
+            self._bd_status(f"{name} · reading geometry…")
+
+            def owork():
+                try:
+                    mdl = run_heavy(scene_object_model, e.path, key)
+                except Exception as ex:
+                    mdl = {"error": str(ex)}
+                GLib.idle_add(odone, mdl)
+
+            def mwork():
+                # mayapy is a subprocess: wait for it in this thread, not in the decoder worker, so
+                # thumbnails and other previews keep flowing meanwhile
+                try:
+                    mdl = scene_object_model(e.path, key, maya="only")
+                except Exception as ex:
+                    mdl = {"error": str(ex)}
+                GLib.idle_add(mdone, mdl)
+
+            def odone(mdl):
+                if not alive():
+                    return False
+                ok = bool(mdl) and "error" not in mdl
+                if ok:
+                    self._bd_show_model(mdl, f"{name} · {mdl.get('label', '')}" + (" · via Maya" if mdl.get("via_maya") else ""),
+                                        mdl.get("notes") or [])
+                if mdl and mdl.get("maya_could_help"):
+                    # some meshes only exist as modelling history (or the file's mesh data isn't readable
+                    # here): let Maya evaluate the scene once; the result is cached for the next picks
+                    first = not maya_mb_cached(e.path)
+                    msg = ("opening the scene in Maya for the meshes Kestrel can't rebuild (first time for this file, "
+                           "can take a minute)…" if first else "reading Maya's copy of the scene…")
+                    if ok:
+                        self.bd_media_label.set_text(f"{name} · {mdl.get('label', '')} · {msg}")
+                    else:
+                        self._bd_status(f"{name} · {msg}")
+                    threading.Thread(target=mwork, daemon=True).start()
+                elif not ok:
+                    self._bd_status(f"{name} · {mdl.get('error', 'no geometry') if mdl else 'no geometry'}")
+                return False
+
+            def mdone(mdl):
+                if not alive():
+                    return False
+                if not mdl or "error" in mdl:
+                    cur = self.bd_media_label.get_text().split(" · opening")[0].split(" · reading Maya")[0]
+                    self._bd_status(f"{cur} · Maya: {mdl.get('error', 'failed') if mdl else 'failed'}")
+                    return False
+                self._bd_show_model(mdl, f"{name} · {mdl.get('label', '')} · via Maya", mdl.get("notes") or [])
+                return False
+            threading.Thread(target=owork, daemon=True).start()
+        elif path and os.path.splitext(path)[1].lower() in SCENE_IMAGE_EXTS:
+            name = os.path.basename(path)
+
+            def twork():
+                real = scene_tile_path(path)
+                img, dims = None, None
+                if os.path.isfile(real):
+                    try:
+                        info = GdkPixbuf.Pixbuf.get_file_info(real)
+                        dims = (info[1], info[2]) if info and info[0] else None
+                        pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(real, 1024, 1024, True)
+                        img = pb.apply_embedded_orientation() or pb
+                    except (GLib.Error, TypeError):
+                        ct, _ = Gio.content_type_guess(real, None)
+                        r = generate_preview(real, ct or "", 1024, 1024)
+                        if "raw" in r:
+                            img = r["raw"]
+                            dims = next(((None, v) for k, v in r.get("info", []) if k == "Dimensions"), None)
+                        elif "png" in r:
+                            try:
+                                img = GdkPixbuf.Pixbuf.new_from_file(r["png"])
+                            except GLib.Error:
+                                img = None
+                            try:
+                                os.remove(r["png"])
+                            except OSError:
+                                pass
+                GLib.idle_add(tdone, real, img, dims)
+
+            def tdone(real, img, dims):
+                if not alive():
+                    return False
+                if img is None:
+                    self._bd_status(f"{name} · " + ("missing on this machine" if not os.path.exists(real) else "can't preview this image"))
+                    return False
+                size = ""
+                if dims and dims[0]:
+                    size = f" · {dims[0]} × {dims[1]}"
+                elif dims and dims[1]:
+                    size = f" · {dims[1]}"
+                tile = "" if real == path else f" · tile {os.path.basename(real)}"
+                if isinstance(img, GdkPixbuf.Pixbuf):
+                    self.bd_image.set_from_pixbuf(img)
+                    self.bd_media_stack.set_visible_child_name("image")
+                    self.bd_media_label.set_text(name + size + tile)
+                    self.bd_play.hide()
+                    if self.bd_glsl is not None:
+                        self.bd_glsl.set_playing(False)
+                    self._bd_show_media(True, img.get_height() + 30)
+                else:
+                    self._bd_show_image(img, name + size + tile)
+                return False
+            threading.Thread(target=twork, daemon=True).start()
+
+    def _bd_status(self, text: str):
+        """A one-line message in the picture half (shown even when nothing has been pictured yet)."""
+        self.bd_media_label.set_text(text)
+        self.bd_media_label.set_tooltip_text(text)
+        if not self.bd_media.get_visible():
+            self.bd_image.set_from_pixbuf(None)
+            self.bd_media_stack.set_visible_child_name("image")
+            self.bd_play.hide()
+            self._bd_show_media(True, 60)
+
+    def _bd_show_model(self, mdl: dict, label: str, notes: list):
+        """Geometry of a picked scene object in the picture half (same viewer as the 3D preview)."""
+        mv = getattr(self, "bd_model_view", None)
+        want_soft = not (self.cfg.get("gl_preview", True) and HAVE_GL) or getattr(self, "_bd_gl_broken", False)
+        if mv is not None and isinstance(mv, ModelView) != want_soft:
+            self.bd_media_stack.remove(mv)
+            mv = None
+        if mv is None:
+            if want_soft:
+                mv = ModelView()
+            else:
+                mv = GLModelView()
+                mv.on_error = self._bd_gl_failed
+            mv.show()
+            self.bd_media_stack.add_named(mv, "model")
+            self.bd_model_view = mv
+        self.bd_media_stack.set_visible_child_name("model")
+        mv.set_model(mdl)
+        mv.queue_draw()
+        self._bd_last_model = mdl
+        self.bd_media_label.set_text(label)
+        self.bd_media_label.set_tooltip_text("\n".join(notes) if notes else None)
+        self.bd_play.hide()
+        if self.bd_glsl is not None:
+            self.bd_glsl.set_playing(False)
+        self._bd_show_media(True, 10 ** 6)
+
+    def _bd_gl_failed(self, msg: str):
+        """The breakdown's GL viewer failed: switch it to the software renderer and re-show the model."""
+        self._bd_gl_broken = True
+        m = getattr(self, "_bd_last_model", None)
+        if m is not None:
+            GLib.idle_add(lambda: (self._bd_show_model(m, self.bd_media_label.get_text(), []), False)[1])
 
     def _bd_fill(self, res: dict):
         st = self.bd_store
@@ -2383,8 +2542,9 @@ class MainWindow(Gtk.ApplicationWindow):
                     tip = GLib.markup_escape_text(path) + ("\n<b>Missing on this machine</b>" if ok is False else
                                                            ("\n<i>Not checked: a path from another machine</i>" if ok is None else ""))
                 key = ""
-                if path and path.startswith("material:"):
-                    key, path, tip = path, "", "Select to preview this material"
+                if path and path.startswith(("material:", "object:")):
+                    key, path = path, ""
+                    tip = "Select to preview this material" if key.startswith("material:") else "Select to preview this geometry in 3D"
                 it = st.append(parent, [label, detail, path, missing if ok is False else "", True, tip, key])
                 if kids:
                     add(it, kids)

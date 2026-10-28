@@ -1231,6 +1231,7 @@ class _MayaScene:
         self.attrs: Dict[str, Dict[str, str]] = {}   # shader nodes: attribute → value text
         self.conns: list = []                         # (src "node.attr", dst "node.attr")
         self.types: Dict[str, str] = {}
+        self.instances: list = []                     # (shape, extra parent) from `parent -add`
 
     def add_path(self, group: str, path: str, owner: str):
         if path and len(path) < 4096:
@@ -1257,6 +1258,44 @@ def _mel_flags(stmt: str) -> Tuple[Dict[str, str], list]:
             pos.append(t.strip('"'))
         i += 1
     return flags, pos
+
+
+class MayaDagPaths:
+    """Full DAG paths for Maya nodes as they are created. `-p` / connection names are the shortest unique
+    partial path at save time, so 'grp2|pCube1' picks the right one of two 'pCube1's."""
+
+    def __init__(self):
+        self.by_short: Dict[str, list] = {}
+
+    def resolve(self, ref: str) -> str:
+        ref = (ref or "").strip()
+        if not ref:
+            return ""
+        short = ref.split("|")[-1]
+        cands = self.by_short.get(short) or self.by_short.get(short.lstrip(":")) or []
+        if not cands:
+            return ""
+        if "|" in ref:
+            if ref.startswith("|"):
+                return ref if ref in cands else next((c for c in cands if c == ref), cands[-1])
+            suf = "|" + ref
+            hits = [c for c in cands if c.endswith(suf)]
+            if hits:
+                return hits[-1]
+        return cands[-1]
+
+    def add(self, name: str, parent: str) -> str:
+        short = name.split("|")[-1]
+        pfull = self.resolve(parent) if parent else ""
+        full = f"{pfull}|{short}" if pfull or parent else f"|{short}"
+        if parent and not pfull:
+            full = "|" + parent.lstrip("|") + "|" + short             # parent not created (yet): keep as written
+        self.by_short.setdefault(short, []).append(full)
+        return full
+
+    @staticmethod
+    def parent_of(full: str) -> str:
+        return full.rsplit("|", 1)[0] if full.count("|") > 1 else ""
 
 
 def _parse_maya_ascii(path: str) -> _MayaScene:
@@ -1296,6 +1335,10 @@ def _parse_maya_ascii(path: str) -> _MayaScene:
                 strs = _RE_MEL_STR.findall(s)
                 if len(strs) >= 2:
                     sc.conns.append((strs[0], strs[1]))
+            elif s.startswith("parent ") and " -add" in s:
+                strs = _RE_MEL_STR.findall(s)                     # instancing: parent -s -nc -r -add "shape" "xform"
+                if len(strs) >= 2:
+                    sc.instances.append((strs[0], strs[1]))
             elif s.startswith("setAttr ") and cur_type in _MAYA_SHADER_TYPES and not selected:
                 mm = re.match(r'setAttr\s+(?:-\w+\s+\S+\s+)*"(\.[^"]+)"\s*(?:-type\s+"\w+"\s*)?(.*)$', s)
                 if mm:
@@ -1617,43 +1660,55 @@ def breakdown_maya(path: str) -> dict:
     types: Dict[str, int] = {}
     for t, n, p in sc.nodes:
         types[t] = types.get(t, 0) + 1
-    # outliner: DAG nodes (anything with a parent, plus transforms / joints at the root)
-    by_name: Dict[str, dict] = {}
+    # outliner: DAG nodes (anything with a parent, plus transforms / joints at the root), keyed by DAG path so
+    # two nodes with the same short name land under their own parents
+    by_path: Dict[str, dict] = {}
     roots_l: list = []
     shapes: Dict[str, list] = {}
-    dag_types = {"transform", "joint", "ikHandle", "locator", "lodGroup", "place3dTexture", "assemblyReference",
-                 "aiStandIn", "gpuCache", "mayaUsdProxyShape", "camera"}
+    dagp = MayaDagPaths()
     for t, n, p in sc.nodes:
         if not n:
             continue
         short = n.split("|")[-1]
+        full = dagp.add(short, p)
         is_xform = t in ("transform", "joint", "lodGroup", "ikHandle", "dagContainer", "aimConstraint",
                          "parentConstraint", "pointConstraint", "orientConstraint", "scaleConstraint")
         if p and not is_xform:
-            shapes.setdefault(p.split("|")[-1], []).append(t)
+            shapes.setdefault(MayaDagPaths.parent_of(full), []).append(t)
             continue
         if not is_xform and not p:
             continue
-        rec = {"name": short, "type": t, "kids": []}
-        if p and p.split("|")[-1] in by_name:
-            by_name[p.split("|")[-1]]["kids"].append(rec)
+        rec = {"name": short, "path": full, "type": t, "kids": []}
+        par = MayaDagPaths.parent_of(full)
+        if p and par in by_path:
+            by_path[par]["kids"].append(rec)
         else:
             roots_l.append(rec)
-        by_name[short] = rec
+        by_path[full] = rec
     n_out = [0]
+
+    ascii_scene = kind == "Maya ASCII scene"
+    for child, par in sc.instances:
+        pfull = dagp.resolve(par)
+        ctype = sc.types.get(child.split("|")[-1], "")
+        if pfull and ctype:
+            shapes.setdefault(pfull, []).append(ctype + " (instance)" if ctype == "mesh" else ctype)
 
     def build(rec):
         n_out[0] += 1
-        sh = shapes.get(rec["name"], [])
+        sh = shapes.get(rec["path"], [])
         detail = ", ".join(sorted(set(sh))) if sh else ("" if rec["type"] == "transform" else rec["type"])
         kids = [build(k) for k in rec["kids"]] if n_out[0] < 6000 else [_bn("…", "")]
-        return _bn(rec["name"], detail, kids)
+        # rows with a mesh (here or below) can be picked to preview it in 3D (ASCII scenes only)
+        geo = any(t.startswith("mesh") for t in sh) or any(k[3].startswith("object:") for k in kids)
+        return _bn(rec["name"], detail, kids, f"object:{rec['path']}" if geo else "")
     outl = [build(r) for r in roots_l if r["name"] not in _MAYA_DEFAULT_CAMS]
     cams = sum(1 for t, n, p in sc.nodes if t == "camera" and n.replace("Shape", "") not in _MAYA_DEFAULT_CAMS)
     lights = sum(1 for t, n, p in sc.nodes if t in _MAYA_LIGHTS)
     meshes = types.get("mesh", 0)
     info.append(("Contents", f"{meshes:,} meshes · {lights} lights · {cams} cameras · {len(sc.refs and {r[0] for r in sc.refs}):,} references"))
-    tree = [_bn("Outliner", f"{len(outl):,} top-level", outl)]
+    tree = [_bn("Outliner", f"{len(outl):,} top-level", outl,
+                "object:*" if any(n[3].startswith("object:") for n in outl) else "")]
     # references (scene files) first
     found = dict(sc.found)
     seen = set()
@@ -1702,7 +1757,8 @@ def breakdown_maya(path: str) -> dict:
     tree.append(_bn("Node types", f"{len(sc.nodes):,} nodes", _bn_counts(types)))
     if sc.info:
         tree.append(_bn("File info", "", [_bn(k, v.replace("\\n", " ").strip()) for k, v in sc.info.items()]))
-    return {"kind": kind, "info": info, "tree": tree, "notes": [], "materials": materials}
+    notes = []
+    return {"kind": kind, "info": info, "tree": tree, "notes": notes, "materials": materials}
 
 
 # --------------------------------------------------------------------------- Blender (.blend)
@@ -1805,7 +1861,7 @@ class BlendFile:
         self.path = path
         f, self.compression = _blend_open(path)
         self._mem = f.getvalue() if isinstance(f, io.BytesIO) else None   # zstd: keep for later block reads
-        self.skipped: Dict[int, Tuple[int, int]] = {}
+        self.skipped: Dict[int, Tuple[int, int, int, int]] = {}     # old address → (offset, length, sdna, nr)
         self.thumb = None
         try:
             self._read(f)
@@ -1831,6 +1887,10 @@ class BlendFile:
         self.e, self.P = e, P
         hsz = 32 if self.new_format else (16 + self.ptr)
         self.blocks = []                      # (code, sdna, old, data or None, nr)
+        self._order: list = []                # old address of every block, in file order
+        self._id_pos: Dict[int, int] = {}     # ID block address → index in _order
+        self._at: Dict[int, list] = {}        # address → indices in _order (usually one)
+        self._payload: Dict[int, tuple] = {}  # index in _order → ("k", block index) | ("s", offset, length, sdna, nr)
         self.by_old: Dict[int, int] = {}
         self.counts: Dict[str, int] = {}
         self.linked: Dict[str, int] = {}
@@ -1848,6 +1908,12 @@ class BlendFile:
             if code == b"ENDB":
                 break
             c2 = code[:2].decode("latin-1") if code[2:4] == b"\0\0" else ""
+            # Blender 5 writes per-ID "stable" addresses that can repeat across IDs: remember every block's
+            # place so a pointer can be resolved within the ID that owns it (read_data(owner=…))
+            self._order.append(old)
+            if c2:
+                self._id_pos[old] = len(self._order) - 1
+            self._at.setdefault(old, []).append(len(self._order) - 1)
             # ID blocks we report on, the schema, and small DATA blocks (list links, embedded collections);
             # geometry and pixel data are skipped without being read
             keep = (code == b"DNA1") or (c2 in _BLEND_KEEP_ID) or (code == b"DATA" and ln <= 4096)
@@ -1859,7 +1925,8 @@ class BlendFile:
             else:
                 data = None
                 try:
-                    self.skipped[old] = (f.tell(), ln)
+                    self.skipped[old] = (f.tell(), ln, sdna, nr)
+                    self._payload[len(self._order) - 1] = ("s", f.tell(), ln, sdna, nr)
                 except (OSError, AttributeError):
                     pass
                 f.seek(ln, 1)
@@ -1869,6 +1936,8 @@ class BlendFile:
                 dna = data
                 continue
             self.by_old[old] = len(self.blocks)
+            if data is not None:
+                self._payload[len(self._order) - 1] = ("k", len(self.blocks))
             self.blocks.append((code, sdna, old, data, nr, c2))
         if dna is None:
             raise ValueError("no DNA1 block")
@@ -1931,22 +2000,47 @@ class BlendFile:
         return tsize * mult
 
     # ---- field access
-    def read_data(self, old: int) -> Optional[bytes]:
-        """Data of any block by its old address, re-reading big blocks that were skipped on the first pass."""
+    def read_data(self, old: int, owner: int = 0) -> Optional[bytes]:
+        """Data of any block by its old address, re-reading big blocks that were skipped on the first pass.
+        `owner` (an ID block's address) picks the copy that belongs to that ID when addresses repeat."""
+        hits = self._at.get(old, ())
+        if owner and len(hits) > 1 and owner in self._id_pos:
+            start = self._id_pos[owner]
+            if not hasattr(self, "_id_sorted"):
+                self._id_sorted = sorted(self._id_pos.values())
+            j = bisect.bisect_right(self._id_sorted, start)
+            end = self._id_sorted[j] if j < len(self._id_sorted) else len(self._order)
+            idx = next((i for i in hits if start < i < end), None)
+            pl = self._payload.get(idx) if idx is not None else None
+            if pl and pl[0] == "k":
+                return self.blocks[pl[1]][3]
+            if pl and pl[0] == "s":
+                return self._read_span(pl[1], pl[2])
         b = self.block(old)
         if b is not None and b[3] is not None:
             return b[3]
         pos = self.skipped.get(old)
         if pos is None:
             return None
+        return self._read_span(pos[0], pos[1])
+
+    def _read_span(self, offset: int, length: int) -> bytes:
         if self._mem is not None:
-            return self._mem[pos[0]:pos[0] + pos[1]]
+            return self._mem[offset:offset + length]
         f, _ = _blend_open(self.path)
         try:
-            f.seek(pos[0])
-            return f.read(pos[1])
+            f.seek(offset)
+            return f.read(length)
         finally:
             f.close()
+
+    def block_nr(self, old: int) -> int:
+        """Element count of a block (kept or skipped): array length for DATA blocks."""
+        b = self.block(old)
+        if b is not None:
+            return b[4]
+        s = self.skipped.get(old)
+        return s[3] if s else 0
 
     def field(self, struct_name: str, data: bytes, path: str, kind: str = "auto", index: int = 0):
         """Value of a (possibly nested 'r.engine') field of struct_name inside data, or None. index picks an
@@ -2036,15 +2130,18 @@ def blend_id_preview(bf: "BlendFile", idb) -> Optional["RawImage"]:
     """The preview render Blender stored with an ID (material balls, object / world previews)."""
     st = bf.sname(idb[1])
     pp = bf.field(st, idb[3], "id.preview") or bf.field(st, idb[3], "preview")
+    owner = idb[2]
+    pd = bf.read_data(pp, owner) if pp else None                  # addresses can repeat across IDs (3.x, 5.x)
     pb = bf.block(pp) if pp else None
-    if pb is None or pb[3] is None:
+    if pb is None or pd is None:
         return None
+    pb = (pb[0], pb[1], pb[2], pd) + tuple(pb[4:])
     ps = bf.sname(pb[1]) or "PreviewImage"
     for i in (1, 0):                                             # 1 = large preview, 0 = icon
         w, h = bf.field(ps, pb[3], "w", index=i), bf.field(ps, pb[3], "h", index=i)
         rp = bf.field(ps, pb[3], "rect", index=i)
         if w and h and rp:
-            img = _blend_rgba_image(bf.read_data(rp) or b"", w, h)
+            img = _blend_rgba_image(bf.read_data(rp, owner) or b"", w, h)
             if img is not None:
                 return img
     return None
@@ -2202,6 +2299,7 @@ def breakdown_blend(path: str) -> dict:
         data_ptr = bf.field(st, b[3], "data") or 0
         db = bf.block(data_ptr)
         obs[b[2]] = {"name": bf.id_name(b), "type": _BLEND_OB_TYPES.get(t, f"type {t}"),
+                     "is_mesh": t == 1 or bool(bf.field(st, b[3], "instance_collection") or bf.field(st, b[3], "dup_group")),
                      "parent": bf.field(st, b[3], "parent") or 0,
                      "data": bf.id_name(db) if db and db[5] else "", "lib": lib_of(b)}
     kids: Dict[int, list] = {}
@@ -2218,7 +2316,9 @@ def breakdown_blend(path: str) -> dict:
             det += f" · linked from {os.path.basename(o['lib'])}"
         sub = [ob_node(k, depth + 1) for k in sorted(kids.get(o_ptr, []), key=lambda k: obs[k]["name"].lower())] \
             if depth < 64 and n_nodes[0] < 6000 else []
-        return _bn(o["name"], det, sub)
+        # rows with geometry (here or below) can be picked to preview it in 3D
+        geo = o["is_mesh"] or any(n[3].startswith("object:") for n in sub)
+        return _bn(o["name"], det, sub, f"object:{o_ptr}" if geo else "")
     # collections
     cols = {b[2]: b for b in ids.get("GR", [])}
     tree, notes = [], []
@@ -2289,7 +2389,8 @@ def breakdown_blend(path: str) -> dict:
                         members.append(op)
                 mset = set(members)
                 content = [ob_node(op) for op in sorted(members, key=lambda k: obs[k]["name"].lower()) if obs[op]["parent"] not in mset]
-        scene_nodes.append(_bn(sname, f"{eng and render.get('Render engine', '')}".strip(" ·"), [_bn("Settings", "", rows)] + content))
+        scene_nodes.append(_bn(sname, f"{eng and render.get('Render engine', '')}".strip(" ·"), [_bn("Settings", "", rows)] + content,
+                               f"object:scene={sb[2]}" if any(o["is_mesh"] for o in obs.values()) else ""))
     for k in ("Render engine", "Frame range", "Resolution"):
         if k in render:
             info.append((k, render[k]))
@@ -2446,7 +2547,7 @@ def breakdown_text(res: dict, title: str = "") -> str:
             extra = []
             if n[1]:
                 extra.append(n[1])
-            if n[3] and not n[3].startswith("material:"):
+            if n[3] and not n[3].startswith(("material:", "object:")):
                 extra.append(n[3] + ("  [MISSING]" if n[4] is False else ""))
             lines.append("  " * depth + "- " + n[0] + (f"   ({' · '.join(extra)})" if extra else ""))
             walk(n[2], depth + 1)

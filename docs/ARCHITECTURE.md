@@ -19,6 +19,7 @@ namespace, so a part may use anything defined in an earlier part, and a class de
 | `p3c.py` | ~1400 | 3D preview: `load_model` + `_finish_model_numpy` (triangulation, decimation, normals), software rasteriser (`_rasterize`, `software_render`) and its `RenderWorker` process, `ModelView` (cairo) and `GLModelView` (Gtk.GLArea), GStreamer `VideoPreview` |
 | `p3e.py` | ~2050 | scene breakdowns: `UEPackage` (Unreal package summary / names / imports / exports), Unity YAML + `.meta` GUID index, Maya ASCII statements + IFF (`FOR4`/`FOR8`) chunks, `BlendFile` (blocks + SDNA, gzip/zstd), `scene_breakdown`, `breakdown_text` |
 | `p3f.py` | ~1500 | shader / material / IES previews: `render_material_ball` (numpy GGX), readers for MaterialX, OSL/OSO, GLSL/HLSL, Unity `.mat`/`.shader`/`.shadergraph`, `IESProfile` + `ies_preview`, `shader_preview`, `material_ball_for`; live GLSL: `GLSLRunner` (no GTK) and `GLSLView` (Gtk.GLArea) |
+| `p3g.py` | ~550 | scene object & texture previews: Blender meshes (MVert/MPoly/MLoop, 3.5+ attribute layers, 5.x `AttributeStorage`) with object matrices, Maya ASCII meshes (`.vt/.ed/.fc`) and history primitives (`polyCube`, `polySphere`…, through deformers and `polyUnite`), `scene_object_model`, `scene_tile_path` |
 | `p3d.py` | ~1300 | built-in VDB reader, Houdini / Maya bridges, 3D importers for FBX / USD / Alembic (HDF5 via h5py), Blender and assimp bridges, `optional_deps`, `install_script`, `preview_tool_report`, GL status |
 | `p3.py`  | ~1050 | `IconCache` (icons + thumbnails), `NavNode`, `FolderView` (one folder tab: listing, search, selection, drag-and-drop, views), `Page` (one or two `FolderView`s for split view) |
 | `p4.py`  | ~3000 | `MainWindow`: menus/command bar, navigation pane, tabs, address bar, side pane (preview + details), preview routing and crossfades, cache-sequence player, drive watching, status bar and spinner, window state |
@@ -116,6 +117,24 @@ Every reader works from the file alone:
 Breakdowns may also carry `images` (`[(label, RawImage)]`: Blender `TEST` thumbnail, Unreal package thumbnail)
 and `materials` (dicts in `MATERIAL_DEFAULTS` form). Material rows have the path `material:<i>`; the page keeps
 that in a hidden column and renders `material_ball_for(materials[i])` in the worker when the row is selected.
+
+Outliner rows whose object has geometry (or has it below) carry `object:<id>` (Blender: the Object's file
+address; Maya: the node name). Selecting one runs `scene_object_model(path, key)` in the worker — it re-reads
+the file, collects the object and its descendants, applies their world matrices (Blender's saved matrix when
+present, else loc/rot/scale + parent chain; Maya `.t/.r/.s/.ro`) and returns a normal 3D-preview model.
+Maya ASCII matrices follow Maya's own order with pivots (T·RT·RP·R·RA·RP⁻¹·ST·SP·SH·S·SP⁻¹), are carried down
+the DAG while walking so instanced shapes (`parent -add`) get the matrix of each path, and were checked
+against the world matrices Maya stores in `dagPose` nodes. Maya binary scenes go through
+`_maya_binary_sections`, which turns IFF attribute chunks into the same setAttr text the ASCII reader uses; a
+`MESH` chunk holds the float count + points, the edge-index count + vertex pairs, and the face-edge count +
+entries (bit 31 = edge reversed, bits 29–30 = last edge of the face). When meshes come out unread or through
+skipped deformers and `mayapy` exists, `scene_object_model(maya="only")` reads Maya's own evaluation
+(`maya_mb_meshes`: every mesh path with world points and triangles, cached per file). Blender collection
+instances recurse into the collection (and into a linked library file when the collection is linked);
+bone-parented objects use the bone's pose matrix plus its length, which reproduces Blender's saved world
+matrices for every object in the sample files.
+Blender 5 writes per-ID "stable" addresses that can repeat across data-blocks, so `BlendFile.read_data(ptr,
+owner)` resolves a pointer to the copy written after the owning ID.
 
 ## Shader, material and IES previews (`p3f.py`)
 

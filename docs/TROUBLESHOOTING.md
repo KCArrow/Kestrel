@@ -91,6 +91,21 @@ diagnostics report you can copy. **Tools → Performance report…** shows stall
   show object names instead. World Partition maps also count the actors under `__ExternalActors__`.
 - Maya references to files saved on another machine are looked up by name next to the scene and in the
   project's `scenes`, `sourceimages`, `images` and `cache` folders.
+- Picking an object shows its **base mesh**: modifiers (Blender), deformers / skinning / smooth preview (Maya)
+  and armature poses aren't applied. A Maya mesh that only exists as construction history is shown as the
+  primitive it started from (polyCube, polySphere, polyCylinder, polyCone, polyPlane, polyTorus, polyPyramid);
+  the caption's tooltip says what was left out.
+- `.ma` and `.mb` meshes are read from the file itself. A mesh that exists only as a long modelling
+  history, or one deformed by skinning / blend shapes, can't be rebuilt exactly that way. If Maya is installed
+  (`mayapy` on PATH, `$MAYA_LOCATION` or `/usr/autodesk/maya*`), Kestrel then opens the scene once in Maya in
+  the background and swaps in Maya's result (the caption ends in "via Maya"); every mesh is cached under
+  `~/.cache/kestrel/scene-geo`, so the first time takes as long as Maya needs to start (and uses a licence)
+  and later picks are instant. Once Maya has read a file, every object picked in it uses Maya's result. Scenes
+  with deformers (a rig) always ask Maya, since stored positions there don't match what Maya shows.
+- Pick the **Outliner** heading of a Maya breakdown (or a scene row in a Blender one) to see every visible
+  object at once — the quickest way to compare with Maya's viewport.
+- Transforms driven by constraints or other connections are shown at the values saved in the file, which can
+  differ from what Maya shows after it evaluates the rig.
 
 ## Shaders, materials and IES files
 

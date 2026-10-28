@@ -17,6 +17,7 @@ Usage:  kestrel [folder ...]
 """
 from __future__ import annotations
 
+import bisect
 import datetime as _dt
 import fnmatch
 import glob

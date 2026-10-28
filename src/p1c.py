@@ -349,6 +349,69 @@ def run_selftest(bench: bool = False) -> int:
             self.assertGreater(int((img[:, :, :3].astype(int).sum(2) != 90).sum()), 2000)     # something was drawn
 
         @timed("built-in VDB reader")
+        @timed("scene object geometry (Maya ASCII)")
+        def test_scene_object_geometry(self):
+            if np is None:
+                self.skipTest("numpy not installed")
+            # a quad (stored .vt/.ed/.fc) under a moved group, plus a polySphere built only by history
+            ma = os.path.join(self.tmp, "objects.ma")
+            lines = [
+                "//Maya ASCII 2024 scene",
+                'createNode transform -n "grp";', '\tsetAttr ".t" -type "double3" 10 0 0 ;',
+                'createNode transform -n "quad" -p "grp";',
+                'createNode mesh -n "quadShape" -p "quad";',
+                '\tsetAttr -s 4 ".vt[0:3]"  -0.5 0 0.5 0.5 0 0.5 -0.5 0 -0.5 0.5 0 -0.5;',
+                '\tsetAttr -s 4 ".ed[0:3]"  0 1 0 0 2 0 1 3 0 2 3 0;',
+                '\tsetAttr ".fc[0]" -type "polyFaces" f 4 0 2 -4 -2 mu 0 4 0 1 3 2;',
+                'createNode transform -n "ball";',
+                'createNode mesh -n "ballShape" -p "ball";',
+                'createNode polySphere -n "polySphere1";', '\tsetAttr ".r" 2;', '\tsetAttr ".sa" 8;', '\tsetAttr ".sh" 6;',
+                'connectAttr "polySphere1.out" "ballShape.i";']
+            with open(ma, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            r = scene_breakdown(ma)
+            outl = {n[0]: n for n in {n[0]: n for n in r["tree"]}["Outliner"][2]}
+            self.assertEqual(outl["grp"][3], "object:|grp")                     # group with a mesh below is pickable
+            V, F, names, notes = maya_object_model_arrays(ma, "grp")
+            self.assertEqual((len(V), len(F)), (4, 2))
+            self.assertAlmostEqual(float(V[:, 0].mean()), 10.0, 4)            # parent's translate applied
+            V, F, names, notes = maya_object_model_arrays(ma, "ball")
+            self.assertEqual(len(F), 8 * 6 * 2)
+            self.assertAlmostEqual(float(np.abs(V).max()), 2.0, 4)
+            self.assertTrue(any("polySphere" in n for n in notes))
+            # an instanced shape shows under each of its parents, each at its own transform
+            inst = os.path.join(self.tmp, "instanced.ma")
+            with open(inst, "w") as f:
+                f.write("\n".join(["//Maya ASCII 2024 scene", 'createNode transform -n "set";',
+                                   'createNode transform -n "a" -p "set";', 'createNode mesh -n "aShape" -p "a";',
+                                   lines[5], lines[6], lines[7],
+                                   'createNode transform -n "b" -p "set";', '\tsetAttr ".t" -type "double3" 0 5 0 ;',
+                                   '\tsetAttr ".s" -type "double3" 2 2 2 ;',
+                                   'parent -s -nc -r -add "|set|a|aShape" "b";']) + "\n")
+            V, F, names, notes = maya_object_model_arrays(inst, "set")
+            self.assertEqual(len(F), 4)                                         # two copies of the quad
+            self.assertAlmostEqual(float(V[:, 1].max()), 5.0, 4)
+            self.assertAlmostEqual(float(np.ptp(V[:, 0])), 2.0, 4)             # the second copy is scaled ×2
+            outl = {n[0]: n for n in {n[0]: n for n in scene_breakdown(inst)["tree"]}["Outliner"][2]}
+            self.assertIn("mesh (instance)", [k[1] for k in outl["set"][2]])
+            # Maya binary MESH chunk → the same .vt/.ed/.fc text the ASCII reader understands
+            vt = struct.pack(">I", 12) + struct.pack(">12f", 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1)
+            ed = struct.pack(">I", 8) + struct.pack(">8I", 0, 1, 1, 3, 3, 2, 2, 0)
+            fe = struct.pack(">I", 4) + struct.pack(">4I", 0, 1, 2, 3 | 0x60000000)
+            txt = _mb_mesh_text(b"ci\0 " + vt + ed + fe)
+            at = list(_ma_setattrs(txt))
+            pts = _ma_indexed(at, "vt", 3)
+            offs, cv = _ma_faces(at, _ma_indexed(at, "ed", 3))
+            self.assertEqual((len(pts), list(offs), list(cv)), (4, [0, 4], [0, 1, 3, 2]))
+            whole = scene_object_model(ma, "object:*")                       # every visible top-level node
+            self.assertNotIn("error", whole, whole.get("error"))
+            m = scene_object_model(ma, "object:ball")
+            self.assertNotIn("error", m, m.get("error"))
+            self.assertIn("triangles", m["label"])
+            self.assertEqual(scene_tile_path(os.path.join(self.tmp, "nope.<UDIM>.png")), os.path.join(self.tmp, "nope.<UDIM>.png"))
+            open(os.path.join(self.tmp, "tile.1002.png"), "w").close()
+            self.assertTrue(scene_tile_path(os.path.join(self.tmp, "tile.<UDIM>.png")).endswith("tile.1002.png"))
+
         @timed("GIF info")
         def test_gif_info(self):
             # hand-built 2×1 GIF89a: global palette, NETSCAPE loop forever, two frames of 50 ms and 0 ms

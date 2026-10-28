@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- Scene breakdowns: pick an object in a Blender (2.7x–5.x) or Maya ASCII outliner to see its geometry in a
+  3D view (with everything parented under it, in place); Maya meshes built by construction history show the
+  primitive they started from. Pick a texture to see the image (first UDIM tile)
+- Maya binary (.mb) object previews read the file's own mesh data — no Maya needed
+- When a Maya scene has meshes Kestrel can't rebuild (long modelling history) or deformers it doesn't
+  apply (skinning, blend shapes), and Maya is installed, the preview shows Kestrel's version at once and then
+  Maya's own evaluation of the scene (read once per file with mayapy, cached); once Maya has read a file,
+  every pick in it uses Maya's result. Rigs (skinning, blend shapes…) always get Maya's evaluation
+- Pick the Outliner heading (Maya) or a scene (Blender) to see everything visible at once
+- Fixed: Maya meshes moved or sculpted with vertex tweaks were drawn without them (bodies too small, parts
+  in the wrong place)
+- Instances: Maya instanced shapes and transforms show under every parent; Blender collection instances
+  show in place, including collections linked from other .blend files
+- World positions checked against the files' own data: Blender objects parented to bones follow the bone;
+  Maya transforms honour inheritsTransform
+- Maya object previews place rigged / grouped meshes correctly: rotate and scale pivots, shear, rotate axis,
+  duplicate short names resolved by DAG path, hidden children left out; big scenes are parsed once and
+  then each pick is quick
+- Blender 5 files: data that shares an address across data-blocks is now read from the right block (stored
+  material previews could show the wrong picture)
+
 ## 1.1 — 2026-10-26
 
 **Houdini caches and VDBs**
